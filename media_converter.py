@@ -494,17 +494,10 @@ async def send_blog_media(
 
         return
 
-    if LOW_EGRESS_MODE:
-        try:
-            await send_url_gallery(
-                channel,
-                image_urls,
-                content=text,
-                send_delay=send_delay,
-            )
-            return
-        except Exception as error:
-            print("URL画像送信エラー。添付方式へ切り替えます:", error)
+    # 新着ブログ通知は、画像URLの埋め込みではなくDiscord添付として送る。
+    # これにより、1メッセージにつき最大10枚の画像がギャラリー形式でまとまって表示される。
+    # LOW_EGRESS_MODEは写真検索などでは引き続き利用できるが、
+    # 新着ブログ通知では見た目を優先して添付方式を固定する。
 
 
     upload_limit = get_upload_limit(
