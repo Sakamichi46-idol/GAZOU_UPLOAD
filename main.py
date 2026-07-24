@@ -116,6 +116,8 @@ async def on_message(message):
                 text=text,
                 image_urls=images,
                 send_delay=1.0,
+                article_url=blog.get("url", url),
+                group=blog.get("group", ""),
             )
 
         except Exception as error:
