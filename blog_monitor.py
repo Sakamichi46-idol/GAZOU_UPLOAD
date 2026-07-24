@@ -20,7 +20,7 @@ def build_notification_text(
         f"📝 {blog.get('title', '')}\n"
         f"📅 {blog.get('date', '')}\n"
         f"🔗 {blog.get('url', '')}\n\n"
-        f"📷 ブログ画像 ({image_count}枚)"
+        f"📷 ブログ画像（{image_count}枚）"
     )
 
 
@@ -82,6 +82,8 @@ async def notify_channel(
         text=text,
         image_urls=images,
         send_delay=1.0,
+        article_url=blog.get("url", ""),
+        group=blog.get("group", ""),
     )
 
 
