@@ -4,6 +4,7 @@ from typing import Any
 import discord
 
 from photo_database import search_photo_images, search_photo_images_by_author
+from bucket_storage import bucket_is_configured, create_presigned_get_url
 
 
 # =========================
@@ -217,6 +218,18 @@ def build_search_embed(
     return embed
 
 
+
+def get_display_image_url(result: dict[str, Any]) -> str:
+    """Prefer durable Bucket content; fall back to the original source URL."""
+    bucket_key = str(result.get("bucket_key") or "").strip()
+    if bucket_key and bucket_is_configured():
+        try:
+            return create_presigned_get_url(bucket_key)
+        except Exception as error:
+            print("Bucket署名付きURL作成エラー:", error)
+    image_url = str(result.get("image_url") or "").strip()
+    return image_url if image_url.startswith(("http://", "https://")) else ""
+
 # =========================
 # 検索結果送信
 # =========================
@@ -322,12 +335,9 @@ async def send_photo_search_results(
 
         # 通信量節約のため、保存済みローカル画像を再アップロードせず、
         # 元画像URLをDiscordに直接表示させる。
-        image_url = str(
-            result.get("image_url")
-            or ""
-        ).strip()
+        image_url = get_display_image_url(result)
 
-        if image_url.startswith(("http://", "https://")):
+        if image_url:
             embed.set_image(url=image_url)
         else:
             embed.description = (embed.description or "") + (
@@ -353,4 +363,7 @@ async def send_photo_author_search_results(ctx, author_name: str, limit: int = D
     await ctx.send(f"📝 **ブログ投稿者検索**: `{shorten_text(clean_name, 1000)}`\n表示件数: **{len(results)}件**")
     for index, result in enumerate(results, start=1):
         embed = build_search_embed(result, query=f"投稿者:{clean_name}", index=index, total=len(results))
+        image_url = get_display_image_url(result)
+        if image_url:
+            embed.set_image(url=image_url)
         await ctx.send(embed=embed)
