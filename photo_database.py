@@ -597,6 +597,34 @@ def init_photo_db() -> None:
             "TEXT NOT NULL DEFAULT ''",
         )
 
+        ensure_column(
+            connection,
+            "photo_images",
+            "bucket_key",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        ensure_column(
+            connection,
+            "photo_images",
+            "bucket_status",
+            "TEXT NOT NULL DEFAULT 'pending'",
+        )
+
+        ensure_column(
+            connection,
+            "photo_images",
+            "bucket_error",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        ensure_column(
+            connection,
+            "photo_images",
+            "storage_backend",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )
+
         # =========================
         # 検索高速化用インデックス
         # =========================
@@ -1213,7 +1241,7 @@ def get_pending_analysis_images(
                 photo_images.analysis_status = 'pending'
 
             AND
-                photo_images.local_path != ''
+                (photo_images.local_path != '' OR photo_images.bucket_key != '')
 
             ORDER BY
                 photo_images.id ASC
@@ -1245,6 +1273,10 @@ def update_image_download(
     height: int,
     image_hash: str,
     status: str = "completed",
+    bucket_key: str = "",
+    bucket_status: str = "pending",
+    bucket_error: str = "",
+    storage_backend: str = "local",
 ) -> None:
     """
     画像ダウンロード後の情報を更新する。
@@ -1269,6 +1301,10 @@ def update_image_download(
                 image_hash = ?,
                 download_status = ?,
                 download_error = '',
+                bucket_key = ?,
+                bucket_status = ?,
+                bucket_error = ?,
+                storage_backend = ?,
                 updated_at = ?
 
             WHERE id = ?
@@ -1282,6 +1318,10 @@ def update_image_download(
                 height,
                 image_hash,
                 status,
+                bucket_key,
+                bucket_status,
+                bucket_error,
+                storage_backend,
                 utc_now_text(),
                 image_id,
             ),
@@ -2776,7 +2816,7 @@ def search_photo_images_by_author(author_name: str, limit: int = 10) -> list[dic
                              WHERE p.image_id=photo_images.id AND p.relation_status='candidate'),'') AS candidate_people
             FROM photo_images JOIN photo_blogs ON photo_blogs.id=photo_images.blog_id
             LEFT JOIN photo_ai_analysis ON photo_ai_analysis.image_id=photo_images.id
-            WHERE photo_images.download_status='completed' AND photo_images.local_path!=''
+            WHERE photo_images.download_status='completed' AND (photo_images.local_path!='' OR photo_images.bucket_key!='')
               AND photo_blogs.member_name LIKE ?
             ORDER BY photo_blogs.published_at DESC, photo_images.image_index ASC
             LIMIT ?
@@ -2936,7 +2976,7 @@ def search_photo_images(
 
             WHERE
                 photo_images.download_status = 'completed'
-                AND photo_images.local_path != ''
+                AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
                 AND ({where_clause})
 
             ORDER BY
