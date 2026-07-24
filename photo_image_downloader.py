@@ -14,6 +14,7 @@ from photo_database import (
     update_image_download,
     update_image_download_failure,
 )
+from bucket_storage import bucket_is_enabled, keep_local_copy, upload_bytes
 
 
 # =========================
@@ -347,6 +348,20 @@ def build_image_path(
     return os.path.join(
         folder_path,
         file_name,
+    )
+
+
+def build_bucket_key(
+    *,
+    blog_id: int,
+    image_index: int,
+    image_hash: str,
+    extension: str,
+) -> str:
+    """Create a stable and collision-resistant object key."""
+    return (
+        f"photos/{int(blog_id):09d}/"
+        f"{int(image_index):03d}-{image_hash[:16]}{extension}"
     )
 
 
@@ -774,11 +789,44 @@ async def download_photo_image(
         file_path
     )
 
+    bucket_key = ""
+    bucket_status = "disabled"
+    bucket_error = ""
+    storage_backend = "local"
+
+    if bucket_is_enabled():
+        bucket_key = build_bucket_key(
+            blog_id=blog_id,
+            image_index=image_index,
+            image_hash=image_hash,
+            extension=extension,
+        )
+        try:
+            upload_bytes(
+                key=bucket_key,
+                content=content,
+                content_type=content_type or "application/octet-stream",
+            )
+            bucket_status = "completed"
+            storage_backend = "bucket"
+        except Exception as error:
+            bucket_status = "failed"
+            bucket_error = f"{type(error).__name__}: {error}"[:1000]
+            if not keep_local_copy():
+                remove_file_safely(file_path)
+                record_download_failure(image_id, "Bucket upload failed: " + bucket_error)
+                return {"success": False, "image_id": image_id, "error": bucket_error}
+
+    local_path_for_db = file_path
+    if bucket_status == "completed" and not keep_local_copy():
+        remove_file_safely(file_path)
+        local_path_for_db = ""
+
     try:
 
         update_image_download(
             image_id,
-            local_path=file_path,
+            local_path=local_path_for_db,
             file_name=file_name,
             mime_type=content_type,
             file_size=file_size,
@@ -786,6 +834,10 @@ async def download_photo_image(
             height=height,
             image_hash=image_hash,
             status="completed",
+            bucket_key=bucket_key,
+            bucket_status=bucket_status,
+            bucket_error=bucket_error,
+            storage_backend=storage_backend,
         )
 
     except Exception as error:
@@ -826,7 +878,8 @@ async def download_photo_image(
     return {
         "success": True,
         "image_id": image_id,
-        "file_path": file_path,
+        "file_path": local_path_for_db,
+        "bucket_key": bucket_key,
         "file_name": file_name,
         "mime_type": content_type,
         "file_size": file_size,
