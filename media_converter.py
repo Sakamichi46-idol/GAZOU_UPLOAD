@@ -9,6 +9,11 @@ import discord
 import imageio_ffmpeg
 
 from low_egress_media import LOW_EGRESS_MODE, send_url_gallery
+from bucket_storage import (
+    bucket_is_enabled,
+    build_blog_image_key,
+    upload_bytes_if_missing,
+)
 
 
 # =========================
@@ -321,7 +326,9 @@ async def download_attachment(
     session,
     image_url,
     index,
-    upload_limit
+    upload_limit,
+    article_url="",
+    group="",
 ):
 
     try:
@@ -390,6 +397,41 @@ async def download_attachment(
             )
 
 
+            # Bucketには変換前のオリジナルGIFを保存する。
+            if bucket_is_enabled():
+                try:
+                    bucket_key = build_blog_image_key(
+                        group=group,
+                        article_url=article_url or image_url,
+                        image_index=index,
+                        image_bytes=data,
+                        extension=".gif",
+                    )
+
+                    uploaded = await asyncio.to_thread(
+                        upload_bytes_if_missing,
+                        key=bucket_key,
+                        content=data,
+                        content_type=(
+                            content_type
+                            or "image/gif"
+                        ),
+                    )
+
+                    print(
+                        "Bucket保存:"
+                        if uploaded
+                        else "Bucket保存済み:",
+                        bucket_key,
+                    )
+
+                except Exception as error:
+                    print(
+                        f"Bucket保存エラー 画像{index}:",
+                        error,
+                    )
+
+
             mp4_data = await convert_gif_to_mp4(
                 data,
                 index,
@@ -425,6 +467,52 @@ async def download_attachment(
         # 通常画像
         # =====================
 
+        extension = get_image_extension(
+            content_type,
+            image_url
+        )
+
+
+        # 取得した同じバイト列をBucket保存とDiscord添付で共用する。
+        # 元サイトからBucket用に再ダウンロードはしない。
+        if bucket_is_enabled():
+            try:
+                bucket_key = build_blog_image_key(
+                    group=group,
+                    article_url=article_url or image_url,
+                    image_index=index,
+                    image_bytes=data,
+                    extension=extension,
+                )
+
+                uploaded = await asyncio.to_thread(
+                    upload_bytes_if_missing,
+                    key=bucket_key,
+                    content=data,
+                    content_type=(
+                        content_type
+                        or "application/octet-stream"
+                    ),
+                )
+
+                print(
+                    "Bucket保存:"
+                    if uploaded
+                    else "Bucket保存済み:",
+                    bucket_key,
+                )
+
+            except Exception as error:
+                # Phase 1.1ではDiscord通知を止めない。
+                # Bucket保存失敗はログへ出し、添付送信は継続する。
+                print(
+                    f"Bucket保存エラー 画像{index}:",
+                    error,
+                )
+
+
+        # Bucket保存後にDiscord側の容量上限を判定する。
+        # Discordへ添付できない大容量画像も、Bucketには原本を残す。
         if len(data) > max_bytes:
 
             return {
@@ -435,12 +523,6 @@ async def download_attachment(
                     "アップロード上限を超えました。"
                 )
             }
-
-
-        extension = get_image_extension(
-            content_type,
-            image_url
-        )
 
 
         return {
@@ -482,7 +564,9 @@ async def send_blog_media(
     channel,
     text,
     image_urls,
-    send_delay=1.0
+    send_delay=1.0,
+    article_url="",
+    group="",
 ):
 
     if not image_urls:
@@ -526,7 +610,9 @@ async def send_blog_media(
                 session,
                 image_url,
                 index,
-                upload_limit
+                upload_limit,
+                article_url=article_url,
+                group=group,
             )
 
 
