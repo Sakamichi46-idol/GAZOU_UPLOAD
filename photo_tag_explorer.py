@@ -16,16 +16,16 @@ PAGE_SIZE = 5
 OPTIONS_PER_PAGE = 25
 
 CATEGORY_DEFS: dict[str, tuple[str, str]] = {
-    "person": ("ð¤", "äººç©"),
-    "clothing": ("ð", "æè£"),
-    "expression": ("ð", "è¡¨æ"),
-    "location": ("ð", "å ´æã»èæ¯"),
-    "composition": ("ð·", "æ®å½±ã»æ§å³"),
-    "pose": ("ðº", "ãã¼ãº"),
-    "event": ("ðª", "ã¤ãã³ã"),
-    "season": ("ð¸", "å­£ç¯ã»å¤©å"),
-    "object": ("ð", "å°ç©"),
-    "other": ("â¨", "ãã®ä»"),
+    "person": ("👤", "人物"),
+    "clothing": ("👕", "服装"),
+    "expression": ("😊", "表情"),
+    "location": ("📍", "場所・背景"),
+    "composition": ("📷", "撮影・構図"),
+    "pose": ("🕺", "ポーズ"),
+    "event": ("🎪", "イベント"),
+    "season": ("🌸", "季節・天候"),
+    "object": ("🎀", "小物"),
+    "other": ("✨", "その他"),
 }
 
 CATEGORY_ALIASES = {
@@ -45,7 +45,7 @@ def _normalized_category(category: str) -> str:
 
 def _short(value: Any, limit: int) -> str:
     text = str(value or "").strip()
-    return text if len(text) <= limit else text[: max(0, limit - 1)] + "â¦"
+    return text if len(text) <= limit else text[: max(0, limit - 1)] + "…"
 
 
 def _all_image_ids() -> set[int]:
@@ -189,7 +189,7 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 photo_blogs.published_at,
 
                 COALESCE((
-                    SELECT GROUP_CONCAT(person_name, 'ã')
+                    SELECT GROUP_CONCAT(person_name, '、')
                     FROM photo_image_people pip
                     WHERE pip.image_id = photo_images.id
                       AND pip.relation_status = 'confirmed'
@@ -202,7 +202,7 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 COALESCE(photo_ai_analysis.objects, '') AS objects,
 
                 COALESCE((
-                    SELECT GROUP_CONCAT(tag, 'ã')
+                    SELECT GROUP_CONCAT(tag, '、')
                     FROM (
                         SELECT tag
                         FROM photo_ai_tags t
@@ -213,7 +213,7 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 ), '') AS ai_tags,
 
                 COALESCE((
-                    SELECT GROUP_CONCAT(tag, 'ã')
+                    SELECT GROUP_CONCAT(tag, '、')
                     FROM (
                         SELECT tag
                         FROM photo_manual_tags m
@@ -290,7 +290,7 @@ class ExplorerState:
             emoji, label = CATEGORY_DEFS[category]
 
             lines.append(
-                f"{emoji} **{label}:** {'ã»'.join(sorted(tags))}"
+                f"{emoji} **{label}:** {'・'.join(sorted(tags))}"
             )
 
         return lines
@@ -316,7 +316,7 @@ class OwnedView(discord.ui.View):
     ) -> bool:
         if interaction.user.id != self.state.owner_id:
             await interaction.response.send_message(
-                "â ï¸ ãã®æ¤ç´¢ç»é¢ã¯ãã³ãã³ããå®è¡ããæ¬äººã ããæä½ã§ãã¾ãã",
+                "⚠️ この検索画面は、コマンドを実行した本人だけが操作できます。",
                 ephemeral=True,
             )
             return False
@@ -331,29 +331,29 @@ def build_explorer_embed(
     selected_lines = state.selected_lines()
 
     embed = discord.Embed(
-        title="ð åçã¿ã°æ¤ç´¢",
+        title="🔍 写真タグ検索",
         description=(
-            "ä¸ã®ã«ãã´ãªã¼ããæ¡ä»¶ãé¸ãã§ãã ããã\n"
-            "**åãã«ãã´ãªã¼åã¯ORãã«ãã´ãªã¼åå£«ã¯AND**ã§æ¤ç´¢ãã¾ãã"
+            "下のカテゴリーから条件を選んでください。\n"
+            "**同じカテゴリー内はOR、カテゴリー同士はAND**で検索します。"
         ),
         color=0x2B90D9,
     )
 
     embed.add_field(
-        name="ð ã©ã¤ãã©ãª",
+        name="📚 ライブラリ",
         value=(
-            f"ç»é²ç»å: **{len(state.all_ids):,}æ**\n"
-            f"åè£ç»å: **{result_count:,}æ**"
+            f"登録画像: **{len(state.all_ids):,}枚**\n"
+            f"候補画像: **{result_count:,}枚**"
         ),
         inline=False,
     )
 
     embed.add_field(
-        name="ç¾å¨ã®æ¡ä»¶",
+        name="現在の条件",
         value=(
             "\n".join(selected_lines)
             if selected_lines
-            else "æ¡ä»¶ã¯ã¾ã é¸æããã¦ãã¾ããã"
+            else "条件はまだ選択されていません。"
         ),
         inline=False,
     )
@@ -392,19 +392,19 @@ def build_explorer_embed(
         )
 
     embed.add_field(
-        name="â¨ ããããã¿ã°",
+        name="✨ おすすめタグ",
         value=(
             "\n".join(recommendation_lines)
             if recommendation_lines
-            else "ç¾å¨ã®æ¡ä»¶ã§ã¯åè£ãããã¾ããã"
+            else "現在の条件では候補がありません。"
         ),
         inline=False,
     )
 
     embed.set_footer(
         text=(
-            "ã«ãã´ãªã¼ãæä½ãããã³ã«ã"
-            "ç¾å¨ã®æ¡ä»¶ã«å¿ããä»¶æ°ã¸æ´æ°ããã¾ãã"
+            "カテゴリーを操作するたびに、"
+            "現在の条件に応じた件数へ更新されます。"
         )
     )
 
@@ -461,8 +461,8 @@ class ExplorerView(OwnedView):
             self.add_item(button)
 
     @discord.ui.button(
-        label="æ¤ç´¢çµæãè¦ã",
-        emoji="ð",
+        label="検索結果を見る",
+        emoji="🔍",
         style=discord.ButtonStyle.success,
         row=2,
     )
@@ -480,8 +480,8 @@ class ExplorerView(OwnedView):
 
         if not results:
             await interaction.response.send_message(
-                "ð æ¡ä»¶ã«ä¸è´ããç»åã¯ããã¾ããã§ããã"
-                "æ¡ä»¶ãæ¸ããã¦ã¿ã¦ãã ããã",
+                "🔍 条件に一致する画像はありませんでした。"
+                "条件を減らしてみてください。",
                 ephemeral=True,
             )
             return
@@ -498,8 +498,8 @@ class ExplorerView(OwnedView):
         )
 
     @discord.ui.button(
-        label="ãªã»ãã",
-        emoji="ð§¹",
+        label="リセット",
+        emoji="🧹",
         style=discord.ButtonStyle.danger,
         row=2,
     )
@@ -518,8 +518,8 @@ class ExplorerView(OwnedView):
         )
 
     @discord.ui.button(
-        label="çµäº",
-        emoji="âï¸",
+        label="終了",
+        emoji="✖️",
         style=discord.ButtonStyle.secondary,
         row=2,
     )
@@ -547,7 +547,7 @@ class TagToggleSelect(discord.ui.Select):
         self.parent_view = parent_view
 
         super().__init__(
-            placeholder="è¿½å ã»è§£é¤ããã¿ã°ãé¸æï¼è¤æ°å¯ï¼",
+            placeholder="追加・解除するタグを選択（複数可）",
             min_values=1,
             max_values=max(1, len(options)),
             options=options,
@@ -635,8 +635,8 @@ class CategoryView(OwnedView):
                 discord.SelectOption(
                     label=_short(tag, 85),
                     value=str(index),
-                    description=f"è©²å½ {count:,}ä»¶"[:100],
-                    emoji="â" if tag in selected else None,
+                    description=f"該当 {count:,}件"[:100],
+                    emoji="✅" if tag in selected else None,
                 )
                 for index, (tag, count) in enumerate(visible)
             ]
@@ -669,56 +669,56 @@ class CategoryView(OwnedView):
         embed = discord.Embed(
             title=f"{emoji} {label}",
             description=(
-                "ã¿ã°ãé¸ã¶ã¨è¿½å ãããä¸åº¦é¸ã¶ã¨è§£é¤ããã¾ãã\n"
-                "è¤æ°ãã¾ã¨ãã¦é¸æã§ãã¾ãã"
+                "タグを選ぶと追加、もう一度選ぶと解除されます。\n"
+                "複数をまとめて選択できます。"
             ),
             color=0x5865F2,
         )
 
         embed.add_field(
-            name="ãã®ã«ãã´ãªã¼ã®é¸æ",
+            name="このカテゴリーの選択",
             value=(
-                "ã»".join(selected)
+                "・".join(selected)
                 if selected
-                else "æªé¸æ"
+                else "未選択"
             ),
             inline=False,
         )
 
         embed.add_field(
-            name="ç¾å¨ã®åè£ç»å",
-            value=f"**{len(self.state.result_ids()):,}æ**",
+            name="現在の候補画像",
+            value=f"**{len(self.state.result_ids()):,}枚**",
             inline=True,
         )
 
         embed.add_field(
-            name="ãã¼ã¸",
+            name="ページ",
             value=f"**{self.page + 1}/{total_pages}**",
             inline=True,
         )
 
         if not self.options_data:
             embed.add_field(
-                name="ã¿ã°",
+                name="タグ",
                 value=(
-                    "ãã®ã«ãã´ãªã¼ã«ã¯"
-                    "å©ç¨ã§ããã¿ã°ãããã¾ããã"
+                    "このカテゴリーには"
+                    "利用できるタグがありません。"
                 ),
                 inline=False,
             )
 
         embed.set_footer(
             text=(
-                "åã¿ã°ã®ä»¶æ°ã¯ãã»ãã®ã«ãã´ãªã¼ã§"
-                "é¸ãã æ¡ä»¶ãåæ ãã¦ãã¾ãã"
+                "各タグの件数は、ほかのカテゴリーで"
+                "選んだ条件を反映しています。"
             )
         )
 
         return embed
 
     @discord.ui.button(
-        label="åã¸",
-        emoji="âï¸",
+        label="前へ",
+        emoji="◀️",
         style=discord.ButtonStyle.secondary,
         row=1,
     )
@@ -739,8 +739,8 @@ class CategoryView(OwnedView):
         )
 
     @discord.ui.button(
-        label="æ¬¡ã¸",
-        emoji="â¶ï¸",
+        label="次へ",
+        emoji="▶️",
         style=discord.ButtonStyle.secondary,
         row=1,
     )
@@ -761,8 +761,8 @@ class CategoryView(OwnedView):
         )
 
     @discord.ui.button(
-        label="ãã®åé¡ãè§£é¤",
-        emoji="ð§¹",
+        label="この分類を解除",
+        emoji="🧹",
         style=discord.ButtonStyle.danger,
         row=1,
     )
@@ -787,8 +787,8 @@ class CategoryView(OwnedView):
         )
 
     @discord.ui.button(
-        label="Explorerã¸æ»ã",
-        emoji="â©ï¸",
+        label="Explorerへ戻る",
+        emoji="↩️",
         style=discord.ButtonStyle.success,
         row=1,
     )
@@ -853,7 +853,7 @@ class ResultsView(OwnedView):
             1,
         ):
             absolute_index = start + offset
-            title = result.get("title") or "ç¡é¡"
+            title = result.get("title") or "無題"
 
             embed = discord.Embed(
                 title=(
@@ -862,13 +862,13 @@ class ResultsView(OwnedView):
                 ),
                 url=result.get("blog_url") or None,
                 description=(
-                    f"**ç»åID:** {result.get('id')}\n"
-                    f"**äººç©:** "
-                    f"{result.get('confirmed_people') or 'æªç¢ºå®'}\n"
-                    f"**æç¨¿è:** "
-                    f"{result.get('member_name') or 'ä¸æ'}\n"
-                    f"**æ¥æ:** "
-                    f"{result.get('published_at') or 'ä¸æ'}"
+                    f"**画像ID:** {result.get('id')}\n"
+                    f"**人物:** "
+                    f"{result.get('confirmed_people') or '未確定'}\n"
+                    f"**投稿者:** "
+                    f"{result.get('member_name') or '不明'}\n"
+                    f"**日時:** "
+                    f"{result.get('published_at') or '不明'}"
                 ),
                 color=0x00AAFF,
             )
@@ -884,7 +884,7 @@ class ResultsView(OwnedView):
 
             embed.set_footer(
                 text=(
-                    f"æ¤ç´¢çµæ "
+                    f"検索結果 "
                     f"{absolute_index}/{len(self.results)}"
                 )
             )
@@ -930,8 +930,8 @@ class ResultsView(OwnedView):
             self.add_item(button)
 
     @discord.ui.button(
-        label="åã®5ä»¶",
-        emoji="âï¸",
+        label="前の5件",
+        emoji="◀️",
         style=discord.ButtonStyle.secondary,
         row=1,
     )
@@ -952,8 +952,8 @@ class ResultsView(OwnedView):
         )
 
     @discord.ui.button(
-        label="æ¬¡ã®5ä»¶",
-        emoji="â¶ï¸",
+        label="次の5件",
+        emoji="▶️",
         style=discord.ButtonStyle.secondary,
         row=1,
     )
@@ -974,8 +974,8 @@ class ResultsView(OwnedView):
         )
 
     @discord.ui.button(
-        label="æ¡ä»¶å¤æ´",
-        emoji="ð§",
+        label="条件変更",
+        emoji="🔧",
         style=discord.ButtonStyle.success,
         row=1,
     )
@@ -1026,7 +1026,7 @@ class DetailView(OwnedView):
 
         embed = discord.Embed(
             title=_short(
-                result.get("title") or "ç¡é¡",
+                result.get("title") or "無題",
                 256,
             ),
             url=result.get("blog_url") or None,
@@ -1034,28 +1034,28 @@ class DetailView(OwnedView):
         )
 
         embed.add_field(
-            name="ð¼ï¸ ç»åID",
+            name="🖼️ 画像ID",
             value=str(result.get("id")),
             inline=True,
         )
 
         embed.add_field(
-            name="ð·ï¸ ã°ã«ã¼ã",
-            value=result.get("group_name") or "ä¸æ",
+            name="🏷️ グループ",
+            value=result.get("group_name") or "不明",
             inline=True,
         )
 
         embed.add_field(
-            name="âï¸ æç¨¿è",
-            value=result.get("member_name") or "ä¸æ",
+            name="✍️ 投稿者",
+            value=result.get("member_name") or "不明",
             inline=True,
         )
 
         embed.add_field(
-            name="ð¤ åã£ã¦ããäººç©",
+            name="👤 写っている人物",
             value=(
                 result.get("confirmed_people")
-                or "æªç¢ºå®"
+                or "未確定"
             ),
             inline=False,
         )
@@ -1063,11 +1063,11 @@ class DetailView(OwnedView):
         details: list[str] = []
 
         for label, key in (
-            ("æè£", "clothing"),
-            ("è¡¨æ", "expression"),
-            ("å ´æã»èæ¯", "background"),
-            ("ãã¼ãº", "pose"),
-            ("å°ç©", "objects"),
+            ("服装", "clothing"),
+            ("表情", "expression"),
+            ("場所・背景", "background"),
+            ("ポーズ", "pose"),
+            ("小物", "objects"),
         ):
             value = str(
                 result.get(key) or ""
@@ -1080,7 +1080,7 @@ class DetailView(OwnedView):
 
         if details:
             embed.add_field(
-                name="ð AIè§£æ",
+                name="🔎 AI解析",
                 value=_short(
                     "\n".join(details),
                     1024,
@@ -1097,12 +1097,12 @@ class DetailView(OwnedView):
 
         if result.get("manual_tags"):
             tag_lines.append(
-                f"**æå:** {result['manual_tags']}"
+                f"**手動:** {result['manual_tags']}"
             )
 
         if tag_lines:
             embed.add_field(
-                name="ð·ï¸ ã¿ã°",
+                name="🏷️ タグ",
                 value=_short(
                     "\n".join(tag_lines),
                     1024,
@@ -1111,8 +1111,8 @@ class DetailView(OwnedView):
             )
 
         embed.add_field(
-            name="ð æç¨¿æ¥æ",
-            value=result.get("published_at") or "ä¸æ",
+            name="📅 投稿日時",
+            value=result.get("published_at") or "不明",
             inline=False,
         )
 
@@ -1123,18 +1123,18 @@ class DetailView(OwnedView):
 
         embed.set_footer(
             text=(
-                f"æ¤ç´¢çµæ "
+                f"検索結果 "
                 f"{self.index + 1}/{len(self.results)}"
-                f"ã»è¨äºå "
-                f"{result.get('image_index', 0)}æç®"
+                f"・記事内 "
+                f"{result.get('image_index', 0)}枚目"
             )
         )
 
         return embed
 
     @discord.ui.button(
-        label="åã®ç»å",
-        emoji="âï¸",
+        label="前の画像",
+        emoji="◀️",
         style=discord.ButtonStyle.secondary,
         row=0,
     )
@@ -1156,8 +1156,8 @@ class DetailView(OwnedView):
         )
 
     @discord.ui.button(
-        label="æ¬¡ã®ç»å",
-        emoji="â¶ï¸",
+        label="次の画像",
+        emoji="▶️",
         style=discord.ButtonStyle.secondary,
         row=0,
     )
@@ -1179,8 +1179,8 @@ class DetailView(OwnedView):
         )
 
     @discord.ui.button(
-        label="ä¸è¦§ã¸æ»ã",
-        emoji="ðï¸",
+        label="一覧へ戻る",
+        emoji="🗂️",
         style=discord.ButtonStyle.primary,
         row=0,
     )
@@ -1201,8 +1201,8 @@ class DetailView(OwnedView):
         )
 
     @discord.ui.button(
-        label="æ¡ä»¶å¤æ´",
-        emoji="ð§",
+        label="条件変更",
+        emoji="🔧",
         style=discord.ButtonStyle.success,
         row=0,
     )
@@ -1221,7 +1221,7 @@ class DetailView(OwnedView):
 
 async def send_photo_tag_explorer(ctx) -> None:
     message = await ctx.send(
-        "ð ã¿ã°æå ±ãèª­ã¿è¾¼ãã§ãã¾ãâ¦"
+        "🔄 タグ情報を読み込んでいます…"
     )
 
     try:
@@ -1240,7 +1240,7 @@ async def send_photo_tag_explorer(ctx) -> None:
     except Exception as error:
         await message.edit(
             content=(
-                "â ï¸ ã¿ã°æ¤ç´¢ç»é¢ã®ä½æã«å¤±æãã¾ããã\n"
+                "⚠️ タグ検索画面の作成に失敗しました。\n"
                 f"`{type(error).__name__}: {error}`"
             )
         )
