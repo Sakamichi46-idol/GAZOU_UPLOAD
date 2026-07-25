@@ -1,6 +1,8 @@
 import asyncio
 from typing import Any
 
+import discord
+
 from blog_checker import get_latest_blog
 from config import ALL_BLOG_CHANNEL, BLOG_CHANNELS
 from database import (
@@ -41,6 +43,71 @@ def build_notification_text(
         f"🔗 {blog.get('url', '')}\n\n"
         f"📷 ブログ画像（{image_count}枚）"
     )
+
+
+def build_notification_embed(
+    blog: dict[str, Any],
+    image_count: int,
+) -> discord.Embed:
+    """
+    Discordへ送信するブログ通知Embedを作成する。
+    """
+
+    group = str(blog.get("group") or "").strip()
+    member = str(blog.get("member") or "").strip()
+    title = str(blog.get("title") or "新着ブログ").strip()
+    date = str(blog.get("date") or "").strip()
+    url = str(blog.get("url") or "").strip()
+
+    group_colors = {
+        "乃木坂46": 0x7E57C2,
+        "櫻坂46": 0xE91E63,
+        "日向坂46": 0x2196F3,
+    }
+
+    embed = discord.Embed(
+        title=title[:256],
+        url=url or None,
+        color=group_colors.get(group, 0x5865F2),
+    )
+
+    if group:
+        embed.add_field(
+            name="🏷️ グループ",
+            value=group[:1024],
+            inline=True,
+        )
+
+    if member:
+        embed.add_field(
+            name="👤 メンバー",
+            value=member[:1024],
+            inline=True,
+        )
+
+    if date:
+        embed.add_field(
+            name="📅 投稿日時",
+            value=date[:1024],
+            inline=False,
+        )
+
+    embed.add_field(
+        name="📷 ブログ画像",
+        value=f"{image_count}枚",
+        inline=True,
+    )
+
+    if url:
+        embed.add_field(
+            name="🔗 ブログを開く",
+            value=f"[公式ブログを見る]({url})",
+            inline=False,
+        )
+
+    embed.set_footer(text="新着ブログ通知")
+
+    return embed
 
 
 # =========================
@@ -286,9 +353,15 @@ async def notify_channel(
         len(images),
     )
 
+    embed = build_notification_embed(
+        blog,
+        len(images),
+    )
+
     await send_blog_media(
         channel=channel,
         text=text,
+        embed=embed,
         image_urls=images,
         send_delay=1.0,
         article_url=str(
