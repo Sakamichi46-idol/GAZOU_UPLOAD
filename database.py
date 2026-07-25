@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 # データベース設定
 # =========================
 
-DB_DIR = "/data"
+DB_DIR = "/app/data"
 
 DB_NAME = os.path.join(
     DB_DIR,
