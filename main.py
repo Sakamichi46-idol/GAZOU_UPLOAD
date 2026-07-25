@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands
 
 from blog_checker import get_latest_blog
-from blog_monitor import check_blog
+from blog_monitor import build_notification_embed, check_blog
 from database import init_db
 from image_getter import get_images
 from media_converter import send_blog_media
@@ -111,9 +111,15 @@ async def on_message(message):
                 f"📷 ブログ画像 ({len(images)}枚)"
             )
 
+            embed = build_notification_embed(
+                blog,
+                len(images),
+            )
+
             await send_blog_media(
                 channel=message.channel,
                 text=text,
+                embed=embed,
                 image_urls=images,
                 send_delay=1.0,
                 article_url=blog.get("url", url),
