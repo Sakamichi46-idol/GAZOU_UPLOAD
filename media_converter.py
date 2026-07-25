@@ -569,45 +569,41 @@ async def send_blog_media(
     article_url="",
     group="",
 ):
+    """
+    記事情報を先に送信し、その後で画像を送信する。
+
+    Embedと画像を同じメッセージに含めると、
+    Discord側の表示順によって画像がEmbedより先に
+    見えることがあるため、必ず別メッセージに分ける。
+    """
+
+    # 記事情報を必ず最初に送信する
+    await channel.send(
+        content=(None if embed else text),
+        embed=embed,
+        suppress_embeds=(embed is None),
+    )
 
     if not image_urls:
-
-        await channel.send(
-            content=(None if embed else text),
-            embed=embed,
-            suppress_embeds=(embed is None),
-        )
-
         return
-
-    # 新着ブログ通知は、画像URLの埋め込みではなくDiscord添付として送る。
-    # これにより、1メッセージにつき最大10枚の画像がギャラリー形式でまとまって表示される。
-    # LOW_EGRESS_MODEは写真検索などでは引き続き利用できるが、
-    # 新着ブログ通知では見た目を優先して添付方式を固定する。
-
 
     upload_limit = get_upload_limit(
         channel
     )
-
 
     print(
         f"Discord容量上限: "
         f"{format_size(upload_limit)}"
     )
 
-
     failed_images = []
     attachments = []
 
-
     async with aiohttp.ClientSession() as session:
-
         for index, image_url in enumerate(
             image_urls,
             start=1
         ):
-
             attachment = await download_attachment(
                 session,
                 image_url,
@@ -617,14 +613,11 @@ async def send_blog_media(
                 group=group,
             )
 
-
             file = attachment.get(
                 "file"
             )
 
-
             if file is None:
-
                 failed_images.append({
                     "url": image_url,
                     "reason": attachment.get(
@@ -632,80 +625,43 @@ async def send_blog_media(
                         "不明なエラー"
                     )
                 })
-
                 continue
-
 
             attachments.append(
                 file
             )
 
-
-    # Discordでは1メッセージにつき最大10ファイル
-    # 10枚ごとに分けて、まとめて送信する
-    text_sent = False
-
-
+    # Discordでは1メッセージにつき最大10ファイル。
+    # Embed送信後、画像だけを10枚ずつ送信する。
     for start_index in range(
         0,
         len(attachments),
         10
     ):
-
         file_group = attachments[
             start_index:start_index + 10
         ]
 
-
         await channel.send(
-            content=(
-                text
-                if not text_sent and embed is None
-                else None
-            ),
-            embed=(
-                embed
-                if not text_sent
-                else None
-            ),
             files=file_group,
-            suppress_embeds=(embed is None),
+            suppress_embeds=True,
         )
-
-
-        text_sent = True
-
 
         if (
             send_delay > 0
             and start_index + 10 < len(attachments)
         ):
-
             await asyncio.sleep(
                 send_delay
             )
 
-
-    # 全画像が失敗した場合も記事情報は送信
-    if not text_sent:
-
-        await channel.send(
-            content=(None if embed else text),
-            embed=embed,
-            suppress_embeds=(embed is None),
-        )
-
-
-    # 送れなかった画像はURLを投稿
+    # 送れなかった画像はURLと理由を投稿する
     if failed_images:
-
         lines = [
             "⚠️ 添付できなかった画像があります。"
         ]
 
-
         for failed in failed_images:
-
             lines.append(
                 (
                     f"{failed['url']}\n"
@@ -713,14 +669,11 @@ async def send_blog_media(
                 )
             )
 
-
         failed_text = "\n\n".join(
             lines
         )
 
-
         while failed_text:
-
             message_part = failed_text[
                 :1900
             ]
@@ -729,15 +682,13 @@ async def send_blog_media(
                 1900:
             ]
 
-
             await channel.send(
                 content=message_part,
                 suppress_embeds=True
             )
 
-
             if failed_text and send_delay > 0:
-
                 await asyncio.sleep(
                     send_delay
                 )
+
