@@ -42,11 +42,11 @@ def build_notification_text(
     url = str(blog.get("url") or "").strip()
 
     return (
-        f"🏷️ {group}\n\n"
-        f"👤 {member}\n\n"
-        f"📝 {title}\n\n"
-        f"📅 {date}\n\n"
-        f"🔗 {url}\n\n"
+        f"🏷️ {group}\n"
+        f"👤 {member}\n"
+        f"📝 {title}\n"
+        f"📅 {date}\n"
+        f"🔗 {url}\n"
         f"📷 ブログ画像（{image_count}枚）"
     )
 
