@@ -31,6 +31,7 @@ def get_sakurazaka_images(url):
         "member": "",
         "title": "",
         "date": "",
+        "url": url,
         "images": []
     }
 
