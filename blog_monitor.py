@@ -32,15 +32,21 @@ def build_notification_text(
     image_count: int,
 ) -> str:
     """
-    Discordへ送信するブログ通知文を作成する。
+    3グループ共通のDiscord通知文を作成する。
     """
 
+    group = str(blog.get("group") or "").strip()
+    member = str(blog.get("member") or "").strip()
+    title = str(blog.get("title") or "").strip()
+    date = str(blog.get("date") or "").strip()
+    url = str(blog.get("url") or "").strip()
+
     return (
-        f"🏷️ {blog.get('group', '')}\n"
-        f"👤 {blog.get('member', '')}\n"
-        f"📝 {blog.get('title', '')}\n"
-        f"📅 {blog.get('date', '')}\n"
-        f"🔗 {blog.get('url', '')}\n\n"
+        f"🏷️ {group}\n\n"
+        f"👤 {member}\n\n"
+        f"📝 {title}\n\n"
+        f"📅 {date}\n\n"
+        f"🔗 {url}\n\n"
         f"📷 ブログ画像（{image_count}枚）"
     )
 
@@ -353,15 +359,10 @@ async def notify_channel(
         len(images),
     )
 
-    embed = build_notification_embed(
-        blog,
-        len(images),
-    )
-
     await send_blog_media(
         channel=channel,
         text=text,
-        embed=embed,
+        embed=None,
         image_urls=images,
         send_delay=1.0,
         article_url=str(
