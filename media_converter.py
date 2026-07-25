@@ -564,6 +564,7 @@ async def send_blog_media(
     channel,
     text,
     image_urls,
+    embed=None,
     send_delay=1.0,
     article_url="",
     group="",
@@ -572,8 +573,9 @@ async def send_blog_media(
     if not image_urls:
 
         await channel.send(
-            content=text,
-            suppress_embeds=True
+            content=(None if embed else text),
+            embed=embed,
+            suppress_embeds=(embed is None),
         )
 
         return
@@ -658,11 +660,16 @@ async def send_blog_media(
         await channel.send(
             content=(
                 text
+                if not text_sent and embed is None
+                else None
+            ),
+            embed=(
+                embed
                 if not text_sent
                 else None
             ),
             files=file_group,
-            suppress_embeds=True
+            suppress_embeds=(embed is None),
         )
 
 
@@ -683,8 +690,9 @@ async def send_blog_media(
     if not text_sent:
 
         await channel.send(
-            content=text,
-            suppress_embeds=True
+            content=(None if embed else text),
+            embed=embed,
+            suppress_embeds=(embed is None),
         )
 
 
