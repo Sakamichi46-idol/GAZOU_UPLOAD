@@ -6,7 +6,7 @@ import discord
 from discord.ext import commands
 
 from blog_checker import get_latest_blog
-from blog_monitor import build_notification_embed, check_blog
+from blog_monitor import build_notification_text, check_blog
 from database import init_db
 from image_getter import get_images
 from media_converter import send_blog_media
@@ -102,16 +102,13 @@ async def on_message(message):
                 )
                 continue
 
-            text = (
-                f"🏷️ {blog.get('group', '')}\n"
-                f"👤 {blog.get('member', '')}\n"
-                f"📝 {blog.get('title', '')}\n"
-                f"📅 {blog.get('date', '')}\n"
-                f"🔗 {blog.get('url', url)}\n\n"
-                f"📷 ブログ画像 ({len(images)}枚)"
-            )
+            # URLがパーサー側に無い場合も、元のURLを必ず使う。
+            blog["url"] = str(
+                blog.get("url")
+                or url
+            ).strip()
 
-            embed = build_notification_embed(
+            text = build_notification_text(
                 blog,
                 len(images),
             )
@@ -119,7 +116,7 @@ async def on_message(message):
             await send_blog_media(
                 channel=message.channel,
                 text=text,
-                embed=embed,
+                embed=None,
                 image_urls=images,
                 send_delay=1.0,
                 article_url=blog.get("url", url),
