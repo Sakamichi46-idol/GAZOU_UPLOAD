@@ -370,6 +370,172 @@ def get_sakurazaka_latest():
 # 日向坂46
 # =========================
 
+def _find_hinata_article_container(link):
+    """
+    日向坂の一覧ページではHTMLのクラス名が変更されることがある。
+    個別ページへのリンクから親要素を順にたどり、
+    1記事分と判断できる最小の要素を返す。
+    """
+
+    date_pattern = re.compile(
+        r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}"
+        r"\s+\d{1,2}:\d{2}"
+    )
+
+    fallback = None
+    current = link
+
+    for _ in range(10):
+        current = getattr(current, "parent", None)
+
+        if current is None:
+            break
+
+        name = getattr(current, "name", "")
+
+        if name not in {"li", "article", "section", "div"}:
+            continue
+
+        detail_links = current.select(
+            'a[href*="/diary/detail/"]'
+        )
+
+        if len(detail_links) != 1:
+            continue
+
+        text = clean_text(
+            current.get_text(" ", strip=True)
+        )
+
+        if not text:
+            continue
+
+        if fallback is None:
+            fallback = current
+
+        if date_pattern.search(text):
+            return current
+
+    return fallback
+
+
+def _extract_hinata_metadata(article):
+    """
+    日向坂ブログ一覧の1記事分の要素から
+    タイトル・メンバー・日時を取得する。
+
+    専用クラスを優先し、取得できない場合は
+    「タイトル → 日時 → メンバー」という一覧上の並びを使う。
+    """
+
+    title = get_text_from_selectors(
+        article,
+        [
+            ".c-blog-top__title",
+            ".c-blog-article__title",
+            ".p-blog-top__title",
+            ".p-blog-article__title",
+            "[class*='blog'][class*='title']",
+            "h1",
+            "h2",
+            "h3",
+        ],
+    )
+
+    member = get_text_from_selectors(
+        article,
+        [
+            ".c-blog-top__name",
+            ".c-blog-article__name",
+            ".p-blog-top__name",
+            ".p-blog-article__name",
+            "[class*='blog'][class*='name']",
+            "[class*='member'][class*='name']",
+        ],
+    )
+
+    date_text = get_text_from_selectors(
+        article,
+        [
+            ".c-blog-article__date time",
+            ".c-blog-top__date time",
+            ".p-blog-article__date time",
+            ".p-blog-top__date time",
+            "[class*='blog'][class*='date'] time",
+            "[class*='blog'][class*='date']",
+            "time",
+        ],
+    )
+
+    date_pattern = re.compile(
+        r"20\d{2}[./-]\d{1,2}[./-]\d{1,2}"
+        r"\s+\d{1,2}:\d{2}"
+    )
+
+    strings = [
+        clean_text(value)
+        for value in article.stripped_strings
+        if clean_text(value)
+    ]
+
+    date_index = None
+
+    if not date_text:
+        for index, value in enumerate(strings):
+            match = date_pattern.search(value)
+
+            if match:
+                date_text = match.group(0)
+                date_index = index
+                break
+    else:
+        normalized_date_text = clean_text(date_text)
+
+        for index, value in enumerate(strings):
+            if normalized_date_text in value:
+                date_index = index
+                break
+
+    if date_index is not None:
+        # 一覧上では通常、日時の直前がタイトル、直後がメンバー名。
+        if not title:
+            for index in range(date_index - 1, -1, -1):
+                candidate = strings[index]
+
+                if candidate in {"個別ページ", "OFFICIAL BLOG"}:
+                    continue
+
+                if "/diary/detail/" in candidate:
+                    continue
+
+                if date_pattern.search(candidate):
+                    continue
+
+                title = candidate
+                break
+
+        if not member:
+            for index in range(date_index + 1, len(strings)):
+                candidate = strings[index]
+
+                if candidate in {"個別ページ", "OFFICIAL BLOG"}:
+                    continue
+
+                if date_pattern.search(candidate):
+                    continue
+
+                # メンバー名は本文より前にあるため、最初の短い文字列を採用。
+                if len(candidate) <= 40:
+                    member = candidate
+                    break
+
+    return (
+        clean_text(member),
+        clean_text(title),
+        normalize_datetime(date_text),
+    )
+
+
 def get_hinatazaka_latest():
     list_url = (
         "https://www.hinatazaka46.com"
@@ -391,123 +557,61 @@ def get_hinatazaka_latest():
             "lxml",
         )
 
-        articles = soup.select(
-            "li.p-blog-top__item"
+        results = []
+        seen_urls = set()
+
+        # クラス名に依存せず、個別ページへのリンクを起点に記事を抽出する。
+        detail_links = soup.select(
+            'a[href*="/diary/detail/"]'
         )
 
-        results = []
-
-        if articles:
-            for article in articles[
-                :MAX_POSTS_PER_GROUP
-            ]:
-                link = article.select_one(
-                    'a[href*="/diary/detail/"]'
+        for link in detail_links:
+            blog_url = canonicalize_url(
+                urljoin(
+                    list_url,
+                    link.get("href", ""),
                 )
+            )
 
-                if not link:
-                    continue
+            if not blog_url or blog_url in seen_urls:
+                continue
 
-                blog_url = canonicalize_url(
-                    urljoin(
-                        list_url,
-                        link.get(
-                            "href",
-                            "",
-                        ),
-                    )
-                )
+            article = _find_hinata_article_container(
+                link
+            )
 
-                if not blog_url:
-                    continue
+            if article is None:
+                continue
 
-                member = get_text_from_selectors(
-                    article,
-                    [
-                        ".c-blog-top__name",
-                        ".c-blog-article__name",
-                        ".name",
-                    ],
-                )
+            member, title, date = (
+                _extract_hinata_metadata(article)
+            )
 
-                title = get_text_from_selectors(
-                    article,
-                    [
-                        ".c-blog-top__title",
-                        ".c-blog-article__title",
-                        ".title",
-                    ],
-                )
+            results.append(
+                {
+                    "group": "日向坂46",
+                    "url": blog_url,
+                    "member": member,
+                    "title": title,
+                    "date": date,
+                    "text": "",
+                }
+            )
 
-                date_text = get_text_from_selectors(
-                    article,
-                    [
-                        ".c-blog-article__date time",
-                        ".c-blog-top__date time",
-                        ".c-blog-article__date",
-                        ".date",
-                        "time",
-                    ],
-                )
+            seen_urls.add(blog_url)
 
-                results.append(
-                    {
-                        "group": "日向坂46",
-                        "url": blog_url,
-                        "member": member,
-                        "title": title,
-                        "date": normalize_datetime(
-                            date_text
-                        ),
-                        "text": "",
-                    }
-                )
-
-        # 一覧のliが取得できなかった場合の予備処理
-        if not results:
-            links = []
-
-            for link in soup.select(
-                'a[href*="/diary/detail/"]'
-            ):
-                blog_url = canonicalize_url(
-                    urljoin(
-                        list_url,
-                        link.get(
-                            "href",
-                            "",
-                        ),
-                    )
-                )
-
-                if (
-                    blog_url
-                    and blog_url not in links
-                ):
-                    links.append(
-                        blog_url
-                    )
-
-                if (
-                    len(links)
-                    >= MAX_POSTS_PER_GROUP
-                ):
-                    break
-
-            for blog_url in links:
-                results.append(
-                    {
-                        "group": "日向坂46",
-                        "url": blog_url,
-                        "member": "",
-                        "title": "",
-                        "date": "",
-                        "text": "",
-                    }
-                )
+            if len(results) >= MAX_POSTS_PER_GROUP:
+                break
 
         results = remove_duplicate_blogs(
             results
+        )
+
+        missing_metadata = sum(
+            1
+            for blog in results
+            if not blog.get("member")
+            or not blog.get("title")
         )
 
         print(
@@ -515,6 +619,14 @@ def get_hinatazaka_latest():
             len(results),
         )
 
+        if missing_metadata:
+            print(
+                "日向坂メタデータ未取得:",
+                missing_metadata,
+                "件",
+            )
+
+        # 一覧は新しい順なので、古い記事から通知する。
         return list(
             reversed(results)
         )
