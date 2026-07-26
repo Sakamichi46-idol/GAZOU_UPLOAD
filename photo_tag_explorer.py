@@ -145,17 +145,18 @@ def _option_counts(
     index: dict[str, dict[str, set[int]]],
     selections: dict[str, set[str]],
     category: str,
+    *,
+    person_match_mode: str = "or",
 ) -> list[tuple[str, int]]:
     base = _matching_ids(
         all_ids,
         index,
         selections,
         exclude_category=category,
-        person_match_mode="or",
+        person_match_mode=person_match_mode,
     )
 
     selected = selections.get(category, set())
-
     values: list[tuple[str, int]] = []
 
     for tag, image_ids in index.get(category, {}).items():
@@ -701,6 +702,7 @@ class CategoryView(OwnedView):
             state.index,
             state.selections,
             category,
+            person_match_mode=state.person_match_mode,
         )
 
         max_page = max(
