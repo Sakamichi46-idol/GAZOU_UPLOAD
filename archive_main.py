@@ -1,6 +1,8 @@
 import asyncio
 import os
-from typing import Any
+import time
+from datetime import datetime
+from typing import Any, Awaitable, Callable, TypeVar
 
 import aiohttp
 import discord
@@ -348,10 +350,65 @@ PHOTO_ARCHIVE_INTERVAL = max(
 archive_cycle_lock = asyncio.Lock()
 startup_initialized = False
 
+T = TypeVar("T")
+
+ARCHIVE_RETRY_DELAYS = (0, 5, 10)
+
+archive_runtime_status: dict[str, Any] = {
+    "running": False,
+    "last_started": None,
+    "last_finished": None,
+    "last_result": "未実行",
+    "last_error": None,
+    "last_targets": 0,
+    "last_completed": 0,
+    "last_failed": 0,
+    "last_duration": 0.0,
+}
+
 
 # =========================
 # 補助関数
 # =========================
+
+def local_time_text(value: datetime | None) -> str:
+    if value is None:
+        return "未実行"
+    return value.astimezone().strftime("%Y年%m月%d日 %H:%M:%S")
+
+
+def log_event(level: str, message: str) -> None:
+    print(f"[{level.upper()}] {message}")
+
+
+async def run_with_retry(
+    operation_name: str,
+    operation: Callable[[], Awaitable[T]],
+) -> T:
+    last_error: Exception | None = None
+
+    for attempt, delay in enumerate(ARCHIVE_RETRY_DELAYS, start=1):
+        if delay > 0:
+            log_event(
+                "WARNING",
+                f"{operation_name}を{delay}秒後に再試行します "
+                f"({attempt}/{len(ARCHIVE_RETRY_DELAYS)})",
+            )
+            await asyncio.sleep(delay)
+
+        try:
+            return await operation()
+        except Exception as error:
+            last_error = error
+            log_event(
+                "WARNING",
+                f"{operation_name}に失敗しました "
+                f"({attempt}/{len(ARCHIVE_RETRY_DELAYS)}): {error}",
+            )
+
+    assert last_error is not None
+    raise last_error
+
 
 def format_bytes(
     size: int,
@@ -1341,6 +1398,51 @@ async def on_ready() -> None:
 
 
 # =========================
+# 統合ステータス
+# =========================
+
+@bot.command(name="status")
+@commands.is_owner()
+async def status_command(ctx: commands.Context) -> None:
+    try:
+        archive_total, photo_counts, storage_stats = await asyncio.gather(
+            asyncio.to_thread(archive_count),
+            asyncio.to_thread(get_photo_db_counts),
+            asyncio.to_thread(get_photo_storage_stats),
+        )
+    except Exception as error:
+        log_event("ERROR", f"ステータス取得エラー: {error}")
+        await ctx.send(f"⚠️ ステータス取得に失敗しました。\n`{error}`")
+        return
+
+    ai_status = get_photo_ai_status()
+    storage_bytes = int(storage_stats.get("total_size", 0) or 0)
+
+    await ctx.send(
+        "🤖 **アーカイブBotステータス**\n"
+        f"Bot接続: **{'稼働中' if bot.is_ready() else '準備中'}**\n"
+        f"通知アーカイブ定期巡回: **{'動作中' if archive_loop.is_running() else '停止中'}**\n"
+        f"通知アーカイブ現在処理: **{'実行中' if archive_cycle_lock.locked() else '停止中'}**\n"
+        f"写真アーカイブ定期巡回: **{'動作中' if photo_archive_loop.is_running() else '停止中'}**\n"
+        f"写真アーカイブ現在処理: **{'実行中' if is_photo_archive_running() else '停止中'}**\n"
+        f"通知済み記事: **{archive_total}件**\n"
+        f"写真DBブログ: **{photo_counts.get('blogs', 0)}件**\n"
+        f"写真DB画像: **{photo_counts.get('images', 0)}件**\n"
+        f"確認待ち: **{photo_counts.get('pending_reviews', 0)}件**\n"
+        f"保存容量: **{format_bytes(storage_bytes)}**\n"
+        f"AI解析: **{'有効' if ai_status.get('enabled') else '無効'}**\n"
+        f"前回開始: **{local_time_text(archive_runtime_status.get('last_started'))}**\n"
+        f"前回完了: **{local_time_text(archive_runtime_status.get('last_finished'))}**\n"
+        f"前回結果: **{archive_runtime_status.get('last_result', '未実行')}**\n"
+        f"前回対象: **{archive_runtime_status.get('last_targets', 0)}件**\n"
+        f"前回成功: **{archive_runtime_status.get('last_completed', 0)}件**\n"
+        f"前回失敗: **{archive_runtime_status.get('last_failed', 0)}件**\n"
+        f"前回処理時間: **{archive_runtime_status.get('last_duration', 0.0):.2f}秒**\n"
+        f"前回エラー: **{archive_runtime_status.get('last_error') or 'なし'}**"
+    )
+
+
+# =========================
 # アーカイブ操作コマンド
 # =========================
 
@@ -1797,94 +1899,80 @@ async def ai_analyze_command(
 # =========================
 
 async def run_archive_cycle() -> None:
-    """
-    未アーカイブ記事を取得して順番に処理する。
-    """
+    """未アーカイブ記事を取得して順番に処理する。"""
 
     if archive_cycle_lock.locked():
-
-        print(
-            "前回のアーカイブ処理が継続中のため、"
-            "今回の巡回をスキップします。"
-        )
-
+        log_event("WARNING", "前回処理が継続中のため今回の巡回をスキップします。")
         return
 
     async with archive_cycle_lock:
-
-        print(
-            "=" * 50
-        )
-
-        print(
-            "アーカイブ巡回を開始します。"
-        )
+        started_at = datetime.now().astimezone()
+        started_clock = time.monotonic()
+        archive_runtime_status.update({
+            "running": True,
+            "last_started": started_at,
+            "last_finished": None,
+            "last_result": "実行中",
+            "last_error": None,
+            "last_targets": 0,
+            "last_completed": 0,
+            "last_failed": 0,
+        })
+        log_event("INFO", "アーカイブ巡回開始")
 
         try:
+            blogs = await run_with_retry(
+                "ブログ一覧取得",
+                get_archive_targets,
+            )
+            archive_runtime_status["last_targets"] = len(blogs)
+            log_event("INFO", f"未処理記事数: {len(blogs)}件")
 
-            blogs = await get_archive_targets()
+            if not blogs:
+                archive_runtime_status["last_result"] = "正常（対象なし）"
+                return
+
+            timeout = aiohttp.ClientTimeout(total=120)
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
+            completed = 0
+            failed = 0
+
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+                for index, blog in enumerate(blogs, start=1):
+                    succeeded = await process_archive_blog(
+                        session, blog, index, len(blogs)
+                    )
+                    if succeeded:
+                        completed += 1
+                    else:
+                        failed += 1
+                    archive_runtime_status["last_completed"] = completed
+                    archive_runtime_status["last_failed"] = failed
+                    await asyncio.sleep(SEND_DELAY)
+
+            archive_runtime_status["last_result"] = (
+                f"正常（成功{completed}件・失敗{failed}件）"
+                if failed == 0
+                else f"一部失敗（成功{completed}件・失敗{failed}件）"
+            )
+            log_event(
+                "SUCCESS" if failed == 0 else "WARNING",
+                f"アーカイブ巡回完了: 成功{completed}件 / 失敗{failed}件",
+            )
 
         except Exception as error:
+            archive_runtime_status["last_result"] = "エラー"
+            archive_runtime_status["last_error"] = str(error)
+            log_event("ERROR", f"アーカイブ巡回エラー: {error}")
 
-            print(
-                "ブログ一覧取得エラー:",
-                error,
+        finally:
+            archive_runtime_status["running"] = False
+            archive_runtime_status["last_finished"] = datetime.now().astimezone()
+            archive_runtime_status["last_duration"] = time.monotonic() - started_clock
+            log_event(
+                "INFO",
+                f"アーカイブ処理時間: {archive_runtime_status['last_duration']:.2f}秒",
             )
-
-            return
-
-        if not blogs:
-
-            print(
-                "未アーカイブの記事はありません。"
-            )
-
-            return
-
-        print(
-            "今回の処理対象:",
-            f"{len(blogs)}件",
-        )
-
-        timeout = aiohttp.ClientTimeout(
-            total=120
-        )
-
-        connector = aiohttp.TCPConnector(
-            limit=10,
-            ttl_dns_cache=300,
-        )
-
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-        ) as session:
-
-            for index, blog in enumerate(
-                blogs,
-                start=1,
-            ):
-
-                await process_archive_blog(
-                    session,
-                    blog,
-                    index,
-                    len(
-                        blogs
-                    ),
-                )
-
-                await asyncio.sleep(
-                    SEND_DELAY
-                )
-
-        print(
-            "=" * 50
-        )
-
-        print(
-            "今回のアーカイブ巡回が完了しました。"
-        )
 
 
 async def process_archive_blog(
@@ -1892,7 +1980,7 @@ async def process_archive_blog(
     blog: dict[str, Any],
     index: int,
     total: int,
-) -> None:
+) -> bool:
     """
     ブログ1件を処理する。
     """
@@ -1947,7 +2035,7 @@ async def process_archive_blog(
             "URLが空のためスキップします。"
         )
 
-        return
+        return False
 
     try:
 
@@ -1961,22 +2049,15 @@ async def process_archive_blog(
                 "送信先チャンネルがありません。"
             )
 
-            return
+            return False
 
         try:
-
-            image_urls = await get_images(
-                blog_url
+            image_urls = await run_with_retry(
+                "記事画像URL取得",
+                lambda: get_images(blog_url),
             )
-
         except Exception as error:
-
-            print(
-                "記事画像URL取得エラー:",
-                blog_url,
-                error,
-            )
-
+            log_event("ERROR", f"記事画像URL取得エラー: {blog_url} / {error}")
             image_urls = []
 
         image_urls = list(
@@ -2041,25 +2122,21 @@ async def process_archive_blog(
                 blog,
             )
 
-            print(
-                "アーカイブ保存完了:",
-                blog_url,
-            )
+            log_event("SUCCESS", f"アーカイブ保存完了: {blog_url}")
+            return True
 
         else:
 
-            print(
-                "一部の送信に失敗したため、"
-                "通知済みDBには保存しませんでした。"
+            log_event(
+                "WARNING",
+                "一部の送信に失敗したため通知済みDBへ保存しませんでした。",
             )
+            return False
 
     except Exception as error:
 
-        print(
-            "アーカイブ処理エラー:",
-            blog_url,
-            error,
-        )
+        log_event("ERROR", f"アーカイブ処理エラー: {blog_url} / {error}")
+        return False
 
 
 @tasks.loop(
