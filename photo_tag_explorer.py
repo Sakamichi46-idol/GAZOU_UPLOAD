@@ -55,7 +55,7 @@ def _all_image_ids() -> set[int]:
             SELECT id
             FROM photo_images
             WHERE download_status = 'completed'
-              AND local_path != ''
+              AND (local_path != '' OR bucket_key != '')
             """
         ).fetchall()
 
@@ -111,6 +111,7 @@ def _matching_ids(
     selections: dict[str, set[str]],
     *,
     exclude_category: str | None = None,
+    person_match_mode: str = "or",
 ) -> set[int]:
     result = set(all_ids)
 
@@ -118,12 +119,18 @@ def _matching_ids(
         if category == exclude_category or not selected_tags:
             continue
 
-        category_ids: set[int] = set()
-
-        for tag in selected_tags:
-            category_ids.update(
-                index.get(category, {}).get(tag, set())
-            )
+        if category == "person" and person_match_mode == "and":
+            category_ids = set(all_ids)
+            for tag in selected_tags:
+                category_ids.intersection_update(
+                    index.get(category, {}).get(tag, set())
+                )
+        else:
+            category_ids: set[int] = set()
+            for tag in selected_tags:
+                category_ids.update(
+                    index.get(category, {}).get(tag, set())
+                )
 
         result.intersection_update(category_ids)
 
@@ -144,6 +151,7 @@ def _option_counts(
         index,
         selections,
         exclude_category=category,
+        person_match_mode="or",
     )
 
     selected = selections.get(category, set())
@@ -194,6 +202,16 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                     WHERE pip.image_id = photo_images.id
                       AND pip.relation_status = 'confirmed'
                 ), '') AS confirmed_people,
+
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = photo_images.id
+                      AND pip.relation_status = 'candidate'
+                ), '') AS candidate_people,
+
+                COALESCE(photo_images.analysis_status, 'pending') AS analysis_status,
+                COALESCE(photo_images.bucket_key, '') AS bucket_key,
 
                 COALESCE(photo_ai_analysis.clothing, '') AS clothing,
                 COALESCE(photo_ai_analysis.expression, '') AS expression,
@@ -247,6 +265,7 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
 @dataclass
 class ExplorerState:
     owner_id: int
+    person_match_mode: str = "or"
 
     selections: dict[str, set[str]] = field(
         default_factory=lambda: {
@@ -278,6 +297,7 @@ class ExplorerState:
             self.all_ids,
             self.index,
             self.selections,
+            person_match_mode=self.person_match_mode,
         )
 
     def selected_lines(self) -> list[str]:
@@ -289,8 +309,12 @@ class ExplorerState:
 
             emoji, label = CATEGORY_DEFS[category]
 
+            suffix = ""
+            if category == "person" and len(tags) >= 2:
+                suffix = "（全員）" if self.person_match_mode == "and" else "（いずれか）"
+
             lines.append(
-                f"{emoji} **{label}:** {'・'.join(sorted(tags))}"
+                f"{emoji} **{label}:** {'・'.join(sorted(tags))}{suffix}"
             )
 
         return lines
@@ -298,6 +322,36 @@ class ExplorerState:
     def clear(self) -> None:
         for tags in self.selections.values():
             tags.clear()
+
+
+def _zero_result_advice(state: ExplorerState) -> list[str]:
+    advice: list[tuple[int, str]] = []
+    for category, tags in state.selections.items():
+        if not tags:
+            continue
+        copied = {key: set(values) for key, values in state.selections.items()}
+        copied[category].clear()
+        count = len(_matching_ids(
+            state.all_ids,
+            state.index,
+            copied,
+            person_match_mode=state.person_match_mode,
+        ))
+        if count:
+            emoji, label = CATEGORY_DEFS[category]
+            advice.append((count, f"{emoji} {label}を解除 → {count:,}枚"))
+    advice.sort(reverse=True)
+    return [text for _count, text in advice[:3]]
+
+
+def _person_matches(state: ExplorerState, query: str) -> list[str]:
+    clean = str(query or "").strip().lower()
+    if not clean:
+        return []
+    return [
+        name for name in state.index.get("person", {})
+        if clean in name.lower()
+    ][:20]
 
 
 class OwnedView(discord.ui.View):
@@ -323,6 +377,10 @@ class OwnedView(discord.ui.View):
 
         return True
 
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
 
 def build_explorer_embed(
     state: ExplorerState,
@@ -331,19 +389,19 @@ def build_explorer_embed(
     selected_lines = state.selected_lines()
 
     embed = discord.Embed(
-        title="🔍 写真タグ検索",
+        title="🔍 写真検索",
         description=(
-            "下のカテゴリーから条件を選んでください。\n"
-            "**同じカテゴリー内はOR、カテゴリー同士はAND**で検索します。"
+            "カテゴリーを選んで条件を絞り込みます。\n"
+            "人物は **全員写っている（AND）／いずれか（OR）** を切り替えられます。"
         ),
         color=0x2B90D9,
     )
 
     embed.add_field(
-        name="📚 ライブラリ",
+        name="📊 検索状況",
         value=(
-            f"登録画像: **{len(state.all_ids):,}枚**\n"
-            f"候補画像: **{result_count:,}枚**"
+            f"登録画像：**{len(state.all_ids):,}枚**\n"
+            f"候補画像：**{result_count:,}枚**"
         ),
         inline=False,
     )
@@ -358,57 +416,148 @@ def build_explorer_embed(
         inline=False,
     )
 
-    recommendations: list[tuple[str, str, int]] = []
-    current_ids = state.result_ids()
-
-    for category, tag_map in state.index.items():
-        selected = state.selections.get(category, set())
-
-        for tag, ids in tag_map.items():
-            if tag in selected:
-                continue
-
-            count = len(current_ids.intersection(ids))
-
-            if count:
-                recommendations.append(
-                    (category, tag, count)
-                )
-
-    recommendations.sort(
-        key=lambda item: (
-            -item[2],
-            item[1],
+    if result_count == 0 and selected_lines:
+        advice = _zero_result_advice(state)
+        embed.add_field(
+            name="⚠️ 該当なし",
+            value=(
+                "次の条件を解除すると候補が戻ります。\n" + "\n".join(advice)
+                if advice else
+                "条件の組み合わせに一致する画像がありません。条件を減らしてください。"
+            ),
+            inline=False,
         )
-    )
-
-    recommendation_lines: list[str] = []
-
-    for category, tag, count in recommendations[:5]:
-        emoji, _ = CATEGORY_DEFS[category]
-
-        recommendation_lines.append(
-            f"{emoji} {tag} **({count:,})**"
+    else:
+        recommendations: list[tuple[str, str, int]] = []
+        current_ids = state.result_ids()
+        for category, tag_map in state.index.items():
+            selected = state.selections.get(category, set())
+            for tag, ids in tag_map.items():
+                if tag in selected:
+                    continue
+                count = len(current_ids.intersection(ids))
+                if count:
+                    recommendations.append((category, tag, count))
+        recommendations.sort(key=lambda item: (-item[2], item[1]))
+        recommendation_lines = []
+        for category, tag, count in recommendations[:5]:
+            emoji, _ = CATEGORY_DEFS[category]
+            recommendation_lines.append(f"{emoji} {tag} **({count:,})**")
+        embed.add_field(
+            name="✨ おすすめ",
+            value="\n".join(recommendation_lines) if recommendation_lines else "追加できるおすすめ条件はありません。",
+            inline=False,
         )
 
-    embed.add_field(
-        name="✨ おすすめタグ",
-        value=(
-            "\n".join(recommendation_lines)
-            if recommendation_lines
-            else "現在の条件では候補がありません。"
-        ),
-        inline=False,
-    )
-
-    embed.set_footer(
-        text=(
-            "カテゴリーを操作するたびに、"
-            "現在の条件に応じた件数へ更新されます。"
-        )
-    )
-
+    embed.set_footer(text="候補件数は条件を変更するたびに更新されます。操作期限は10分です。")
     return embed
+
+
+class PersonNameModal(discord.ui.Modal, title="人物名で検索"):
+    person_name = discord.ui.TextInput(
+        label="人物名",
+        placeholder="例：岩本蓮加（部分一致可）",
+        max_length=50,
+    )
+
+    def __init__(self, state: ExplorerState):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        matches = _person_matches(self.state, str(self.person_name))
+        if not matches:
+            await interaction.response.send_message(
+                "⚠️ 一致する確認済み人物が見つかりませんでした。",
+                ephemeral=True,
+            )
+            return
+        if len(matches) == 1:
+            self.state.selections["person"].add(matches[0])
+            view = ExplorerView(self.state)
+            await interaction.response.edit_message(
+                embed=build_explorer_embed(self.state),
+                view=view,
+            )
+            return
+        view = PersonMatchView(self.state, matches)
+        await interaction.response.send_message(
+            "候補から人物を選んでください。",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class PersonMatchSelect(discord.ui.Select):
+    def __init__(self, parent: "PersonMatchView"):
+        self.parent_view = parent
+        super().__init__(
+            placeholder="人物を選択（複数可）",
+            min_values=1,
+            max_values=len(parent.matches),
+            options=[discord.SelectOption(label=_short(name, 100), value=name) for name in parent.matches],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.state.selections["person"].update(self.values)
+        await interaction.response.send_message(
+            "✅ 人物条件に追加しました。元の検索画面へ戻ってください。",
+            ephemeral=True,
+        )
+        self.parent_view.stop()
+
+
+class PersonMatchView(OwnedView):
+    def __init__(self, state: ExplorerState, matches: list[str]):
+        super().__init__(state, timeout=180)
+        self.matches = matches[:25]
+        self.add_item(PersonMatchSelect(self))
+
+
+class ConditionRemoveSelect(discord.ui.Select):
+    def __init__(self, parent: "ConditionRemoveView"):
+        self.parent_view = parent
+        options = []
+        self.keys: list[tuple[str, str]] = []
+        for category, tags in parent.state.selections.items():
+            emoji, label = CATEGORY_DEFS[category]
+            for tag in sorted(tags):
+                self.keys.append((category, tag))
+                options.append(discord.SelectOption(
+                    label=_short(tag, 85),
+                    description=f"{label}から解除"[:100],
+                    emoji=emoji,
+                    value=str(len(self.keys)-1),
+                ))
+        options = options[:25]
+        self.keys = self.keys[:25]
+        super().__init__(
+            placeholder="解除する条件を選択",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        for value in self.values:
+            category, tag = self.keys[int(value)]
+            self.parent_view.state.selections[category].discard(tag)
+        view = ExplorerView(self.parent_view.state)
+        await interaction.response.edit_message(
+            embed=build_explorer_embed(self.parent_view.state),
+            view=view,
+        )
+
+
+class ConditionRemoveView(OwnedView):
+    def __init__(self, state: ExplorerState):
+        super().__init__(state)
+        self.add_item(ConditionRemoveSelect(self))
+
+    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ExplorerView(self.state)
+        await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
 
 
 class ExplorerView(OwnedView):
@@ -417,125 +566,73 @@ class ExplorerView(OwnedView):
         self._build_items()
 
     def _build_items(self) -> None:
-        for category, (emoji, label) in CATEGORY_DEFS.items():
-            selected_count = len(
-                self.state.selections.get(category, set())
-            )
-
-            tag_count = len(
-                self.state.index.get(category, {})
-            )
-
-            if selected_count:
-                text = f"{label} ({selected_count})"
-            else:
-                text = f"{label} ({tag_count})"
-
+        for index_no, (category, (emoji, label)) in enumerate(CATEGORY_DEFS.items()):
+            selected_count = len(self.state.selections.get(category, set()))
+            tag_count = len(self.state.index.get(category, {}))
+            text = f"{label} ({selected_count if selected_count else tag_count})"
             button = discord.ui.Button(
-                label=text[:80],
-                emoji=emoji,
-                style=(
-                    discord.ButtonStyle.primary
-                    if selected_count
-                    else discord.ButtonStyle.secondary
-                ),
-                custom_id=f"tag_category:{category}",
+                label=text[:80], emoji=emoji,
+                style=discord.ButtonStyle.primary if selected_count else discord.ButtonStyle.secondary,
+                custom_id=f"tag_category:{category}", row=index_no // 5,
             )
-
-            async def callback(
-                interaction: discord.Interaction,
-                key: str = category,
-            ) -> None:
-                view = CategoryView(
-                    self.state,
-                    key,
-                    page=0,
-                )
-
-                await interaction.response.edit_message(
-                    embed=view.build_embed(),
-                    view=view,
-                )
-
+            async def callback(interaction: discord.Interaction, key: str = category) -> None:
+                view = CategoryView(self.state, key, page=0)
+                await interaction.response.edit_message(embed=view.build_embed(), view=view)
             button.callback = callback
             self.add_item(button)
 
-    @discord.ui.button(
-        label="検索結果を見る",
-        emoji="🔍",
-        style=discord.ButtonStyle.success,
-        row=2,
-    )
-    async def search(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        result_ids = self.state.result_ids()
+        name_button = discord.ui.Button(label="人物名入力", emoji="🔤", style=discord.ButtonStyle.secondary, row=2)
+        async def name_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(PersonNameModal(self.state))
+        name_button.callback = name_callback
+        self.add_item(name_button)
 
-        results = await asyncio.to_thread(
-            _load_results,
-            result_ids,
-        )
+        mode_label = "人物：全員" if self.state.person_match_mode == "and" else "人物：いずれか"
+        mode_button = discord.ui.Button(label=mode_label, emoji="👥", style=discord.ButtonStyle.primary, row=2)
+        async def mode_callback(interaction: discord.Interaction) -> None:
+            self.state.person_match_mode = "or" if self.state.person_match_mode == "and" else "and"
+            view = ExplorerView(self.state)
+            await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
+        mode_button.callback = mode_callback
+        self.add_item(mode_button)
 
-        if not results:
-            await interaction.response.send_message(
-                "🔍 条件に一致する画像はありませんでした。"
-                "条件を減らしてみてください。",
-                ephemeral=True,
+        has_conditions = any(self.state.selections.values())
+        remove_button = discord.ui.Button(label="条件を個別解除", emoji="➖", style=discord.ButtonStyle.secondary, row=2, disabled=not has_conditions)
+        async def remove_callback(interaction: discord.Interaction) -> None:
+            view = ConditionRemoveView(self.state)
+            await interaction.response.edit_message(
+                embed=discord.Embed(title="➖ 条件を個別解除", description="解除する条件を選択してください。", color=0x5865F2),
+                view=view,
             )
-            return
+        remove_button.callback = remove_callback
+        self.add_item(remove_button)
 
-        view = ResultsView(
-            self.state,
-            results,
-            page=0,
-        )
+        count = len(self.state.result_ids())
+        search_button = discord.ui.Button(label=f"{count:,}枚を検索"[:80], emoji="🔍", style=discord.ButtonStyle.success, row=3, disabled=count == 0)
+        async def search_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            results = await asyncio.to_thread(_load_results, self.state.result_ids())
+            view = ResultsView(self.state, results, page=0)
+            await interaction.edit_original_response(embeds=view.build_embeds(), view=view)
+        search_button.callback = search_callback
+        self.add_item(search_button)
 
-        await interaction.response.edit_message(
-            embeds=view.build_embeds(),
-            view=view,
-        )
+        reset_button = discord.ui.Button(label="全解除", emoji="🧹", style=discord.ButtonStyle.danger, row=3, disabled=not has_conditions)
+        async def reset_callback(interaction: discord.Interaction) -> None:
+            self.state.clear()
+            view = ExplorerView(self.state)
+            await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
+        reset_button.callback = reset_callback
+        self.add_item(reset_button)
 
-    @discord.ui.button(
-        label="リセット",
-        emoji="🧹",
-        style=discord.ButtonStyle.danger,
-        row=2,
-    )
-    async def reset(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        self.state.clear()
-
-        view = ExplorerView(self.state)
-
-        await interaction.response.edit_message(
-            embed=build_explorer_embed(self.state),
-            view=view,
-        )
-
-    @discord.ui.button(
-        label="終了",
-        emoji="✖️",
-        style=discord.ButtonStyle.secondary,
-        row=2,
-    )
-    async def close(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        for item in self.children:
-            item.disabled = True
-
-        await interaction.response.edit_message(
-            view=self
-        )
-
-        self.stop()
+        close_button = discord.ui.Button(label="終了", emoji="✖️", style=discord.ButtonStyle.secondary, row=3)
+        async def close_callback(interaction: discord.Interaction) -> None:
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(view=self)
+            self.stop()
+        close_button.callback = close_callback
+        self.add_item(close_button)
 
 
 class TagToggleSelect(discord.ui.Select):
@@ -864,7 +961,8 @@ class ResultsView(OwnedView):
                 description=(
                     f"**画像ID:** {result.get('id')}\n"
                     f"**人物:** "
-                    f"{result.get('confirmed_people') or '未確定'}\n"
+                    f"{result.get('confirmed_people') or result.get('candidate_people') or '未確定'}\n"
+                    f"**確認状態:** {('✅ 確認済み' if result.get('confirmed_people') else '⚠️ AI候補・確認待ち')}\n"
                     f"**投稿者:** "
                     f"{result.get('member_name') or '不明'}\n"
                     f"**日時:** "
@@ -873,9 +971,7 @@ class ResultsView(OwnedView):
                 color=0x00AAFF,
             )
 
-            image_url = str(
-                result.get("image_url") or ""
-            ).strip()
+            image_url = get_display_image_url(result)
 
             if image_url:
                 embed.set_thumbnail(
@@ -1051,12 +1147,16 @@ class DetailView(OwnedView):
             inline=True,
         )
 
+        confirmed = str(result.get("confirmed_people") or "").strip()
+        candidates = str(result.get("candidate_people") or "").strip()
         embed.add_field(
             name="👤 写っている人物",
-            value=(
-                result.get("confirmed_people")
-                or "未確定"
-            ),
+            value=confirmed or candidates or "未確定",
+            inline=False,
+        )
+        embed.add_field(
+            name="🔐 人物確認状態",
+            value="✅ 人による確認済み" if confirmed else "⚠️ AI判定・確認待ち",
             inline=False,
         )
 
