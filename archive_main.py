@@ -36,6 +36,7 @@ from photo_database import (
     get_photo_db_counts,
     get_photo_storage_stats,
     init_photo_db,
+    reset_failed_analysis_images,
     save_photo_blog,
     save_photo_images,
 )
@@ -1881,11 +1882,38 @@ async def ai_analyze_command(
         "🤖 未解析画像のAI解析を開始します。"
     )
 
+    retried = 0
+
     try:
 
         result = await analyze_pending_images(
             limit
         )
+
+        if result.get("found", 0) == 0:
+
+            retry_limit = limit
+
+            if retry_limit is None:
+                retry_limit = int(
+                    status.get("batch_limit", 10) or 10
+                )
+
+            retried = await asyncio.to_thread(
+                reset_failed_analysis_images,
+                retry_limit,
+            )
+
+            if retried > 0:
+
+                await ctx.send(
+                    "🔄 未解析画像がないため、"
+                    f"失敗済み画像 **{retried}件** を再試行します。"
+                )
+
+                result = await analyze_pending_images(
+                    retry_limit
+                )
 
     except Exception as error:
 
@@ -1906,7 +1934,8 @@ async def ai_analyze_command(
         f"検出: **{result.get('found', 0)}件**\n"
         f"完了: **{result.get('completed', 0)}件**\n"
         f"確認待ち: **{result.get('review', 0)}件**\n"
-        f"失敗: **{result.get('failed', 0)}件**"
+        f"失敗: **{result.get('failed', 0)}件**\n"
+        f"再試行: **{retried}件**"
     )
 
 
