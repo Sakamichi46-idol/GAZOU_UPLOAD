@@ -356,6 +356,13 @@ AUTO_START_PHOTO_ARCHIVE = env_flag(
     True,
 )
 
+# 未解析画像を定期的に確認して自動解析する。
+# falseにすると!ai_analyzeによる手動実行だけになる。
+AUTO_START_AI_ANALYSIS = env_flag(
+    "AUTO_START_AI_ANALYSIS",
+    True,
+)
+
 PHOTO_AI_AUTO_LIMIT = max(
     int(
         os.getenv(
@@ -376,7 +383,14 @@ PHOTO_ARCHIVE_INTERVAL = max(
     60,
 )
 
+# AI解析キューの確認間隔。APIへ画像を送るのはpending画像がある時だけ。
+PHOTO_AI_AUTO_INTERVAL = max(
+    int(os.getenv("PHOTO_AI_AUTO_INTERVAL", "60")),
+    30,
+)
+
 archive_cycle_lock = asyncio.Lock()
+ai_analysis_lock = asyncio.Lock()
 startup_initialized = False
 
 T = TypeVar("T")
@@ -1321,6 +1335,31 @@ async def send_blog_to_channel(
 
 
 # =========================
+# AI自動解析
+# =========================
+
+async def run_ai_analysis_batch(
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """AI解析を多重起動させずに1バッチ実行する。"""
+
+    if ai_analysis_lock.locked():
+        return {
+            "requested": limit or PHOTO_AI_AUTO_LIMIT,
+            "found": 0,
+            "completed": 0,
+            "review": 0,
+            "failed": 0,
+            "skipped": True,
+        }
+
+    async with ai_analysis_lock:
+        return await analyze_pending_images(
+            limit or PHOTO_AI_AUTO_LIMIT
+        )
+
+
+# =========================
 # 起動時処理
 # =========================
 
@@ -1420,6 +1459,11 @@ async def on_ready() -> None:
         f"{PHOTO_ARCHIVE_INTERVAL}秒",
     )
 
+    print(
+        "AI解析キュー確認間隔:",
+        f"{PHOTO_AI_AUTO_INTERVAL}秒",
+    )
+
     if AUTO_START_ARCHIVE:
 
         if not archive_loop.is_running():
@@ -1446,6 +1490,20 @@ async def on_ready() -> None:
         print(
             "写真アーカイブ自動開始: 無効 "
             "(!photo_archive_start で開始)"
+        )
+
+    if AUTO_START_AI_ANALYSIS:
+
+        if not ai_analysis_loop.is_running():
+            ai_analysis_loop.start()
+            print("AI解析ワーカーを自動開始しました。")
+        else:
+            print("AI解析ワーカーはすでに動作中です。")
+
+    else:
+        print(
+            "AI解析ワーカー自動開始: 無効 "
+            "(!ai_analyze で手動実行)"
         )
 
     print(
@@ -1480,6 +1538,7 @@ async def status_command(ctx: commands.Context) -> None:
         f"通知アーカイブ定期巡回: **{'動作中' if archive_loop.is_running() else '停止中'}**\n"
         f"通知アーカイブ現在処理: **{'実行中' if archive_cycle_lock.locked() else '停止中'}**\n"
         f"写真アーカイブ定期巡回: **{'動作中' if photo_archive_loop.is_running() else '停止中'}**\n"
+        f"AI解析ワーカー: **{'動作中' if ai_analysis_loop.is_running() else '停止中'}**\n"
         f"写真アーカイブ現在処理: **{'実行中' if is_photo_archive_running() else '停止中'}**\n"
         f"通知済み記事: **{archive_total}件**\n"
         f"写真DBブログ: **{photo_counts.get('blogs', 0)}件**\n"
@@ -1923,7 +1982,7 @@ async def ai_analyze_command(
 
     try:
 
-        result = await analyze_pending_images(
+        result = await run_ai_analysis_batch(
             limit
         )
 
@@ -2242,6 +2301,48 @@ async def photo_archive_loop_error(
 
     print(
         "写真アーカイブ巡回タスクエラー:",
+        error,
+    )
+
+
+@tasks.loop(
+    seconds=PHOTO_AI_AUTO_INTERVAL
+)
+async def ai_analysis_loop() -> None:
+    """pending画像がある時だけAI解析を実行する。"""
+
+    status = get_photo_ai_status()
+
+    if not status.get("enabled"):
+        return
+
+    result = await run_ai_analysis_batch(
+        PHOTO_AI_AUTO_LIMIT
+    )
+
+    if result.get("found", 0) > 0:
+        print(
+            "AI自動解析完了:",
+            f"検出={result.get('found', 0)}",
+            f"完了={result.get('completed', 0)}",
+            f"確認待ち={result.get('review', 0)}",
+            f"失敗={result.get('failed', 0)}",
+        )
+
+
+@ai_analysis_loop.before_loop
+async def before_ai_analysis_loop() -> None:
+
+    await bot.wait_until_ready()
+
+
+@ai_analysis_loop.error
+async def ai_analysis_loop_error(
+    error: BaseException,
+) -> None:
+
+    print(
+        "AI解析ワーカーエラー:",
         error,
     )
 
