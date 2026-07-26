@@ -11,6 +11,8 @@ from discord.ext import commands
 
 from photo_ai_analyzer import analyze_photo_image
 from photo_database import (
+    add_review_item,
+    complete_review_item,
     get_all_people,
     get_image_people,
     set_confirmed_image_people,
@@ -26,7 +28,11 @@ from photo_database import (
 )
 from photo_image_downloader import download_photo_image
 from photo_search import send_photo_search_results, send_photo_author_search_results
-from photo_review_view import send_photo_edit_view, send_photo_review_view
+from photo_review_view import (
+    send_next_person_review,
+    send_person_review,
+    send_person_review_batch,
+)
 from photo_tag_explorer import send_photo_tag_explorer
 
 
@@ -446,17 +452,131 @@ def register_photo_commands(bot: commands.Bot) -> None:
             "次に `!photo_archive_run` を実行してください。"
         )
 
+    @bot.command(name="photo_person_show")
+    async def photo_person_show_command(ctx: commands.Context, image_id: int) -> None:
+        """画像に登録されている人物候補・確定人物を表示する。"""
+        image = await asyncio.to_thread(get_photo_image, image_id)
+        if not image:
+            await ctx.send("⚠️ 画像IDが見つかりません。")
+            return
+
+        people = await asyncio.to_thread(get_image_people, image_id)
+        confirmed = [
+            str(item.get("person_name", "")).strip()
+            for item in people
+            if item.get("relation_status") == "confirmed"
+            and str(item.get("person_name", "")).strip()
+        ]
+        candidates = [
+            f"{str(item.get('person_name', '')).strip()} ({float(item.get('confidence') or 0):.0%})"
+            for item in people
+            if item.get("relation_status") == "candidate"
+            and str(item.get("person_name", "")).strip()
+        ]
+
+        await ctx.send(
+            f"👤 **画像ID {image_id} の人物情報**\n"
+            f"確定: **{'、'.join(confirmed) if confirmed else '未確定'}**\n"
+            f"候補: **{'、'.join(candidates) if candidates else '候補なし'}**"
+        )
+
+    @bot.command(name="review_next")
+    @commands.is_owner()
+    async def review_next_command(ctx: commands.Context) -> None:
+        """最も古い人物確認待ちを1件表示する。"""
+        await send_next_person_review(ctx)
+
     @bot.command(name="review_list")
     @commands.is_owner()
-    async def review_list_command(ctx: commands.Context, limit: int = 100) -> None:
-        limit = max(1, min(int(limit), 500))
-        await send_photo_review_view(ctx, limit=limit)
+    async def review_list_command(ctx: commands.Context, limit: int = 5) -> None:
+        """人物確認待ちを複数件表示する（最大10件）。"""
+        await send_person_review_batch(ctx, limit=max(1, min(int(limit), 10)))
+
+    @bot.command(name="review_stats")
+    @commands.is_owner()
+    async def review_stats_command(ctx: commands.Context) -> None:
+        stats = await asyncio.to_thread(
+            _row,
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped
+            FROM photo_review_queue
+            """,
+        ) or {}
+        await ctx.send(
+            "🧾 **レビュー統計**\n"
+            f"合計: **{int(stats.get('total') or 0)}件**\n"
+            f"確認待ち: **{int(stats.get('pending') or 0)}件**\n"
+            f"完了: **{int(stats.get('completed') or 0)}件**\n"
+            f"スキップ: **{int(stats.get('skipped') or 0)}件**"
+        )
 
     @bot.command(name="photo_edit")
     @commands.is_owner()
     async def photo_edit_command(ctx: commands.Context, image_id: int) -> None:
-        """画像IDを指定し、確定済みの人物タグを編集する。"""
-        await send_photo_edit_view(ctx, image_id=image_id)
+        """指定画像を人物確認待ちへ戻し、レビュー画面を表示する。"""
+        image = await asyncio.to_thread(get_photo_image, image_id)
+        if not image:
+            await ctx.send("⚠️ 画像IDが見つかりません。")
+            return
+
+        people = await asyncio.to_thread(get_image_people, image_id)
+        candidate_names = [
+            str(item.get("person_name", "")).strip()
+            for item in people
+            if str(item.get("person_name", "")).strip()
+        ]
+        await asyncio.to_thread(
+            add_review_item,
+            image_id,
+            "person_identity",
+            "この写真に写っている人物を確認してください。",
+            "、".join(dict.fromkeys(candidate_names)),
+        )
+        review = await asyncio.to_thread(
+            _row,
+            """
+            SELECT
+                photo_review_queue.id AS review_id,
+                photo_review_queue.image_id,
+                photo_review_queue.question,
+                photo_review_queue.candidates,
+                photo_images.image_url,
+                photo_images.local_path,
+                photo_images.image_index,
+                photo_blogs.blog_url,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at,
+                COALESCE(photo_ai_analysis.person_name, '') AS ai_person_name,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people
+                    WHERE image_id = photo_images.id
+                      AND relation_status = 'candidate'
+                ), '') AS candidate_people,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people
+                    WHERE image_id = photo_images.id
+                      AND relation_status = 'confirmed'
+                ), '') AS confirmed_people
+            FROM photo_review_queue
+            JOIN photo_images ON photo_images.id = photo_review_queue.image_id
+            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            LEFT JOIN photo_ai_analysis ON photo_ai_analysis.image_id = photo_images.id
+            WHERE photo_review_queue.image_id = ?
+            """,
+            (image_id,),
+        )
+        if not review:
+            await ctx.send("❌ レビュー画面の作成に失敗しました。")
+            return
+        await send_person_review(ctx, review)
 
     @bot.command(name="review_done")
     @commands.is_owner()
@@ -471,35 +591,54 @@ def register_photo_commands(bot: commands.Bot) -> None:
             return
 
         selected_value = selected_value.strip()
-        if review.get("review_type") == "person_identity":
-            if not selected_value:
-                await ctx.send(
-                    "⚠️ 写っている人物名を入力してください。\n"
-                    f"例: `!review_done {review_id} 井上和`\n"
-                    f"複数人: `!review_done {review_id} 菅原咲月,井上和`\n"
-                    f"人物なし: `!review_done {review_id} なし`"
-                )
-                return
-            names = [] if selected_value in {"なし", "人物なし", "不明"} else [
-                name.strip() for name in selected_value.replace("、", ",").split(",") if name.strip()
-            ]
-            await asyncio.to_thread(
-                set_confirmed_image_people, int(review["image_id"]), names,
-                confirmed_by=str(ctx.author.id), note="Discord review",
+        if not selected_value:
+            await ctx.send(
+                "⚠️ 人物名を入力してください。\n"
+                f"例: `!review_done {review_id} 井上和`\n"
+                f"複数人: `!review_done {review_id} 菅原咲月,井上和`\n"
+                f"人物なし: `!review_done {review_id} なし`"
             )
-            display = "人物なし" if not names else "、".join(names)
-            await ctx.send(f"✅ Review **{review_id}** を完了し、画像ID **{review['image_id']}** を **{display}** として確定しました。")
             return
 
+        names = [] if selected_value in {"なし", "人物なし", "不明"} else [
+            name.strip()
+            for name in selected_value.replace("、", ",").split(",")
+            if name.strip()
+        ]
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            int(review["image_id"]),
+            names,
+            confirmed_by=str(ctx.author.id),
+            note="Discord review command",
+        )
+        await asyncio.to_thread(
+            complete_review_item,
+            int(review["image_id"]),
+            "人物なし" if not names else "、".join(names),
+            reviewed_by=str(ctx.author.id),
+            review_note="Discord command",
+        )
+        display = "人物なし" if not names else "、".join(names)
+        await ctx.send(
+            f"✅ Review **{review_id}** を完了し、画像ID **{review['image_id']}** を "
+            f"**{display}** として確定しました。"
+        )
+
+    @bot.command(name="review_skip")
+    @commands.is_owner()
+    async def review_skip_command(ctx: commands.Context, review_id: int, *, note: str = "") -> None:
         updated = await asyncio.to_thread(
             _execute,
             """
             UPDATE photo_review_queue
-            SET status = 'completed', reviewed_by = ?, selected_value = ?,
-                review_note = 'Discord command', reviewed_at = ?, updated_at = ?
+            SET status = 'skipped', reviewed_by = ?, review_note = ?,
+                reviewed_at = ?, updated_at = ?
             WHERE id = ? AND status = 'pending'
             """,
-            (str(ctx.author.id), selected_value, _now(), _now(), review_id),
+            (str(ctx.author.id), note.strip() or "Discord skip", _now(), _now(), review_id),
         )
-        await ctx.send(f"✅ Review **{review_id}** を完了にしました。" if updated else "⚠️ 指定された確認待ちは見つかりません。")
-
+        if updated:
+            await ctx.send(f"⏭️ Review **{review_id}** をスキップしました。")
+        else:
+            await ctx.send("⚠️ 指定された確認待ちは見つかりません。")
