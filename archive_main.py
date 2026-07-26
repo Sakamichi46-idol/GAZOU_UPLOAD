@@ -15,7 +15,11 @@ from archive_config import (
 )
 from archive_database import (
     archive_count,
+    claim_image_urls,
+    get_unsent_image_urls,
     init_archive_db,
+    mark_image_urls_sent,
+    release_image_claims,
     reset_archive,
     save_archive,
 )
@@ -39,7 +43,12 @@ from photo_image_downloader import (
     download_blog_images,
     get_photo_storage_path,
 )
-from low_egress_media import LOW_EGRESS_MODE, send_url_gallery
+from low_egress_media import (
+    IMAGE_EMBEDS_PER_MESSAGE,
+    LOW_EGRESS_MODE,
+    build_image_embeds,
+    clean_http_urls,
+)
 
 from photo_archive_runner import (
     is_photo_archive_running,
@@ -1162,126 +1171,133 @@ async def send_blog_to_channel(
     channel: discord.abc.Messageable,
     embed: discord.Embed,
     image_urls: list[str],
+    blog_url: str,
 ) -> bool:
     """
     1チャンネルへEmbedと画像を送信する。
+
+    画像は記事URL・チャンネルID・画像URLの組み合わせで送信履歴を保存する。
+    途中で一部だけ成功した場合も、成功済み画像は次回送らない。
     """
+    channel_id = str(getattr(channel, "id", "unknown"))
 
-    if LOW_EGRESS_MODE:
-        try:
-            return await send_url_gallery(
-                channel,
-                image_urls,
-                header_embed=embed,
-                send_delay=SEND_DELAY,
-            )
-        except Exception as error:
-            print(
-                "URL画像送信エラー。添付方式へ切り替えます:",
-                getattr(channel, "id", "unknown"),
-                error,
-            )
-
-    attachments: list[
-        dict[str, Any]
-    ] = []
-
-    failed_urls: list[str] = []
+    pending_urls = await asyncio.to_thread(
+        get_unsent_image_urls,
+        blog_url,
+        channel_id,
+        image_urls,
+    )
 
     try:
+        # 記事ヘッダーは、未送信画像がある場合または画像なし記事で送る。
+        if pending_urls or not image_urls:
+            await channel.send(embed=embed)
+            await asyncio.sleep(SEND_DELAY)
 
-        await channel.send(
-            embed=embed
-        )
-
-        await asyncio.sleep(
-            SEND_DELAY
-        )
-
-        if not image_urls:
+        if not pending_urls:
+            print(
+                "画像重複防止: このチャンネルへの未送信画像はありません:",
+                channel_id,
+                blog_url,
+            )
             return True
 
-        upload_limit = (
-            get_channel_upload_limit(
-                channel
-            )
-        )
+        if LOW_EGRESS_MODE:
+            urls = clean_http_urls(pending_urls)
+            for start in range(0, len(urls), IMAGE_EMBEDS_PER_MESSAGE):
+                group_urls = urls[start:start + IMAGE_EMBEDS_PER_MESSAGE]
+                claimed_urls = await asyncio.to_thread(
+                    claim_image_urls,
+                    blog_url,
+                    channel_id,
+                    group_urls,
+                )
+                if not claimed_urls:
+                    continue
 
-        attachments, failed_urls = (
-            await prepare_attachments(
-                session,
-                image_urls,
-                upload_limit,
-            )
-        )
+                try:
+                    message = await channel.send(
+                        embeds=build_image_embeds(claimed_urls),
+                    )
+                    await asyncio.to_thread(
+                        mark_image_urls_sent,
+                        blog_url,
+                        channel_id,
+                        claimed_urls,
+                        str(getattr(message, "id", "")),
+                    )
+                except Exception:
+                    # Discord APIが明確に失敗を返した場合は、次回再試行できるよう予約解除。
+                    await asyncio.to_thread(
+                        release_image_claims,
+                        blog_url,
+                        channel_id,
+                        claimed_urls,
+                    )
+                    raise
 
-        groups = build_file_groups(
-            attachments,
+                if SEND_DELAY > 0 and start + IMAGE_EMBEDS_PER_MESSAGE < len(urls):
+                    await asyncio.sleep(SEND_DELAY)
+
+            return True
+
+        upload_limit = get_channel_upload_limit(channel)
+        attachments, failed_urls = await prepare_attachments(
+            session,
+            pending_urls,
             upload_limit,
         )
 
-        for group in groups:
-
-            try:
-
-                await channel.send(
-                    files=[
-                        item[
-                            "file"
-                        ]
-                        for item in group
-                    ]
+        # ダウンロードできなかった画像は予約前なので、そのまま次回再試行される。
+        groups = build_file_groups(attachments, upload_limit)
+        try:
+            for group in groups:
+                group_urls = [item["url"] for item in group]
+                claimed_urls = await asyncio.to_thread(
+                    claim_image_urls,
+                    blog_url,
+                    channel_id,
+                    group_urls,
                 )
+                if not claimed_urls:
+                    continue
 
-                await asyncio.sleep(
-                    SEND_DELAY
-                )
+                claimed_set = set(claimed_urls)
+                send_group = [item for item in group if item["url"] in claimed_set]
+                try:
+                    message = await channel.send(
+                        files=[item["file"] for item in send_group]
+                    )
+                    await asyncio.to_thread(
+                        mark_image_urls_sent,
+                        blog_url,
+                        channel_id,
+                        claimed_urls,
+                        str(getattr(message, "id", "")),
+                    )
+                except Exception:
+                    await asyncio.to_thread(
+                        release_image_claims,
+                        blog_url,
+                        channel_id,
+                        claimed_urls,
+                    )
+                    raise
 
-            except Exception as error:
+                await asyncio.sleep(SEND_DELAY)
 
-                print(
-                    "添付まとめ送信エラー:",
-                    getattr(
-                        channel,
-                        "id",
-                        "unknown",
-                    ),
-                    error,
-                )
-
-                failed_urls.extend(
-                    item[
-                        "url"
-                    ]
-                    for item in group
-                )
-
-        await send_failed_urls(
-            channel,
-            failed_urls,
-        )
-
-        return True
+            await send_failed_urls(channel, failed_urls)
+            return not failed_urls
+        finally:
+            close_discord_files(attachments)
 
     except Exception as error:
-
         print(
             "チャンネル送信エラー:",
-            getattr(
-                channel,
-                "id",
-                "unknown",
-            ),
+            channel_id,
             error,
         )
-
         return False
-
-    finally:
-
-        close_discord_files(
-            attachments
-        )
 
 
 # =========================
@@ -2104,6 +2120,7 @@ async def process_archive_blog(
                 channel,
                 embed,
                 image_urls,
+                blog_url,
             )
 
             send_results.append(
