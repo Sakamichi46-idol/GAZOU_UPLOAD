@@ -36,7 +36,6 @@ from photo_database import (
     get_photo_db_counts,
     get_photo_storage_stats,
     init_photo_db,
-    reset_failed_analysis_images,
     save_photo_blog,
     save_photo_images,
 )
@@ -322,19 +321,39 @@ ARCHIVE_MEMBER_CHANNELS = {
 # 共通設定
 # =========================
 
-PHOTO_AI_AUTO_ANALYZE = (
-    os.getenv(
-        "PHOTO_AI_AUTO_ANALYZE",
-        "true",
+def env_flag(name: str, default: bool) -> bool:
+    """環境変数を安全に真偽値へ変換する。"""
+
+    default_text = "true" if default else "false"
+
+    return (
+        os.getenv(name, default_text)
+        .strip()
+        .lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
     )
-    .strip()
-    .lower()
-    in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+
+
+PHOTO_AI_AUTO_ANALYZE = env_flag(
+    "PHOTO_AI_AUTO_ANALYZE",
+    True,
+)
+
+# Railwayの再起動後も巡回を自動復旧する。
+# Variablesでfalseにすれば従来どおり手動開始に戻せる。
+AUTO_START_ARCHIVE = env_flag(
+    "AUTO_START_ARCHIVE",
+    True,
+)
+
+AUTO_START_PHOTO_ARCHIVE = env_flag(
+    "AUTO_START_PHOTO_ARCHIVE",
+    True,
 )
 
 PHOTO_AI_AUTO_LIMIT = max(
@@ -1401,13 +1420,33 @@ async def on_ready() -> None:
         f"{PHOTO_ARCHIVE_INTERVAL}秒",
     )
 
-    print(
-        "!archive_start で通知アーカイブ開始"
-    )
+    if AUTO_START_ARCHIVE:
 
-    print(
-        "!photo_archive_start で写真アーカイブ開始"
-    )
+        if not archive_loop.is_running():
+            archive_loop.start()
+            print("ブログアーカイブを自動開始しました。")
+        else:
+            print("ブログアーカイブはすでに動作中です。")
+
+    else:
+        print(
+            "ブログアーカイブ自動開始: 無効 "
+            "(!archive_start で開始)"
+        )
+
+    if AUTO_START_PHOTO_ARCHIVE:
+
+        if not photo_archive_loop.is_running():
+            photo_archive_loop.start()
+            print("写真アーカイブを自動開始しました。")
+        else:
+            print("写真アーカイブはすでに動作中です。")
+
+    else:
+        print(
+            "写真アーカイブ自動開始: 無効 "
+            "(!photo_archive_start で開始)"
+        )
 
     print(
         "=" * 50
@@ -1882,38 +1921,11 @@ async def ai_analyze_command(
         "🤖 未解析画像のAI解析を開始します。"
     )
 
-    retried = 0
-
     try:
 
         result = await analyze_pending_images(
             limit
         )
-
-        if result.get("found", 0) == 0:
-
-            retry_limit = limit
-
-            if retry_limit is None:
-                retry_limit = int(
-                    status.get("batch_limit", 10) or 10
-                )
-
-            retried = await asyncio.to_thread(
-                reset_failed_analysis_images,
-                retry_limit,
-            )
-
-            if retried > 0:
-
-                await ctx.send(
-                    "🔄 未解析画像がないため、"
-                    f"失敗済み画像 **{retried}件** を再試行します。"
-                )
-
-                result = await analyze_pending_images(
-                    retry_limit
-                )
 
     except Exception as error:
 
@@ -1934,8 +1946,7 @@ async def ai_analyze_command(
         f"検出: **{result.get('found', 0)}件**\n"
         f"完了: **{result.get('completed', 0)}件**\n"
         f"確認待ち: **{result.get('review', 0)}件**\n"
-        f"失敗: **{result.get('failed', 0)}件**\n"
-        f"再試行: **{retried}件**"
+        f"失敗: **{result.get('failed', 0)}件**"
     )
 
 
