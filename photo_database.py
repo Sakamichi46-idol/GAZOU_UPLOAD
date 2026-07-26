@@ -1445,6 +1445,76 @@ def update_image_analysis_status(
         connection.commit()
 
 
+def reset_failed_analysis_images(
+    limit: int = 10,
+) -> int:
+    """
+    失敗済みのAI解析を、古い順に指定件数だけpendingへ戻す。
+
+    !ai_analyzeで未解析画像が0件だった場合の
+    自動再試行に使用する。
+    戻した件数を返す。
+    """
+
+    limit = max(
+        int(limit),
+        1,
+    )
+
+    with closing(
+        get_connection()
+    ) as connection:
+
+        cursor = connection.execute(
+            """
+            SELECT id
+            FROM photo_images
+            WHERE
+                download_status = 'completed'
+            AND
+                analysis_status = 'failed'
+            AND
+                (local_path != '' OR bucket_key != '')
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (
+                limit,
+            ),
+        )
+
+        image_ids = [
+            int(row["id"])
+            for row in cursor.fetchall()
+        ]
+
+        if not image_ids:
+            return 0
+
+        placeholders = ",".join(
+            "?" for _ in image_ids
+        )
+
+        connection.execute(
+            f"""
+            UPDATE photo_images
+            SET
+                analysis_status = 'pending',
+                analysis_error = '',
+                updated_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (
+                utc_now_text(),
+                *image_ids,
+            ),
+        )
+
+        connection.commit()
+
+        return len(image_ids)
+
+
 def reset_image_analysis_status(
     image_id: int,
 ) -> None:
