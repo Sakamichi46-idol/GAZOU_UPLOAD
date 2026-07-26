@@ -10,7 +10,7 @@ import os
 ARCHIVE_INTERVAL = int(
     os.getenv(
         "ARCHIVE_INTERVAL",
-        "60"
+        "600"
     )
 )
 
