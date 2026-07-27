@@ -12,6 +12,7 @@ from discord.ext import commands
 from photo_database import (
     get_connection,
     get_pending_person_reviews,
+    get_skipped_person_reviews,
     save_person,
     set_confirmed_image_people,
     utc_now_text,
@@ -77,15 +78,26 @@ def mark_person_review_skipped(image_id: int, reviewed_by: str = "", note: str =
 def build_review_embed(review: dict[str, Any]) -> discord.Embed:
     candidates = build_candidate_names(review)
     confirmed = split_person_names(review.get("confirmed_people", ""))
+    is_skipped = normalize_text(review.get("review_status")) == "skipped"
     embed = discord.Embed(
-        title="🖼️ 写真の人物確認",
-        description="写真に写っている人物を確認してください。複数人の選択にも対応しています。",
-        color=REVIEW_EMBED_COLOR,
+        title="⏭️ スキップ済み写真の再確認" if is_skipped else "🖼️ 写真の人物確認",
+        description=(
+            "以前スキップした写真です。今回、人物情報を確定してください。"
+            if is_skipped
+            else "写真に写っている人物を確認してください。複数人の選択にも対応しています。"
+        ),
+        color=SKIP_EMBED_COLOR if is_skipped else REVIEW_EMBED_COLOR,
     )
     embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
     embed.add_field(name="グループ", value=normalize_text(review.get("group_name")) or "不明", inline=True)
     embed.add_field(name="ブログ投稿者", value=normalize_text(review.get("member_name")) or "不明", inline=True)
     embed.add_field(name="タイトル", value=truncate_text(review.get("title"), 1000) or "タイトルなし", inline=False)
+    if is_skipped and normalize_text(review.get("review_note")):
+        embed.add_field(
+            name="前回のスキップメモ",
+            value=truncate_text(review.get("review_note"), 1000),
+            inline=False,
+        )
     if review.get("published_at"):
         embed.add_field(name="投稿日", value=truncate_text(review.get("published_at"), 1000), inline=False)
     candidate_text = "\n".join(f"{i}. {name}" for i, name in enumerate(candidates[:MAX_CANDIDATE_DISPLAY], 1))
@@ -119,15 +131,26 @@ class ReviewSession:
         *,
         owner_id: int,
         batch_size: int = 5,
+        queue_status: str = "pending",
     ):
         self.destination = destination
         self.owner_id = owner_id
         self.batch_size = max(1, min(int(batch_size), 10))
+        self.queue_status = "skipped" if queue_status == "skipped" else "pending"
         self.continuous = False
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
         self.lock = asyncio.Lock()
         self.stopped = False
+
+    @property
+    def queue_label(self) -> str:
+        return "スキップ済み" if self.queue_status == "skipped" else "人物確認待ち"
+
+    def get_reviews(self, limit: int) -> list[dict[str, Any]]:
+        if self.queue_status == "skipped":
+            return get_skipped_person_reviews(limit)
+        return get_pending_person_reviews(limit)
 
     async def send_message(self, *args: Any, **kwargs: Any) -> discord.Message | None:
         destination = self.destination
@@ -141,9 +164,9 @@ class ReviewSession:
     async def start_batch(self) -> int:
         if self.stopped:
             return 0
-        reviews = await asyncio.to_thread(get_pending_person_reviews, self.batch_size)
+        reviews = await asyncio.to_thread(self.get_reviews, self.batch_size)
         if not reviews:
-            await self.send_message("✅ 人物確認待ちの写真はありません。")
+            await self.send_message(f"✅ {self.queue_label}の写真はありません。")
             self.stopped = True
             return 0
         self.active_image_ids = {int(review["image_id"]) for review in reviews}
@@ -170,10 +193,10 @@ class ReviewSession:
             await self.start_batch()
             return
 
-        remaining = await asyncio.to_thread(get_pending_person_reviews, 1)
+        remaining = await asyncio.to_thread(self.get_reviews, 1)
         if not remaining:
             await self.send_message(
-                f"🎉 {finished_count}件のレビューが完了し、人物確認待ちは0件になりました。"
+                f"🎉 {finished_count}件のレビューが完了し、{self.queue_label}は0件になりました。"
             )
             self.stopped = True
             return
@@ -198,7 +221,7 @@ class ReviewContinueView(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="次の5件", emoji="▶️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="次のセット", emoji="▶️", style=discord.ButtonStyle.primary)
     async def next_batch(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(content="🔄 次のレビューを読み込んでいます…", view=None)
         await self.session.start_batch()
@@ -422,6 +445,12 @@ class PersonReviewView(discord.ui.View):
         self.candidates = build_candidate_names(review)
         self.accept_candidate.disabled = not bool(self.candidates)
 
+        # スキップ済み一覧では再スキップすると同じ写真が再取得され続けるため、
+        # スキップボタンを無効化して必ず確定・終了のどちらかを選べるようにする。
+        if self.session and self.session.queue_status == "skipped":
+            self.skip_review.disabled = True
+            self.skip_review.label = "再スキップ不可"
+
         if self.session and self.session.continuous:
             stop_button = discord.ui.Button(
                 label="連続停止",
@@ -571,6 +600,8 @@ async def send_next_person_review(destination: commands.Context | discord.Intera
 async def send_person_review_batch(
     destination: commands.Context | discord.Interaction | discord.abc.Messageable,
     limit: int = 5,
+    *,
+    queue_status: str = "pending",
 ) -> int:
     owner = getattr(destination, "author", None) or getattr(destination, "user", None)
     owner_id = int(getattr(owner, "id", 0) or 0)
@@ -578,5 +609,18 @@ async def send_person_review_batch(
         destination,
         owner_id=owner_id,
         batch_size=max(1, min(int(limit), 10)),
+        queue_status=queue_status,
     )
     return await session.start_batch()
+
+
+async def send_skipped_person_review_batch(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    limit: int = 5,
+) -> int:
+    """過去にスキップした人物レビューを再表示する。"""
+    return await send_person_review_batch(
+        destination,
+        limit=limit,
+        queue_status="skipped",
+    )
