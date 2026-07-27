@@ -15,10 +15,13 @@ from openai import OpenAI
 
 from photo_database import (
     clear_ai_tags,
+    copy_ai_result,
+    find_reusable_analysis_by_hash,
     get_pending_analysis_images,
     get_photo_image,
     save_ai_analysis,
     save_ai_tag,
+    save_ai_usage,
     update_image_analysis_status,
 )
 
@@ -34,7 +37,7 @@ OPENAI_API_KEY = os.getenv(
 
 PHOTO_AI_MODEL = os.getenv(
     "PHOTO_AI_MODEL",
-    "gpt-5-mini",
+    "gpt-5-nano",
 ).strip()
 
 PHOTO_AI_DETAIL = os.getenv(
@@ -120,13 +123,13 @@ PHOTO_AI_REQUEST_TIMEOUT = get_env_float(
 
 PHOTO_AI_MAX_DIMENSION = get_env_int(
     "PHOTO_AI_MAX_DIMENSION",
-    1024,
+    512,
     minimum=256,
 )
 
 PHOTO_AI_JPEG_QUALITY = get_env_int(
     "PHOTO_AI_JPEG_QUALITY",
-    78,
+    70,
     minimum=40,
 )
 
@@ -138,6 +141,30 @@ PHOTO_AI_MAX_FILE_SIZE = get_env_int(
 PHOTO_AI_REQUEST_INTERVAL = get_env_float(
     "PHOTO_AI_REQUEST_INTERVAL",
     1.0,
+    minimum=0.0,
+)
+
+PHOTO_AI_MAX_OUTPUT_TOKENS = get_env_int(
+    "PHOTO_AI_MAX_OUTPUT_TOKENS",
+    500,
+    minimum=100,
+)
+
+PHOTO_AI_INPUT_PRICE_PER_MILLION = get_env_float(
+    "PHOTO_AI_INPUT_PRICE_PER_MILLION",
+    0.05,
+    minimum=0.0,
+)
+
+PHOTO_AI_CACHED_INPUT_PRICE_PER_MILLION = get_env_float(
+    "PHOTO_AI_CACHED_INPUT_PRICE_PER_MILLION",
+    0.005,
+    minimum=0.0,
+)
+
+PHOTO_AI_OUTPUT_PRICE_PER_MILLION = get_env_float(
+    "PHOTO_AI_OUTPUT_PRICE_PER_MILLION",
+    0.40,
     minimum=0.0,
 )
 
@@ -602,7 +629,7 @@ def get_openai_client() -> OpenAI:
 def request_photo_analysis(
     image_path: str,
     stored_mime_type: str = "",
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
     """
     OpenAIへ画像を送り、
     構造化された解析結果を取得する。
@@ -659,6 +686,7 @@ def request_photo_analysis(
                 ],
             },
         ],
+        max_output_tokens=PHOTO_AI_MAX_OUTPUT_TOKENS,
         text={
             "format": {
                 "type": "json_schema",
@@ -697,10 +725,46 @@ def request_photo_analysis(
             "AI解析結果が辞書形式ではありません。"
         )
 
+    usage = getattr(response, "usage", None)
+    usage_data = {
+        "response_id": normalize_text(getattr(response, "id", "")),
+        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+        "cached_input_tokens": 0,
+    }
+
+    input_details = getattr(usage, "input_tokens_details", None)
+    if input_details is not None:
+        usage_data["cached_input_tokens"] = int(
+            getattr(input_details, "cached_tokens", 0) or 0
+        )
+
     return (
         analysis,
         raw_output,
+        usage_data,
     )
+
+
+def calculate_estimated_cost(usage_data: dict[str, Any]) -> dict[str, float]:
+    """Responses APIのusageから推定料金を計算する。"""
+
+    input_tokens = max(int(usage_data.get("input_tokens", 0) or 0), 0)
+    cached_tokens = max(int(usage_data.get("cached_input_tokens", 0) or 0), 0)
+    uncached_tokens = max(input_tokens - cached_tokens, 0)
+    output_tokens = max(int(usage_data.get("output_tokens", 0) or 0), 0)
+
+    input_cost = uncached_tokens / 1_000_000 * PHOTO_AI_INPUT_PRICE_PER_MILLION
+    cached_cost = cached_tokens / 1_000_000 * PHOTO_AI_CACHED_INPUT_PRICE_PER_MILLION
+    output_cost = output_tokens / 1_000_000 * PHOTO_AI_OUTPUT_PRICE_PER_MILLION
+
+    return {
+        "input_cost_usd": input_cost,
+        "cached_input_cost_usd": cached_cost,
+        "output_cost_usd": output_cost,
+        "estimated_cost_usd": input_cost + cached_cost + output_cost,
+    }
 
 
 # =========================
@@ -1095,7 +1159,33 @@ def analyze_photo_image_sync(
 
     try:
 
-        analysis, raw_output = (
+        image_hash = normalize_text(image.get("image_hash", ""))
+        reusable = find_reusable_analysis_by_hash(image_id, image_hash)
+        if reusable is not None:
+            source_image_id = int(reusable["source_image_id"])
+            if copy_ai_result(source_image_id, image_id):
+                copied = get_photo_image(image_id) or {}
+                final_status = normalize_text(copied.get("analysis_status", "completed"))
+                save_ai_usage(
+                    image_id=image_id,
+                    source_image_id=source_image_id,
+                    model_name="",
+                    request_kind="cache_reuse",
+                    status=final_status,
+                )
+                print(
+                    "AI解析結果を同一画像から再利用:",
+                    f"image_id={image_id}",
+                    f"source_image_id={source_image_id}",
+                )
+                return {
+                    "image_id": image_id,
+                    "status": final_status,
+                    "reused": True,
+                    "source_image_id": source_image_id,
+                }
+
+        analysis, raw_output, usage_data = (
             request_photo_analysis(
                 image_path=image_path,
                 stored_mime_type=mime_type,
@@ -1107,6 +1197,22 @@ def analyze_photo_image_sync(
             analysis=analysis,
             raw_output=raw_output,
         )
+
+        costs = calculate_estimated_cost(usage_data)
+        save_ai_usage(
+            image_id=image_id,
+            model_name=PHOTO_AI_MODEL,
+            request_kind="api",
+            status=str(result.get("status", "completed")),
+            input_tokens=int(usage_data.get("input_tokens", 0) or 0),
+            cached_input_tokens=int(usage_data.get("cached_input_tokens", 0) or 0),
+            output_tokens=int(usage_data.get("output_tokens", 0) or 0),
+            total_tokens=int(usage_data.get("total_tokens", 0) or 0),
+            response_id=str(usage_data.get("response_id", "")),
+            **costs,
+        )
+        result["usage"] = usage_data
+        result["estimated_cost_usd"] = costs["estimated_cost_usd"]
 
         print(
             "AI画像解析完了:",
@@ -1265,6 +1371,12 @@ def get_photo_ai_status() -> dict[str, Any]:
         "request_interval": (
             PHOTO_AI_REQUEST_INTERVAL
         ),
+        "max_dimension": PHOTO_AI_MAX_DIMENSION,
+        "jpeg_quality": PHOTO_AI_JPEG_QUALITY,
+        "max_output_tokens": PHOTO_AI_MAX_OUTPUT_TOKENS,
+        "input_price_per_million": PHOTO_AI_INPUT_PRICE_PER_MILLION,
+        "cached_input_price_per_million": PHOTO_AI_CACHED_INPUT_PRICE_PER_MILLION,
+        "output_price_per_million": PHOTO_AI_OUTPUT_PRICE_PER_MILLION,
     }
 
 
