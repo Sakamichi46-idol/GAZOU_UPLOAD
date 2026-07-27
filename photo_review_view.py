@@ -112,13 +112,123 @@ def build_skipped_embed(review: dict[str, Any], reviewer: discord.abc.User) -> d
     return embed
 
 
+class ReviewSession:
+    def __init__(
+        self,
+        destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+        *,
+        owner_id: int,
+        batch_size: int = 5,
+    ):
+        self.destination = destination
+        self.owner_id = owner_id
+        self.batch_size = max(1, min(int(batch_size), 10))
+        self.continuous = False
+        self.active_image_ids: set[int] = set()
+        self.completed_image_ids: set[int] = set()
+        self.lock = asyncio.Lock()
+        self.stopped = False
+
+    async def send_message(self, *args: Any, **kwargs: Any) -> discord.Message | None:
+        destination = self.destination
+        if isinstance(destination, discord.Interaction):
+            if destination.response.is_done():
+                return await destination.followup.send(*args, wait=True, **kwargs)
+            await destination.response.send_message(*args, **kwargs)
+            return await destination.original_response()
+        return await destination.send(*args, **kwargs)
+
+    async def start_batch(self) -> int:
+        if self.stopped:
+            return 0
+        reviews = await asyncio.to_thread(get_pending_person_reviews, self.batch_size)
+        if not reviews:
+            await self.send_message("✅ 人物確認待ちの写真はありません。")
+            self.stopped = True
+            return 0
+        self.active_image_ids = {int(review["image_id"]) for review in reviews}
+        self.completed_image_ids.clear()
+        for review in reviews:
+            await send_person_review(self.destination, review, session=self)
+        return len(reviews)
+
+    async def mark_done(self, image_id: int) -> None:
+        async with self.lock:
+            if self.stopped or image_id not in self.active_image_ids:
+                return
+            self.completed_image_ids.add(image_id)
+            if self.completed_image_ids != self.active_image_ids:
+                return
+            finished_count = len(self.active_image_ids)
+            self.active_image_ids.clear()
+            self.completed_image_ids.clear()
+
+        if self.continuous:
+            await self.send_message(
+                f"✅ {finished_count}件のレビューが完了しました。次の{self.batch_size}件を自動で読み込みます…"
+            )
+            await self.start_batch()
+            return
+
+        remaining = await asyncio.to_thread(get_pending_person_reviews, 1)
+        if not remaining:
+            await self.send_message(
+                f"🎉 {finished_count}件のレビューが完了し、人物確認待ちは0件になりました。"
+            )
+            self.stopped = True
+            return
+
+        await self.send_message(
+            f"✅ {finished_count}件のレビューが完了しました。\n続けて確認しますか？",
+            view=ReviewContinueView(self),
+        )
+
+
+class ReviewContinueView(discord.ui.View):
+    def __init__(self, session: ReviewSession):
+        super().__init__(timeout=900)
+        self.session = session
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.session.owner_id:
+            await interaction.response.send_message(
+                "このレビュー操作はコマンドを実行した本人だけが使えます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="次の5件", emoji="▶️", style=discord.ButtonStyle.primary)
+    async def next_batch(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="🔄 次のレビューを読み込んでいます…", view=None)
+        await self.session.start_batch()
+        self.stop()
+
+    @discord.ui.button(label="連続レビュー", emoji="🔁", style=discord.ButtonStyle.success)
+    async def continuous_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.session.continuous = True
+        await interaction.response.edit_message(
+            content="🔁 連続レビューを開始しました。各セットが終わると自動で次へ進みます。",
+            view=None,
+        )
+        await self.session.start_batch()
+        self.stop()
+
+    @discord.ui.button(label="終了", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def stop_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.session.stopped = True
+        await interaction.response.edit_message(content="⏹️ レビューを終了しました。", view=None)
+        self.stop()
+
+
 class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
     person_names = discord.ui.TextInput(label="人物名", placeholder="複数人は「、」で区切ってください。", style=discord.TextStyle.paragraph, max_length=500)
     note = discord.ui.TextInput(label="メモ", required=False, max_length=500)
 
-    def __init__(self, review: dict[str, Any]):
+    def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=300)
         self.review = review
+        self.session = session
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         names = split_person_names(self.person_names.value)
@@ -127,6 +237,8 @@ class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
             return
         await asyncio.to_thread(set_confirmed_image_people, int(self.review["image_id"]), names, confirmed_by=get_reviewer_name(interaction.user), note=normalize_text(self.note.value))
         await interaction.response.edit_message(embed=build_completed_embed(self.review, names, interaction.user), view=None)
+        if self.session:
+            await self.session.mark_done(int(self.review["image_id"]))
 
 
 @dataclass
@@ -134,6 +246,7 @@ class SelectionState:
     review: dict[str, Any]
     owner_id: int
     source_message: discord.Message
+    session: ReviewSession | None = None
     selected_names: list[str] = field(default_factory=list)
     group_name: str = ""
     generation_name: str = ""
@@ -278,6 +391,8 @@ class SelectedPeopleView(OwnedView):
         completed = build_completed_embed(self.state.review, self.state.selected_names, interaction.user)
         await self.state.source_message.edit(embed=completed, view=None)
         await interaction.response.edit_message(content="✅ 元のレビュー画面を更新しました。", view=None)
+        if self.state.session:
+            await self.state.session.mark_done(int(self.state.review["image_id"]))
 
     @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=2)
     async def nobody(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -285,6 +400,8 @@ class SelectedPeopleView(OwnedView):
         completed = build_completed_embed(self.state.review, [], interaction.user)
         await self.state.source_message.edit(embed=completed, view=None)
         await interaction.response.edit_message(content="✅ 人物なしで確定しました。", view=None)
+        if self.state.session:
+            await self.state.session.mark_done(int(self.state.review["image_id"]))
 
     @discord.ui.button(label="人物不明", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
     async def unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -292,41 +409,76 @@ class SelectedPeopleView(OwnedView):
         completed = build_completed_embed(self.state.review, ["人物不明"], interaction.user)
         await self.state.source_message.edit(embed=completed, view=None)
         await interaction.response.edit_message(content="✅ 人物不明で確定しました。", view=None)
+        if self.state.session:
+            await self.state.session.mark_done(int(self.state.review["image_id"]))
 
 
 class PersonReviewView(discord.ui.View):
-    def __init__(self, review: dict[str, Any]):
+    def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=900)
         self.review = review
+        self.session = session
         self.image_id = int(review["image_id"])
         self.candidates = build_candidate_names(review)
         self.accept_candidate.disabled = not bool(self.candidates)
+        if self.session and self.session.continuous:
+            stop_button = discord.ui.Button(
+                label="連続停止",
+                emoji="⏹️",
+                style=discord.ButtonStyle.secondary,
+                row=1,
+            )
+
+            async def stop_continuous(interaction: discord.Interaction) -> None:
+                self.session.continuous = False
+                await interaction.response.send_message(
+                    "⏹️ 連続レビューを停止しました。現在表示中のセット終了後に続行確認を表示します。",
+                    ephemeral=True,
+                )
+
+            stop_button.callback = stop_continuous
+            self.add_item(stop_button)
 
     @discord.ui.button(label="候補をすべて採用", emoji="✅", style=discord.ButtonStyle.success, row=0)
     async def accept_candidate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await asyncio.to_thread(set_confirmed_image_people, self.image_id, self.candidates, confirmed_by=get_reviewer_name(interaction.user), note="表示候補をすべて採用")
         await interaction.response.edit_message(embed=build_completed_embed(self.review, self.candidates, interaction.user), view=None)
+        if self.session:
+            await self.session.mark_done(self.image_id)
 
     @discord.ui.button(label="人物を選ぶ", emoji="👥", style=discord.ButtonStyle.primary, row=0)
     async def select_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await asyncio.to_thread(seed_member_master)
         initial = split_person_names(self.review.get("confirmed_people", ""))
-        state = SelectionState(self.review, interaction.user.id, interaction.message, initial)
+        state = SelectionState(
+            review=self.review,
+            owner_id=interaction.user.id,
+            source_message=interaction.message,
+            session=self.session,
+            selected_names=initial,
+        )
         await interaction.response.send_message(selection_text(state), view=GroupView(state), ephemeral=True)
 
     @discord.ui.button(label="手入力", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
     async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(PersonInputModal(self.review))
+        await interaction.response.send_modal(PersonInputModal(self.review, self.session))
 
     @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.danger, row=0)
     async def skip_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await asyncio.to_thread(mark_person_review_skipped, self.image_id, get_reviewer_name(interaction.user), "Discordレビュー画面でスキップ")
         await interaction.response.edit_message(embed=build_skipped_embed(self.review, interaction.user), view=None)
+        if self.session:
+            await self.session.mark_done(self.image_id)
 
 
-async def send_person_review(destination: commands.Context | discord.Interaction | discord.abc.Messageable, review: dict[str, Any]) -> discord.Message | None:
+async def send_person_review(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    review: dict[str, Any],
+    *,
+    session: ReviewSession | None = None,
+) -> discord.Message | None:
     embed = build_review_embed(review)
-    view = PersonReviewView(review)
+    view = PersonReviewView(review, session=session)
     local_path = normalize_text(review.get("local_path"))
     image_url = normalize_text(review.get("image_url"))
     file: discord.File | None = None
@@ -360,17 +512,15 @@ async def send_next_person_review(destination: commands.Context | discord.Intera
     return reviews[0]
 
 
-async def send_person_review_batch(destination: commands.Context | discord.Interaction | discord.abc.Messageable, limit: int = 5) -> int:
-    reviews = await asyncio.to_thread(get_pending_person_reviews, max(1, min(int(limit), 10)))
-    if not reviews:
-        message = "✅ 人物確認待ちの写真はありません。"
-        if isinstance(destination, discord.Interaction):
-            await (destination.followup.send(message, ephemeral=True) if destination.response.is_done() else destination.response.send_message(message, ephemeral=True))
-        else:
-            await destination.send(message)
-        return 0
-    if isinstance(destination, discord.Interaction) and not destination.response.is_done():
-        await destination.response.defer()
-    for review in reviews:
-        await send_person_review(destination, review)
-    return len(reviews)
+async def send_person_review_batch(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    limit: int = 5,
+) -> int:
+    owner = getattr(destination, "author", None) or getattr(destination, "user", None)
+    owner_id = int(getattr(owner, "id", 0) or 0)
+    session = ReviewSession(
+        destination,
+        owner_id=owner_id,
+        batch_size=max(1, min(int(limit), 10)),
+    )
+    return await session.start_batch()
