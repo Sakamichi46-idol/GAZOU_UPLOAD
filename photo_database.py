@@ -3253,8 +3253,19 @@ def get_photo_storage_stats() -> dict[str, int]:
 
 
 
-def get_pending_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
-    """人物確認待ちを、Discordレビュー画面用の情報付きで返す。"""
+def get_person_reviews_by_status(
+    status: str,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """指定状態の人物レビューをDiscord画面用の情報付きで返す。"""
+    normalized_status = str(status or "").strip().lower()
+    allowed_statuses = {"pending", "skipped"}
+    if normalized_status not in allowed_statuses:
+        raise ValueError(
+            f"Unsupported review status: {normalized_status!r}. "
+            f"Allowed: {sorted(allowed_statuses)}"
+        )
+
     safe_limit = max(1, min(int(limit), 500))
 
     with closing(get_connection()) as connection:
@@ -3263,8 +3274,10 @@ def get_pending_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
             SELECT
                 photo_review_queue.id AS review_id,
                 photo_review_queue.image_id,
+                photo_review_queue.status AS review_status,
                 photo_review_queue.question,
                 photo_review_queue.candidates,
+                photo_review_queue.review_note,
                 photo_images.image_url,
                 photo_images.local_path,
                 photo_images.image_index,
@@ -3299,15 +3312,25 @@ def get_pending_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
                 ON photo_blogs.id = photo_images.blog_id
             LEFT JOIN photo_ai_analysis
                 ON photo_ai_analysis.image_id = photo_images.id
-            WHERE photo_review_queue.status = 'pending'
+            WHERE photo_review_queue.status = ?
               AND photo_review_queue.review_type = 'person_identity'
             ORDER BY photo_review_queue.id ASC
             LIMIT ?
             """,
-            (safe_limit,),
+            (normalized_status, safe_limit),
         ).fetchall()
 
     return rows_to_dicts(rows)
+
+
+def get_pending_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
+    """未確認の人物レビューを返す。"""
+    return get_person_reviews_by_status("pending", limit)
+
+
+def get_skipped_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
+    """過去にスキップした人物レビューを返す。"""
+    return get_person_reviews_by_status("skipped", limit)
 
 
 # =========================
