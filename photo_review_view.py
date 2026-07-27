@@ -93,7 +93,7 @@ def build_review_embed(review: dict[str, Any]) -> discord.Embed:
     embed.add_field(name="現在の確定人物", value="、".join(confirmed) if confirmed else "未確定", inline=False)
     if review.get("blog_url"):
         embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
-    embed.set_footer(text="人物を選ぶ → グループ → 期生 → 名前の順で追加し、最後に確定します。")
+    embed.set_footer(text="人物がいない写真は「人物なし」、写っているが判別できない場合は「人物不明」を押してください。")
     return embed
 
 
@@ -421,6 +421,7 @@ class PersonReviewView(discord.ui.View):
         self.image_id = int(review["image_id"])
         self.candidates = build_candidate_names(review)
         self.accept_candidate.disabled = not bool(self.candidates)
+
         if self.session and self.session.continuous:
             stop_button = discord.ui.Button(
                 label="連続停止",
@@ -439,12 +440,43 @@ class PersonReviewView(discord.ui.View):
             stop_button.callback = stop_continuous
             self.add_item(stop_button)
 
-    @discord.ui.button(label="候補をすべて採用", emoji="✅", style=discord.ButtonStyle.success, row=0)
-    async def accept_candidate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await asyncio.to_thread(set_confirmed_image_people, self.image_id, self.candidates, confirmed_by=get_reviewer_name(interaction.user), note="表示候補をすべて採用")
-        await interaction.response.edit_message(embed=build_completed_embed(self.review, self.candidates, interaction.user), view=None)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.session and self.session.owner_id and interaction.user.id != self.session.owner_id:
+            await interaction.response.send_message(
+                "このレビュー操作はコマンドを実行した本人だけが使えます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def complete_review(
+        self,
+        interaction: discord.Interaction,
+        names: list[str],
+        *,
+        note: str,
+    ) -> None:
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            self.image_id,
+            names,
+            confirmed_by=get_reviewer_name(interaction.user),
+            note=note,
+        )
+        await interaction.response.edit_message(
+            embed=build_completed_embed(self.review, names, interaction.user),
+            view=None,
+        )
         if self.session:
             await self.session.mark_done(self.image_id)
+
+    @discord.ui.button(label="候補をすべて採用", emoji="✅", style=discord.ButtonStyle.success, row=0)
+    async def accept_candidate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.complete_review(
+            interaction,
+            self.candidates,
+            note="表示候補をすべて採用",
+        )
 
     @discord.ui.button(label="人物を選ぶ", emoji="👥", style=discord.ButtonStyle.primary, row=0)
     async def select_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -463,12 +495,36 @@ class PersonReviewView(discord.ui.View):
     async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(PersonInputModal(self.review, self.session))
 
-    @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.danger, row=0)
+    @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def skip_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await asyncio.to_thread(mark_person_review_skipped, self.image_id, get_reviewer_name(interaction.user), "Discordレビュー画面でスキップ")
-        await interaction.response.edit_message(embed=build_skipped_embed(self.review, interaction.user), view=None)
+        await asyncio.to_thread(
+            mark_person_review_skipped,
+            self.image_id,
+            get_reviewer_name(interaction.user),
+            "Discordレビュー画面でスキップ",
+        )
+        await interaction.response.edit_message(
+            embed=build_skipped_embed(self.review, interaction.user),
+            view=None,
+        )
         if self.session:
             await self.session.mark_done(self.image_id)
+
+    @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=1)
+    async def no_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.complete_review(
+            interaction,
+            [],
+            note="人物は写っていない",
+        )
+
+    @discord.ui.button(label="人物不明", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
+    async def unknown_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.complete_review(
+            interaction,
+            ["人物不明"],
+            note="人物は写っているが判別できない",
+        )
 
 
 async def send_person_review(
