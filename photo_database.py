@@ -302,6 +302,48 @@ def init_photo_db() -> None:
             """
         )
 
+
+        # -------------------------
+        # AI API使用量・推定料金
+        # -------------------------
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS photo_ai_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                image_id INTEGER,
+                source_image_id INTEGER,
+
+                model_name TEXT NOT NULL DEFAULT '',
+                request_kind TEXT NOT NULL DEFAULT 'api',
+                status TEXT NOT NULL DEFAULT 'completed',
+
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+
+                input_cost_usd REAL NOT NULL DEFAULT 0,
+                cached_input_cost_usd REAL NOT NULL DEFAULT 0,
+                output_cost_usd REAL NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0,
+
+                response_id TEXT NOT NULL DEFAULT '',
+                error_type TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY(image_id)
+                    REFERENCES photo_images(id)
+                    ON DELETE SET NULL,
+
+                FOREIGN KEY(source_image_id)
+                    REFERENCES photo_images(id)
+                    ON DELETE SET NULL
+            )
+            """
+        )
+
         # -------------------------
         # 人間が追加・修正したタグ
         # -------------------------
@@ -665,6 +707,31 @@ def init_photo_db() -> None:
             CREATE INDEX IF NOT EXISTS
             idx_photo_images_blog
             ON photo_images(blog_id)
+            """
+        )
+
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_photo_images_image_hash
+            ON photo_images(image_hash)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_photo_ai_usage_created
+            ON photo_ai_usage(created_at)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_photo_ai_usage_model
+            ON photo_ai_usage(model_name)
             """
         )
 
@@ -3362,3 +3429,256 @@ if __name__ == "__main__":
     )
     print("=" * 50)
 
+
+
+# =========================
+# AI料金削減・使用量記録
+# =========================
+
+def find_reusable_analysis_by_hash(
+    image_id: int,
+    image_hash: str,
+) -> dict[str, Any] | None:
+    """同一ハッシュの解析済み画像を1件返す。"""
+
+    normalized_hash = str(image_hash or "").strip()
+    if not normalized_hash:
+        return None
+
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT source.id AS source_image_id
+            FROM photo_images AS source
+            JOIN photo_ai_analysis AS analysis
+              ON analysis.image_id = source.id
+            WHERE source.id <> ?
+              AND source.image_hash = ?
+              AND source.analysis_status IN ('completed', 'review')
+            ORDER BY
+                CASE source.analysis_status
+                    WHEN 'completed' THEN 0
+                    ELSE 1
+                END,
+                source.id ASC
+            LIMIT 1
+            """,
+            (int(image_id), normalized_hash),
+        ).fetchone()
+
+    return row_to_dict(row)
+
+
+def copy_ai_result(
+    source_image_id: int,
+    target_image_id: int,
+) -> bool:
+    """解析結果とAIタグを別画像へコピーする。"""
+
+    now = utc_now_text()
+
+    with closing(get_connection()) as connection:
+        source = connection.execute(
+            """
+            SELECT *
+            FROM photo_ai_analysis
+            WHERE image_id = ?
+            """,
+            (int(source_image_id),),
+        ).fetchone()
+
+        if source is None:
+            return False
+
+        connection.execute(
+            "DELETE FROM photo_ai_analysis WHERE image_id = ?",
+            (int(target_image_id),),
+        )
+        connection.execute(
+            "DELETE FROM photo_ai_tags WHERE image_id = ?",
+            (int(target_image_id),),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO photo_ai_analysis (
+                image_id, model_name, raw_response,
+                person_name, clothing, expression,
+                background, pose, objects, person_count,
+                overall_confidence, needs_review,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(target_image_id),
+                str(source["model_name"] or ""),
+                str(source["raw_response"] or ""),
+                str(source["person_name"] or ""),
+                str(source["clothing"] or ""),
+                str(source["expression"] or ""),
+                str(source["background"] or ""),
+                str(source["pose"] or ""),
+                str(source["objects"] or ""),
+                int(source["person_count"] or 0),
+                float(source["overall_confidence"] or 0),
+                int(source["needs_review"] or 0),
+                now,
+                now,
+            ),
+        )
+
+        tags = connection.execute(
+            """
+            SELECT category, tag, confidence, model_name, raw_value
+            FROM photo_ai_tags
+            WHERE image_id = ?
+            """,
+            (int(source_image_id),),
+        ).fetchall()
+
+        for tag in tags:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO photo_ai_tags (
+                    image_id, category, tag, confidence,
+                    model_name, raw_value, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(target_image_id),
+                    str(tag["category"] or ""),
+                    str(tag["tag"] or ""),
+                    float(tag["confidence"] or 0),
+                    str(tag["model_name"] or ""),
+                    str(tag["raw_value"] or ""),
+                    now,
+                    now,
+                ),
+            )
+
+        final_status = (
+            "review"
+            if int(source["needs_review"] or 0)
+            else "completed"
+        )
+        connection.execute(
+            """
+            UPDATE photo_images
+            SET analysis_status = ?, analysis_error = '', updated_at = ?
+            WHERE id = ?
+            """,
+            (final_status, now, int(target_image_id)),
+        )
+        connection.commit()
+
+    return True
+
+
+def save_ai_usage(
+    *,
+    image_id: int | None,
+    source_image_id: int | None = None,
+    model_name: str = "",
+    request_kind: str = "api",
+    status: str = "completed",
+    input_tokens: int = 0,
+    cached_input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    input_cost_usd: float = 0.0,
+    cached_input_cost_usd: float = 0.0,
+    output_cost_usd: float = 0.0,
+    estimated_cost_usd: float = 0.0,
+    response_id: str = "",
+    error_type: str = "",
+) -> None:
+    """AI API使用量または重複再利用実績を保存する。"""
+
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            INSERT INTO photo_ai_usage (
+                image_id, source_image_id, model_name,
+                request_kind, status,
+                input_tokens, cached_input_tokens,
+                output_tokens, total_tokens,
+                input_cost_usd, cached_input_cost_usd,
+                output_cost_usd, estimated_cost_usd,
+                response_id, error_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                image_id,
+                source_image_id,
+                str(model_name or ""),
+                str(request_kind or "api"),
+                str(status or "completed"),
+                max(int(input_tokens or 0), 0),
+                max(int(cached_input_tokens or 0), 0),
+                max(int(output_tokens or 0), 0),
+                max(int(total_tokens or 0), 0),
+                max(float(input_cost_usd or 0), 0.0),
+                max(float(cached_input_cost_usd or 0), 0.0),
+                max(float(output_cost_usd or 0), 0.0),
+                max(float(estimated_cost_usd or 0), 0.0),
+                str(response_id or ""),
+                str(error_type or ""),
+                utc_now_text(),
+            ),
+        )
+        connection.commit()
+
+
+def get_ai_cost_summary(days: int | None = None) -> dict[str, Any]:
+    """AI使用量と推定料金をモデル別に集計する。"""
+
+    where_sql = ""
+    params: tuple[Any, ...] = ()
+    if days is not None:
+        safe_days = max(int(days), 1)
+        where_sql = "WHERE datetime(created_at) >= datetime('now', ?)"
+        params = (f"-{safe_days} days",)
+
+    with closing(get_connection()) as connection:
+        total = connection.execute(
+            f"""
+            SELECT
+                COUNT(*) AS records,
+                SUM(CASE WHEN request_kind = 'api' THEN 1 ELSE 0 END) AS api_calls,
+                SUM(CASE WHEN request_kind = 'cache_reuse' THEN 1 ELSE 0 END) AS reused,
+                COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(cached_input_tokens), 0) AS cached_input_tokens,
+                COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+            FROM photo_ai_usage
+            {where_sql}
+            """,
+            params,
+        ).fetchone()
+
+        models = connection.execute(
+            f"""
+            SELECT
+                CASE
+                    WHEN model_name = '' THEN '(再利用)'
+                    ELSE model_name
+                END AS model_name,
+                COUNT(*) AS records,
+                SUM(CASE WHEN request_kind = 'api' THEN 1 ELSE 0 END) AS api_calls,
+                SUM(CASE WHEN request_kind = 'cache_reuse' THEN 1 ELSE 0 END) AS reused,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+            FROM photo_ai_usage
+            {where_sql}
+            GROUP BY model_name
+            ORDER BY estimated_cost_usd DESC, records DESC
+            """,
+            params,
+        ).fetchall()
+
+    return {
+        "days": days,
+        "total": row_to_dict(total) or {},
+        "models": rows_to_dicts(models),
+    }
