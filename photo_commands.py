@@ -32,6 +32,7 @@ from photo_review_view import (
     send_next_person_review,
     send_person_review,
     send_person_review_batch,
+    send_skipped_person_review_batch,
 )
 from photo_tag_explorer import send_photo_tag_explorer
 
@@ -491,6 +492,15 @@ def register_photo_commands(bot: commands.Bot) -> None:
     async def review_list_command(ctx: commands.Context, limit: int = 5) -> None:
         """人物確認待ちを複数件表示する（最大10件）。"""
         await send_person_review_batch(ctx, limit=max(1, min(int(limit), 10)))
+
+    @bot.command(name="review_skipped")
+    @commands.is_owner()
+    async def review_skipped_command(ctx: commands.Context, limit: int = 5) -> None:
+        """過去にスキップした人物レビューを再表示する（最大10件）。"""
+        await send_skipped_person_review_batch(
+            ctx,
+            limit=max(1, min(int(limit), 10)),
+        )
 
     @bot.command(name="review_stats")
     @commands.is_owner()
