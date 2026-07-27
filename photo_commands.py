@@ -13,6 +13,7 @@ from photo_ai_analyzer import analyze_photo_image
 from photo_database import (
     add_review_item,
     complete_review_item,
+    get_ai_cost_summary,
     get_all_people,
     get_image_people,
     set_confirmed_image_people,
@@ -244,6 +245,42 @@ def register_photo_commands(bot: commands.Bot) -> None:
             await ctx.send(f"🗑️ 画像ID **{image_id}** から `{tag}` を削除しました。")
         else:
             await ctx.send("⚠️ 指定されたタグは見つかりませんでした。")
+
+
+    @bot.command(name="ai_cost")
+    @commands.is_owner()
+    async def ai_cost_command(ctx: commands.Context, days: int | None = 30) -> None:
+        """AI使用量と推定料金を表示する。0で全期間。"""
+
+        period = None if days is None or int(days) <= 0 else min(int(days), 3650)
+        summary = await asyncio.to_thread(get_ai_cost_summary, period)
+        total = summary.get("total", {})
+        title = "全期間" if period is None else f"過去{period}日"
+
+        lines = [
+            f"💰 **AI使用量・推定料金（{title}）**",
+            f"API呼び出し: **{int(total.get('api_calls') or 0)}回**",
+            f"重複画像の再利用: **{int(total.get('reused') or 0)}回**",
+            f"入力トークン: **{int(total.get('input_tokens') or 0):,}**",
+            f"キャッシュ入力: **{int(total.get('cached_input_tokens') or 0):,}**",
+            f"出力トークン: **{int(total.get('output_tokens') or 0):,}**",
+            f"合計トークン: **{int(total.get('total_tokens') or 0):,}**",
+            f"推定料金: **${float(total.get('estimated_cost_usd') or 0):.6f} USD**",
+        ]
+
+        models = summary.get("models", [])
+        if models:
+            lines.append("\n**モデル別**")
+            for item in models[:8]:
+                lines.append(
+                    f"・{item.get('model_name', '不明')}: "
+                    f"API {int(item.get('api_calls') or 0)}回 / "
+                    f"再利用 {int(item.get('reused') or 0)}回 / "
+                    f"${float(item.get('estimated_cost_usd') or 0):.6f}"
+                )
+
+        lines.append("\n※ OpenAIのusage値と設定単価から計算した推定額です。")
+        await ctx.send("\n".join(lines))
 
     @bot.command(name="ai_retry")
     @commands.is_owner()
