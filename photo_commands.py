@@ -307,13 +307,30 @@ def register_photo_commands(bot: commands.Bot) -> None:
             return
         await ctx.send(f"🤖 {len(failed)}件の再解析を開始します。")
         completed = 0
+        review = 0
+        failed_count = 0
+
         for item in failed:
             target_id = int(item["id"])
             await asyncio.to_thread(reset_image_analysis_status, target_id)
             result = await analyze_photo_image(target_id)
-            if result.get("status") == "completed":
+
+            status = result.get("status")
+
+            if status == "completed":
                 completed += 1
-        await ctx.send(f"✅ 再解析終了: 完了 **{completed}件** / 対象 **{len(failed)}件**")
+            elif status == "review":
+                review += 1
+            else:
+                failed_count += 1
+
+        success = completed + review
+
+        await ctx.send(
+            "✅ 再解析終了\n"
+            f"成功: **{success}件** / 対象 **{len(failed)}件**\n"
+            f"（completed: {completed}件 / review: {review}件 / failed: {failed_count}件）"
+        )
 
     @bot.command(name="photo_redownload")
     @commands.is_owner()
