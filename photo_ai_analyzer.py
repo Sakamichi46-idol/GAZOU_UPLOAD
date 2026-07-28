@@ -622,6 +622,395 @@ def get_openai_client() -> OpenAI:
     )
 
 
+
+
+class AIResponseError(RuntimeError):
+    """
+    OpenAI Responses APIが正常な解析本文を返さなかった場合の例外。
+    失敗時でも使用量とレスポンスIDをDBへ保存できるようにする。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage_data: dict[str, Any] | None = None,
+        response_status: str = "",
+        response_id: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.usage_data = usage_data or {}
+        self.response_status = response_status
+        self.response_id = response_id
+
+
+def get_object_value(
+    value: Any,
+    name: str,
+    default: Any = None,
+) -> Any:
+    """辞書とSDKオブジェクトの両方から値を取得する。"""
+
+    if isinstance(value, dict):
+        return value.get(name, default)
+
+    return getattr(value, name, default)
+
+
+def build_usage_data(response: Any) -> dict[str, Any]:
+    """Responses APIの使用量を安全に辞書へ変換する。"""
+
+    usage = get_object_value(response, "usage")
+    input_details = get_object_value(
+        usage,
+        "input_tokens_details",
+    )
+    output_details = get_object_value(
+        usage,
+        "output_tokens_details",
+    )
+
+    return {
+        "response_id": normalize_text(
+            get_object_value(response, "id", "")
+        ),
+        "input_tokens": int(
+            get_object_value(usage, "input_tokens", 0) or 0
+        ),
+        "output_tokens": int(
+            get_object_value(usage, "output_tokens", 0) or 0
+        ),
+        "total_tokens": int(
+            get_object_value(usage, "total_tokens", 0) or 0
+        ),
+        "cached_input_tokens": int(
+            get_object_value(input_details, "cached_tokens", 0) or 0
+        ),
+        "reasoning_tokens": int(
+            get_object_value(output_details, "reasoning_tokens", 0) or 0
+        ),
+    }
+
+
+def extract_response_text(response: Any) -> str:
+    """
+    SDKのoutput_textを優先し、空の場合はresponse.outputを走査して
+    output_text本文を取り出す。
+    """
+
+    direct_text = normalize_text(
+        get_object_value(response, "output_text", "")
+    )
+
+    if direct_text:
+        return direct_text
+
+    text_parts: list[str] = []
+    output_items = get_object_value(response, "output", []) or []
+
+    for item in output_items:
+        content_items = get_object_value(item, "content", []) or []
+
+        for content in content_items:
+            content_type = normalize_text(
+                get_object_value(content, "type", "")
+            )
+
+            if content_type != "output_text":
+                continue
+
+            text = normalize_text(
+                get_object_value(content, "text", "")
+            )
+
+            if text:
+                text_parts.append(text)
+
+    return "\n".join(text_parts).strip()
+
+
+def extract_response_refusal(response: Any) -> str:
+    """response.output内に拒否理由があれば取得する。"""
+
+    output_items = get_object_value(response, "output", []) or []
+
+    for item in output_items:
+        content_items = get_object_value(item, "content", []) or []
+
+        for content in content_items:
+            if normalize_text(
+                get_object_value(content, "type", "")
+            ) != "refusal":
+                continue
+
+            refusal = normalize_text(
+                get_object_value(content, "refusal", "")
+            )
+
+            if refusal:
+                return refusal
+
+    return ""
+
+
+def build_response_diagnostic(response: Any) -> dict[str, Any]:
+    """Railwayログへ出すための安全な診断情報を作成する。"""
+
+    incomplete_details = get_object_value(
+        response,
+        "incomplete_details",
+    )
+    response_error = get_object_value(response, "error")
+    usage_data = build_usage_data(response)
+
+    output_summary: list[dict[str, Any]] = []
+    output_items = get_object_value(response, "output", []) or []
+
+    for item in output_items:
+        content_types: list[str] = []
+        content_items = get_object_value(item, "content", []) or []
+
+        for content in content_items:
+            content_types.append(
+                normalize_text(
+                    get_object_value(content, "type", "")
+                )
+            )
+
+        output_summary.append(
+            {
+                "type": normalize_text(
+                    get_object_value(item, "type", "")
+                ),
+                "status": normalize_text(
+                    get_object_value(item, "status", "")
+                ),
+                "content_types": content_types,
+            }
+        )
+
+    return {
+        "response_id": usage_data["response_id"],
+        "status": normalize_text(
+            get_object_value(response, "status", "")
+        ),
+        "incomplete_reason": normalize_text(
+            get_object_value(incomplete_details, "reason", "")
+        ),
+        "error_code": normalize_text(
+            get_object_value(response_error, "code", "")
+        ),
+        "error_message": normalize_text(
+            get_object_value(response_error, "message", "")
+        ),
+        "refusal": extract_response_refusal(response)[:300],
+        "output": output_summary,
+        "usage": usage_data,
+    }
+
+
+# =========================
+# AI通信
+# =========================
+
+def request_photo_analysis(
+    image_path: str,
+    stored_mime_type: str = "",
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    """
+    OpenAIへ画像を送り、構造化された解析結果を取得する。
+
+    output_textが空の場合はresponse.outputも確認し、
+    incomplete・failed・refusalを区別して診断情報を残す。
+    """
+
+    validate_image_file(image_path)
+
+    mime_type = get_image_mime_type(
+        image_path,
+        stored_mime_type,
+    )
+
+    image_data_url = image_to_data_url(
+        image_path,
+        mime_type,
+    )
+
+    client = get_openai_client()
+
+    response = client.responses.create(
+        model=PHOTO_AI_MODEL,
+        store=False,
+        input=[
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": SYSTEM_PROMPT,
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "この画像を写真検索用に"
+                            "分類してください。"
+                        ),
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": image_data_url,
+                        "detail": get_image_detail(),
+                    },
+                ],
+            },
+        ],
+        reasoning={
+            "effort": "low",
+        },
+        max_output_tokens=PHOTO_AI_MAX_OUTPUT_TOKENS,
+        text={
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "photo_analysis",
+                "strict": True,
+                "schema": PHOTO_ANALYSIS_SCHEMA,
+            },
+        },
+    )
+
+    usage_data = build_usage_data(response)
+    response_status = normalize_text(
+        get_object_value(response, "status", "")
+    )
+    raw_output = extract_response_text(response)
+
+    if response_status != "completed" or not raw_output:
+        diagnostic = build_response_diagnostic(response)
+
+        print(
+            "OpenAIレスポンス診断:",
+            json.dumps(
+                diagnostic,
+                ensure_ascii=False,
+                default=str,
+            ),
+        )
+
+        incomplete_reason = normalize_text(
+            diagnostic.get("incomplete_reason", "")
+        )
+        refusal = normalize_text(
+            diagnostic.get("refusal", "")
+        )
+        api_error = normalize_text(
+            diagnostic.get("error_message", "")
+        )
+
+        if incomplete_reason:
+            message = (
+                "AI解析が未完了で終了しました。"
+                f" status={response_status},"
+                f" reason={incomplete_reason},"
+                f" reasoning_tokens="
+                f"{usage_data.get('reasoning_tokens', 0)}"
+            )
+
+        elif refusal:
+            message = (
+                "AIが画像解析を拒否しました。"
+                f" refusal={refusal[:300]}"
+            )
+
+        elif api_error:
+            message = (
+                "OpenAI APIが失敗を返しました。"
+                f" error={api_error[:300]}"
+            )
+
+        elif not raw_output:
+            message = (
+                "AIの解析本文が空でした。"
+                f" status={response_status or 'unknown'},"
+                f" reasoning_tokens="
+                f"{usage_data.get('reasoning_tokens', 0)}"
+            )
+
+        else:
+            message = (
+                "AI解析レスポンスが完了状態ではありません。"
+                f" status={response_status or 'unknown'}"
+            )
+
+        raise AIResponseError(
+            message,
+            usage_data=usage_data,
+            response_status=response_status,
+            response_id=usage_data.get("response_id", ""),
+        )
+
+    try:
+        analysis = json.loads(raw_output)
+
+    except json.JSONDecodeError as error:
+        print(
+            "AI解析JSON読込失敗:",
+            f"response_id={usage_data.get('response_id', '')}",
+            f"先頭500文字={raw_output[:500]}",
+        )
+
+        raise AIResponseError(
+            "AI解析結果をJSONとして読み込めませんでした像ファイルがありません: {image_path}"
+        )
+
+    if not path.is_file():
+        raise ValueError(
+            f"画像ファイルではありません: {image_path}"
+        )
+
+    file_size = path.stat().st_size
+
+    if file_size <= 0:
+        raise ValueError(
+            f"画像ファイルが空です: {image_path}"
+        )
+
+    if file_size > PHOTO_AI_MAX_FILE_SIZE:
+        raise ValueError(
+            "AI解析可能サイズを超えています: "
+            f"{file_size} bytes"
+        )
+
+    return path
+
+
+def get_openai_client() -> OpenAI:
+    """
+    OpenAIクライアントを作成する。
+    """
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "Railway Variablesに"
+            "OPENAI_API_KEYが設定されていません。"
+        )
+
+    if not PHOTO_AI_MODEL:
+        raise RuntimeError(
+            "PHOTO_AI_MODELが空です。"
+        )
+
+    return OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=PHOTO_AI_REQUEST_TIMEOUT,
+    )
+
+
 # =========================
 # AI通信
 # =========================
