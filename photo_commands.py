@@ -284,38 +284,33 @@ def register_photo_commands(bot: commands.Bot) -> None:
 
     @bot.command(name="ai_retry")
     @commands.is_owner()
-    async def ai_retry_command(ctx: commands.Context, image_id: int | None = None, limit: int = 10) -> None:
-        if image_id is not None:
-            image = await asyncio.to_thread(get_photo_image, image_id)
-            if not image:
-                await ctx.send("⚠️ 画像IDが見つかりません。")
-                return
-            await asyncio.to_thread(reset_image_analysis_status, image_id)
-            await ctx.send(f"🤖 画像ID **{image_id}** を再解析します。")
-            result = await analyze_photo_image(image_id)
-            await ctx.send(f"解析結果: **{result.get('status', '不明')}**")
-            return
+    async def ai_retry_command(ctx: commands.Context, count: int = 10) -> None:
+        """failed・review状態の画像を、指定した件数だけ再解析する。"""
 
-        limit = max(1, min(int(limit), 50))
-        failed = await asyncio.to_thread(
+        count = max(1, min(int(count), 1000))
+        targets = await asyncio.to_thread(
             _rows,
             "SELECT id FROM photo_images WHERE analysis_status IN ('failed', 'review') ORDER BY id LIMIT ?",
-            (limit,),
+            (count,),
         )
-        if not failed:
+        if not targets:
             await ctx.send("✅ 再解析対象はありません。")
             return
-        await ctx.send(f"🤖 {len(failed)}件の再解析を開始します。")
+
+        await ctx.send(
+            f"🤖 **{len(targets)}件**の再解析を開始します。"
+            f"（指定件数: {count}件）"
+        )
+
         completed = 0
         review = 0
         failed_count = 0
 
-        for item in failed:
+        for item in targets:
             target_id = int(item["id"])
             await asyncio.to_thread(reset_image_analysis_status, target_id)
             result = await analyze_photo_image(target_id)
-
-            status = result.get("status")
+            status = str(result.get("status") or "failed")
 
             if status == "completed":
                 completed += 1
@@ -325,12 +320,28 @@ def register_photo_commands(bot: commands.Bot) -> None:
                 failed_count += 1
 
         success = completed + review
-
         await ctx.send(
             "✅ 再解析終了\n"
-            f"成功: **{success}件** / 対象 **{len(failed)}件**\n"
-            f"（completed: {completed}件 / review: {review}件 / failed: {failed_count}件）"
+            f"成功: **{success}件** / 対象 **{len(targets)}件**\n"
+            f"（completed: {completed}件 / review: {review}件 / "
+            f"failed: {failed_count}件）"
         )
+
+    @bot.command(name="ai_retry_id")
+    @commands.is_owner()
+    async def ai_retry_id_command(ctx: commands.Context, image_id: int) -> None:
+        """指定した画像IDを1件だけ再解析する。"""
+
+        image = await asyncio.to_thread(get_photo_image, image_id)
+        if not image:
+            await ctx.send("⚠️ 画像IDが見つかりません。")
+            return
+
+        await asyncio.to_thread(reset_image_analysis_status, image_id)
+        await ctx.send(f"🤖 画像ID **{image_id}** を再解析します。")
+        result = await analyze_photo_image(image_id)
+        status = str(result.get("status") or "failed")
+        await ctx.send(f"✅ 画像ID **{image_id}** の解析結果: **{status}**")
 
     @bot.command(name="photo_redownload")
     @commands.is_owner()
