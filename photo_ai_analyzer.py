@@ -601,9 +601,7 @@ def validate_image_file(
 
 
 def get_openai_client() -> OpenAI:
-    """
-    OpenAIクライアントを作成する。
-    """
+    """OpenAIクライアントを作成する。"""
 
     if not OPENAI_API_KEY:
         raise RuntimeError(
@@ -622,13 +620,8 @@ def get_openai_client() -> OpenAI:
     )
 
 
-
-
 class AIResponseError(RuntimeError):
-    """
-    OpenAI Responses APIが正常な解析本文を返さなかった場合の例外。
-    失敗時でも使用量とレスポンスIDをDBへ保存できるようにする。
-    """
+    """Responses APIが正常な解析本文を返さなかった場合の例外。"""
 
     def __init__(
         self,
@@ -693,10 +686,7 @@ def build_usage_data(response: Any) -> dict[str, Any]:
 
 
 def extract_response_text(response: Any) -> str:
-    """
-    SDKのoutput_textを優先し、空の場合はresponse.outputを走査して
-    output_text本文を取り出す。
-    """
+    """output_textが空の場合はresponse.output内も確認する。"""
 
     direct_text = normalize_text(
         get_object_value(response, "output_text", "")
@@ -712,11 +702,9 @@ def extract_response_text(response: Any) -> str:
         content_items = get_object_value(item, "content", []) or []
 
         for content in content_items:
-            content_type = normalize_text(
+            if normalize_text(
                 get_object_value(content, "type", "")
-            )
-
-            if content_type != "output_text":
+            ) != "output_text":
                 continue
 
             text = normalize_text(
@@ -754,7 +742,7 @@ def extract_response_refusal(response: Any) -> str:
 
 
 def build_response_diagnostic(response: Any) -> dict[str, Any]:
-    """Railwayログへ出すための安全な診断情報を作成する。"""
+    """Railwayログへ出す安全な診断情報を作る。"""
 
     incomplete_details = get_object_value(
         response,
@@ -817,12 +805,7 @@ def request_photo_analysis(
     image_path: str,
     stored_mime_type: str = "",
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    """
-    OpenAIへ画像を送り、構造化された解析結果を取得する。
-
-    output_textが空の場合はresponse.outputも確認し、
-    incomplete・failed・refusalを区別して診断情報を残す。
-    """
+    """OpenAIへ画像を送り、構造化された解析結果を取得する。"""
 
     validate_image_file(image_path)
 
@@ -838,10 +821,10 @@ def request_photo_analysis(
 
     client = get_openai_client()
 
-    response = client.responses.create(
-        model=PHOTO_AI_MODEL,
-        store=False,
-        input=[
+    request_options: dict[str, Any] = {
+        "model": PHOTO_AI_MODEL,
+        "store": False,
+        "input": [
             {
                 "role": "system",
                 "content": [
@@ -869,11 +852,8 @@ def request_photo_analysis(
                 ],
             },
         ],
-        reasoning={
-            "effort": "low",
-        },
-        max_output_tokens=PHOTO_AI_MAX_OUTPUT_TOKENS,
-        text={
+        "max_output_tokens": PHOTO_AI_MAX_OUTPUT_TOKENS,
+        "text": {
             "verbosity": "low",
             "format": {
                 "type": "json_schema",
@@ -882,7 +862,15 @@ def request_photo_analysis(
                 "schema": PHOTO_ANALYSIS_SCHEMA,
             },
         },
-    )
+    }
+
+    # GPT-5系では推論量を抑え、JSON本文へ使える出力枠を確保する。
+    if PHOTO_AI_MODEL.startswith("gpt-5"):
+        request_options["reasoning"] = {
+            "effort": "low",
+        }
+
+    response = client.responses.create(**request_options)
 
     usage_data = build_usage_data(response)
     response_status = normalize_text(
@@ -920,19 +908,16 @@ def request_photo_analysis(
                 f" reasoning_tokens="
                 f"{usage_data.get('reasoning_tokens', 0)}"
             )
-
         elif refusal:
             message = (
                 "AIが画像解析を拒否しました。"
                 f" refusal={refusal[:300]}"
             )
-
         elif api_error:
             message = (
                 "OpenAI APIが失敗を返しました。"
                 f" error={api_error[:300]}"
             )
-
         elif not raw_output:
             message = (
                 "AIの解析本文が空でした。"
@@ -940,7 +925,6 @@ def request_photo_analysis(
                 f" reasoning_tokens="
                 f"{usage_data.get('reasoning_tokens', 0)}"
             )
-
         else:
             message = (
                 "AI解析レスポンスが完了状態ではありません。"
@@ -956,184 +940,28 @@ def request_photo_analysis(
 
     try:
         analysis = json.loads(raw_output)
-
     except json.JSONDecodeError as error:
         print(
             "AI解析JSON読込失敗:",
             f"response_id={usage_data.get('response_id', '')}",
             f"先頭500文字={raw_output[:500]}",
         )
-
         raise AIResponseError(
-            "AI解析結果をJSONとして読み込めませんでした像ファイルがありません: {image_path}"
-        )
-
-    if not path.is_file():
-        raise ValueError(
-            f"画像ファイルではありません: {image_path}"
-        )
-
-    file_size = path.stat().st_size
-
-    if file_size <= 0:
-        raise ValueError(
-            f"画像ファイルが空です: {image_path}"
-        )
-
-    if file_size > PHOTO_AI_MAX_FILE_SIZE:
-        raise ValueError(
-            "AI解析可能サイズを超えています: "
-            f"{file_size} bytes"
-        )
-
-    return path
-
-
-def get_openai_client() -> OpenAI:
-    """
-    OpenAIクライアントを作成する。
-    """
-
-    if not OPENAI_API_KEY:
-        raise RuntimeError(
-            "Railway Variablesに"
-            "OPENAI_API_KEYが設定されていません。"
-        )
-
-    if not PHOTO_AI_MODEL:
-        raise RuntimeError(
-            "PHOTO_AI_MODELが空です。"
-        )
-
-    return OpenAI(
-        api_key=OPENAI_API_KEY,
-        timeout=PHOTO_AI_REQUEST_TIMEOUT,
-    )
-
-
-# =========================
-# AI通信
-# =========================
-
-def request_photo_analysis(
-    image_path: str,
-    stored_mime_type: str = "",
-) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    """
-    OpenAIへ画像を送り、
-    構造化された解析結果を取得する。
-
-    戻り値:
-        解析結果の辞書
-        APIの元出力文字列
-    """
-
-    validate_image_file(
-        image_path
-    )
-
-    mime_type = get_image_mime_type(
-        image_path,
-        stored_mime_type,
-    )
-
-    image_data_url = image_to_data_url(
-        image_path,
-        mime_type,
-    )
-
-    client = get_openai_client()
-
-    response = client.responses.create(
-        model=PHOTO_AI_MODEL,
-        store=False,
-        input=[
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": SYSTEM_PROMPT,
-                    },
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            "この画像を写真検索用に"
-                            "分類してください。"
-                        ),
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": image_data_url,
-                        "detail": get_image_detail(),
-                    },
-                ],
-            },
-        ],
-        max_output_tokens=PHOTO_AI_MAX_OUTPUT_TOKENS,
-        text={
-            "format": {
-                "type": "json_schema",
-                "name": "photo_analysis",
-                "strict": True,
-                "schema": PHOTO_ANALYSIS_SCHEMA,
-            },
-        },
-    )
-
-    raw_output = normalize_text(
-        response.output_text
-    )
-
-    if not raw_output:
-        raise RuntimeError(
-            "AIから解析結果が返りませんでした。"
-        )
-
-    try:
-        analysis = json.loads(
-            raw_output
-        )
-
-    except json.JSONDecodeError as error:
-        raise RuntimeError(
-            "AI解析結果をJSONとして"
-            "読み込めませんでした。"
+            "AI解析結果をJSONとして読み込めませんでした。",
+            usage_data=usage_data,
+            response_status=response_status,
+            response_id=usage_data.get("response_id", ""),
         ) from error
 
-    if not isinstance(
-        analysis,
-        dict,
-    ):
-        raise RuntimeError(
-            "AI解析結果が辞書形式ではありません。"
+    if not isinstance(analysis, dict):
+        raise AIResponseError(
+            "AI解析結果が辞書形式ではありません。",
+            usage_data=usage_data,
+            response_status=response_status,
+            response_id=usage_data.get("response_id", ""),
         )
 
-    usage = getattr(response, "usage", None)
-    usage_data = {
-        "response_id": normalize_text(getattr(response, "id", "")),
-        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0),
-        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
-        "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
-        "cached_input_tokens": 0,
-    }
-
-    input_details = getattr(usage, "input_tokens_details", None)
-    if input_details is not None:
-        usage_data["cached_input_tokens"] = int(
-            getattr(input_details, "cached_tokens", 0) or 0
-        )
-
-    return (
-        analysis,
-        raw_output,
-        usage_data,
-    )
+    return analysis, raw_output, usage_data
 
 
 def calculate_estimated_cost(usage_data: dict[str, Any]) -> dict[str, float]:
@@ -1618,6 +1446,40 @@ def analyze_photo_image_sync(
         error_message = (
             f"{type(error).__name__}: {error}"
         )
+
+        if isinstance(error, AIResponseError):
+            failure_usage = error.usage_data
+            failure_costs = calculate_estimated_cost(failure_usage)
+
+            try:
+                save_ai_usage(
+                    image_id=image_id,
+                    model_name=PHOTO_AI_MODEL,
+                    request_kind="api",
+                    status="failed",
+                    input_tokens=int(
+                        failure_usage.get("input_tokens", 0) or 0
+                    ),
+                    cached_input_tokens=int(
+                        failure_usage.get("cached_input_tokens", 0) or 0
+                    ),
+                    output_tokens=int(
+                        failure_usage.get("output_tokens", 0) or 0
+                    ),
+                    total_tokens=int(
+                        failure_usage.get("total_tokens", 0) or 0
+                    ),
+                    response_id=str(
+                        failure_usage.get("response_id", "")
+                    ),
+                    **failure_costs,
+                )
+            except Exception as usage_error:
+                print(
+                    "AI失敗時の使用量保存に失敗:",
+                    f"image_id={image_id}",
+                    f"{type(usage_error).__name__}: {usage_error}",
+                )
 
         update_image_analysis_status(
             image_id,
