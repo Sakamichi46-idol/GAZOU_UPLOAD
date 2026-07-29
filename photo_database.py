@@ -559,6 +559,57 @@ def init_photo_db() -> None:
         )
 
         # -------------------------
+        # 画像単位の顔スキャン履歴
+        # -------------------------
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS photo_face_scans (
+                image_id INTEGER PRIMARY KEY,
+
+                status TEXT NOT NULL DEFAULT 'pending',
+                detected_faces INTEGER NOT NULL DEFAULT 0,
+                auto_confirmed_faces INTEGER NOT NULL DEFAULT 0,
+
+                model_name TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+
+                scanned_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+
+                FOREIGN KEY(image_id)
+                    REFERENCES photo_images(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        # Phase 6初期版で既に顔が保存されている画像は、
+        # 完了済みとして安全に引き継ぐ。顔が0件だった過去画像だけは
+        # 履歴が存在しないため、次回バッチで一度だけ再スキャンされる。
+        now = utc_now_text()
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO photo_face_scans (
+                image_id, status, detected_faces, auto_confirmed_faces,
+                model_name, error_message, scanned_at, created_at, updated_at
+            )
+            SELECT
+                photo_faces.image_id,
+                'completed',
+                COUNT(photo_faces.id),
+                SUM(CASE WHEN photo_faces.confirmation_status = 'auto_seeded' THEN 1 ELSE 0 END),
+                MAX(photo_faces.model_name),
+                '',
+                ?, ?, ?
+            FROM photo_faces
+            GROUP BY photo_faces.image_id
+            """,
+            (now, now, now),
+        )
+
+        # -------------------------
         # 顔ごとの人物候補
         # -------------------------
 
@@ -829,6 +880,14 @@ def init_photo_db() -> None:
             CREATE INDEX IF NOT EXISTS
             idx_photo_faces_status
             ON photo_faces(confirmation_status)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+            idx_photo_face_scans_status
+            ON photo_face_scans(status)
             """
         )
 
@@ -3377,6 +3436,18 @@ def get_photo_db_counts() -> dict[str, int]:
             "people": """
                 SELECT COUNT(*) AS count
                 FROM photo_people
+            """,
+
+            "face_scanned_images": """
+                SELECT COUNT(*) AS count
+                FROM photo_face_scans
+                WHERE status = 'completed'
+            """,
+
+            "face_scan_failed_images": """
+                SELECT COUNT(*) AS count
+                FROM photo_face_scans
+                WHERE status = 'failed'
             """,
 
             "faces": """
