@@ -3323,8 +3323,12 @@ def get_photo_storage_stats() -> dict[str, int]:
 def get_person_reviews_by_status(
     status: str,
     limit: int = 100,
+    group_name: str = "",
 ) -> list[dict[str, Any]]:
-    """指定状態の人物レビューをDiscord画面用の情報付きで返す。"""
+    """指定状態の人物レビューをDiscord画面用の情報付きで返す。
+
+    group_name を指定した場合は、その坂道グループのブログだけに絞り込む。
+    """
     normalized_status = str(status or "").strip().lower()
     allowed_statuses = {"pending", "skipped"}
     if normalized_status not in allowed_statuses:
@@ -3334,10 +3338,17 @@ def get_person_reviews_by_status(
         )
 
     safe_limit = max(1, min(int(limit), 500))
+    normalized_group = str(group_name or "").strip()
+    group_filter = " AND photo_blogs.group_name = ?" if normalized_group else ""
+    params: tuple[Any, ...]
+    if normalized_group:
+        params = (normalized_status, normalized_group, safe_limit)
+    else:
+        params = (normalized_status, safe_limit)
 
     with closing(get_connection()) as connection:
         rows = connection.execute(
-            """
+            f"""
             SELECT
                 photo_review_queue.id AS review_id,
                 photo_review_queue.image_id,
@@ -3381,23 +3392,30 @@ def get_person_reviews_by_status(
                 ON photo_ai_analysis.image_id = photo_images.id
             WHERE photo_review_queue.status = ?
               AND photo_review_queue.review_type = 'person_identity'
+              {group_filter}
             ORDER BY photo_review_queue.id ASC
             LIMIT ?
             """,
-            (normalized_status, safe_limit),
+            params,
         ).fetchall()
 
     return rows_to_dicts(rows)
 
 
-def get_pending_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
+def get_pending_person_reviews(
+    limit: int = 100,
+    group_name: str = "",
+) -> list[dict[str, Any]]:
     """未確認の人物レビューを返す。"""
-    return get_person_reviews_by_status("pending", limit)
+    return get_person_reviews_by_status("pending", limit, group_name)
 
 
-def get_skipped_person_reviews(limit: int = 100) -> list[dict[str, Any]]:
+def get_skipped_person_reviews(
+    limit: int = 100,
+    group_name: str = "",
+) -> list[dict[str, Any]]:
     """過去にスキップした人物レビューを返す。"""
-    return get_person_reviews_by_status("skipped", limit)
+    return get_person_reviews_by_status("skipped", limit, group_name)
 
 
 # =========================
