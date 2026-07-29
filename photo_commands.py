@@ -292,12 +292,45 @@ def register_photo_commands(bot: commands.Bot) -> None:
                 "`requirements-face.txt` の依存関係を `requirements.txt` に追加すると有効化できます。"
             )
             return
+        counts = await asyncio.to_thread(get_photo_db_counts)
+        eligible_row = await asyncio.to_thread(
+            _row,
+            """
+            SELECT COUNT(*) AS count
+            FROM photo_images
+            WHERE download_status = 'completed'
+              AND (local_path != '' OR bucket_key != '')
+            """,
+        )
+        images_with_faces_row = await asyncio.to_thread(
+            _row,
+            "SELECT COUNT(DISTINCT image_id) AS count FROM photo_faces",
+        )
+
+        eligible_images = int((eligible_row or {}).get("count") or 0)
+        scanned_images = int(counts.get("face_scanned_images") or 0)
+        failed_images = int(counts.get("face_scan_failed_images") or 0)
+        remaining_images = max(eligible_images - scanned_images, 0)
+        images_with_faces = int((images_with_faces_row or {}).get("count") or 0)
+        progress = (scanned_images / eligible_images * 100.0) if eligible_images else 0.0
+        detection_rate = (images_with_faces / scanned_images * 100.0) if scanned_images else 0.0
+
         await ctx.send(
             "✅ **ローカル顔認識: 利用可能**\n"
             f"モデル: `{status.get('model_name')}`\n"
-            f"OpenCV: `{status.get('opencv_version')}`\n"
-            f"NumPy: `{status.get('numpy_version')}`\n"
-            "OpenAI APIは使用しません。処理はコマンド実行時だけです。"
+            f"OpenCV: `{status.get('opencv_version')}` / NumPy: `{status.get('numpy_version')}`\n\n"
+            "📊 **顔スキャン進捗**\n"
+            f"対象画像: **{eligible_images:,}枚**\n"
+            f"スキャン済み: **{scanned_images:,}枚**（{progress:.1f}%）\n"
+            f"未スキャン: **{remaining_images:,}枚**\n"
+            f"失敗記録: **{failed_images:,}枚**\n\n"
+            "👤 **顔データ**\n"
+            f"顔を検出した画像: **{images_with_faces:,}枚**（スキャン済みの{detection_rate:.1f}%）\n"
+            f"検出した顔: **{int(counts.get('faces') or 0):,}件**\n"
+            f"参照登録済み: **{int(counts.get('confirmed_faces') or 0):,}件**\n"
+            f"人物候補: **{int(counts.get('face_candidates') or 0):,}件**\n"
+            f"顔確認待ち: **{int(counts.get('pending_face_reviews') or 0):,}件**\n\n"
+            "OpenAI APIは使用しません。顔が0件だった画像もスキャン済みとして記録します。"
         )
 
     @bot.command(name="face_scan")
