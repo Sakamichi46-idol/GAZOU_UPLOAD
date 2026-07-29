@@ -1,4 +1,5 @@
 import asyncio
+import io
 import os
 import sqlite3
 from contextlib import closing
@@ -18,6 +19,8 @@ from photo_database import (
     get_image_people,
     get_person_by_name,
     confirm_face_person,
+    complete_face_review,
+    get_pending_face_reviews,
     set_confirmed_image_people,
     get_connection,
     get_photo_db_counts,
@@ -49,6 +52,8 @@ from local_face_recognition import (
     detect_faces_for_image,
     get_face_engine_status,
     get_face_summary,
+    get_face_crop_bytes,
+    scan_faces_batch,
     suggest_face_candidates,
 )
 
@@ -359,6 +364,91 @@ def register_photo_commands(bot: commands.Bot) -> None:
             )
         await ctx.send("\n".join(lines)[:1900])
 
+    @bot.command(name="face_scan_batch")
+    @commands.is_owner()
+    async def face_scan_batch_command(
+        ctx: commands.Context,
+        limit: int = 20,
+        *,
+        group_name: str = "",
+    ) -> None:
+        """未スキャン画像をローカルで一括顔検出する。最大100件。"""
+        limit = max(1, min(int(limit), 100))
+        group_name = group_name.strip()
+        label = f" / {group_name}" if group_name else ""
+        await ctx.send(f"🔍 顔一括検出を開始します: **最大{limit}枚{label}**\nOpenAI APIは使用しません。")
+        try:
+            result = await asyncio.to_thread(scan_faces_batch, limit, group_name)
+        except FaceEngineUnavailable as error:
+            await ctx.send(f"⚠️ {error}")
+            return
+        except Exception as error:
+            await ctx.send(f"❌ 一括顔検出に失敗しました: `{type(error).__name__}: {error}`")
+            return
+        lines = [
+            "✅ **顔一括検出完了**",
+            f"対象: **{result['targets']}枚**",
+            f"処理成功: **{result['scanned']}枚**",
+            f"検出した顔: **{result['detected']}件**",
+            f"安全条件で参照登録: **{result['auto_confirmed']}件**",
+            f"失敗: **{result['failed']}枚**",
+        ]
+        if result.get("errors"):
+            lines.append("\n**先頭のエラー**")
+            lines.extend(f"・{item}" for item in result["errors"])
+        await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="face_crop")
+    @commands.is_owner()
+    async def face_crop_command(ctx: commands.Context, face_id: int) -> None:
+        """顔IDの切り出し画像を一時表示する。"""
+        try:
+            data, filename = await asyncio.to_thread(get_face_crop_bytes, face_id)
+        except Exception as error:
+            await ctx.send(f"❌ 顔画像の作成に失敗しました: `{type(error).__name__}: {error}`")
+            return
+        await ctx.send(
+            f"🖼️ 顔ID **{face_id}** の確認用切り出し",
+            file=discord.File(io.BytesIO(data), filename=filename),
+        )
+
+    @bot.command(name="face_review_list")
+    @commands.is_owner()
+    async def face_review_list_command(ctx: commands.Context, limit: int = 5) -> None:
+        reviews = await asyncio.to_thread(get_pending_face_reviews, max(1, min(int(limit), 10)))
+        if not reviews:
+            await ctx.send("✅ 顔の確認待ちはありません。")
+            return
+        lines = ["👤 **顔確認待ち**"]
+        for item in reviews:
+            candidates = str(item.get("candidates") or "").strip()
+            lines.append(
+                f"Review **{item['id']}** / 顔ID **{item['face_id']}** / 画像ID **{item['image_id']}**\n"
+                f"{item.get('group_name','')} {item.get('member_name','')} / 候補: {candidates or 'なし'}"
+            )
+        lines.append("\n確認画像: `!face_crop 顔ID`\n確定: `!face_review_done 顔ID 人物名`")
+        await ctx.send("\n\n".join(lines)[:1900])
+
+    @bot.command(name="face_review_done")
+    @commands.is_owner()
+    async def face_review_done_command(ctx: commands.Context, face_id: int, *, person_name: str = "") -> None:
+        person_name = person_name.strip()
+        if not person_name:
+            await ctx.send("使い方: `!face_review_done 顔ID 人物名`")
+            return
+        person = await asyncio.to_thread(get_person_by_name, person_name)
+        if not person:
+            await ctx.send("⚠️ 人物マスターにその名前がありません。")
+            return
+        await asyncio.to_thread(
+            complete_face_review,
+            face_id,
+            int(person["id"]),
+            str(ctx.author.id),
+            "Discord face review",
+        )
+        await ctx.send(f"✅ 顔ID **{face_id}** を **{person_name}** としてレビュー完了しました。")
+
     @bot.command(name="face_confirm")
     @commands.is_owner()
     async def face_confirm_command(ctx: commands.Context, face_id: int, *, person_name: str = "") -> None:
@@ -372,6 +462,8 @@ def register_photo_commands(bot: commands.Bot) -> None:
             return
         await asyncio.to_thread(
             confirm_face_person,
+    complete_face_review,
+    get_pending_face_reviews,
             face_id,
             int(person["id"]),
             confirmed_by=str(ctx.author.id),
