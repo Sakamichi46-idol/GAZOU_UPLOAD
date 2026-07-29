@@ -3324,6 +3324,7 @@ def get_person_reviews_by_status(
     status: str,
     limit: int = 100,
     group_name: str = "",
+    blog_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """指定状態の人物レビューをDiscord画面用の情報付きで返す。
 
@@ -3339,12 +3340,22 @@ def get_person_reviews_by_status(
 
     safe_limit = max(1, min(int(limit), 500))
     normalized_group = str(group_name or "").strip()
-    group_filter = " AND photo_blogs.group_name = ?" if normalized_group else ""
-    params: tuple[Any, ...]
+    normalized_blog_id = int(blog_id) if blog_id is not None else None
+
+    filters: list[str] = []
+    values: list[Any] = [normalized_status]
     if normalized_group:
-        params = (normalized_status, normalized_group, safe_limit)
-    else:
-        params = (normalized_status, safe_limit)
+        filters.append("photo_blogs.group_name = ?")
+        values.append(normalized_group)
+    if normalized_blog_id is not None:
+        filters.append("photo_blogs.id = ?")
+        values.append(normalized_blog_id)
+
+    extra_filter = ""
+    if filters:
+        extra_filter = " AND " + " AND ".join(filters)
+    values.append(safe_limit)
+    params = tuple(values)
 
     with closing(get_connection()) as connection:
         rows = connection.execute(
@@ -3359,6 +3370,12 @@ def get_person_reviews_by_status(
                 photo_images.image_url,
                 photo_images.local_path,
                 photo_images.image_index,
+                photo_images.blog_id,
+                (
+                    SELECT COUNT(*)
+                    FROM photo_images AS blog_images
+                    WHERE blog_images.blog_id = photo_images.blog_id
+                ) AS total_blog_images,
                 photo_blogs.blog_url,
                 photo_blogs.group_name,
                 photo_blogs.member_name,
@@ -3392,8 +3409,8 @@ def get_person_reviews_by_status(
                 ON photo_ai_analysis.image_id = photo_images.id
             WHERE photo_review_queue.status = ?
               AND photo_review_queue.review_type = 'person_identity'
-              {group_filter}
-            ORDER BY photo_review_queue.id ASC
+              {extra_filter}
+            ORDER BY photo_blogs.id ASC, photo_images.image_index ASC, photo_review_queue.id ASC
             LIMIT ?
             """,
             params,
@@ -3405,17 +3422,61 @@ def get_person_reviews_by_status(
 def get_pending_person_reviews(
     limit: int = 100,
     group_name: str = "",
+    blog_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """未確認の人物レビューを返す。"""
-    return get_person_reviews_by_status("pending", limit, group_name)
+    return get_person_reviews_by_status("pending", limit, group_name, blog_id)
 
 
 def get_skipped_person_reviews(
     limit: int = 100,
     group_name: str = "",
+    blog_id: int | None = None,
 ) -> list[dict[str, Any]]:
     """過去にスキップした人物レビューを返す。"""
-    return get_person_reviews_by_status("skipped", limit, group_name)
+    return get_person_reviews_by_status("skipped", limit, group_name, blog_id)
+
+
+def set_confirmed_blog_people(
+    blog_id: int,
+    person_names: list[str],
+    *,
+    confirmed_by: str = "",
+    note: str = "",
+    statuses: tuple[str, ...] = ("pending",),
+) -> int:
+    """同じブログの対象レビューを、指定人物でまとめて確定する。
+
+    既に完了済みの画像は変更しない。戻り値は今回確定した画像数。
+    """
+    allowed = tuple(status for status in statuses if status in {"pending", "skipped"})
+    if not allowed:
+        return 0
+
+    placeholders = ",".join("?" for _ in allowed)
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT photo_review_queue.image_id
+            FROM photo_review_queue
+            JOIN photo_images ON photo_images.id = photo_review_queue.image_id
+            WHERE photo_images.blog_id = ?
+              AND photo_review_queue.review_type = 'person_identity'
+              AND photo_review_queue.status IN ({placeholders})
+            ORDER BY photo_images.image_index ASC
+            """,
+            (int(blog_id), *allowed),
+        ).fetchall()
+
+    image_ids = [int(row["image_id"]) for row in rows]
+    for image_id in image_ids:
+        set_confirmed_image_people(
+            image_id,
+            person_names,
+            confirmed_by=confirmed_by,
+            note=note,
+        )
+    return len(image_ids)
 
 
 # =========================
