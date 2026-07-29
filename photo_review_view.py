@@ -14,6 +14,7 @@ from photo_database import (
     get_pending_person_reviews,
     get_skipped_person_reviews,
     save_person,
+    set_confirmed_blog_people,
     set_confirmed_image_people,
     utc_now_text,
 )
@@ -50,10 +51,11 @@ def get_reviewer_name(user: discord.abc.User) -> str:
 
 
 def build_candidate_names(review: dict[str, Any]) -> list[str]:
+    """投稿者を最優先にし、その後へAI候補を重複なしで並べる。"""
     result: list[str] = []
-    for key in ("candidate_people", "ai_person_name", "candidates"):
+    for key in ("member_name", "candidate_people", "ai_person_name", "candidates"):
         for name in split_person_names(review.get(key, "")):
-            if name not in result:
+            if name and name not in result:
                 result.append(name)
     return result
 
@@ -89,8 +91,12 @@ def build_review_embed(review: dict[str, Any]) -> discord.Embed:
         color=SKIP_EMBED_COLOR if is_skipped else REVIEW_EMBED_COLOR,
     )
     embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
+    image_index = int(review.get("image_index") or 0)
+    total_blog_images = int(review.get("total_blog_images") or 0)
+    image_position = f"{image_index} / {total_blog_images}" if total_blog_images else str(image_index or "不明")
+    embed.add_field(name="ブログ内の画像", value=image_position, inline=True)
     embed.add_field(name="グループ", value=normalize_text(review.get("group_name")) or "不明", inline=True)
-    embed.add_field(name="ブログ投稿者", value=normalize_text(review.get("member_name")) or "不明", inline=True)
+    embed.add_field(name="ブログ投稿者（最優先候補）", value=normalize_text(review.get("member_name")) or "不明", inline=True)
     embed.add_field(name="タイトル", value=truncate_text(review.get("title"), 1000) or "タイトルなし", inline=False)
     if is_skipped and normalize_text(review.get("review_note")):
         embed.add_field(
@@ -140,8 +146,10 @@ class ReviewSession:
         self.queue_status = "skipped" if queue_status == "skipped" else "pending"
         self.group_name = normalize_text(group_name)
         self.continuous = False
+        self.current_blog_id: int | None = None
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
+        self.message_by_image_id: dict[int, discord.Message] = {}
         self.lock = asyncio.Lock()
         self.stopped = False
 
@@ -152,10 +160,10 @@ class ReviewSession:
             return f"{self.group_name}の{status_label}"
         return status_label
 
-    def get_reviews(self, limit: int) -> list[dict[str, Any]]:
+    def get_reviews(self, limit: int, blog_id: int | None = None) -> list[dict[str, Any]]:
         if self.queue_status == "skipped":
-            return get_skipped_person_reviews(limit, self.group_name)
-        return get_pending_person_reviews(limit, self.group_name)
+            return get_skipped_person_reviews(limit, self.group_name, blog_id)
+        return get_pending_person_reviews(limit, self.group_name, blog_id)
 
     async def send_message(self, *args: Any, **kwargs: Any) -> discord.Message | None:
         destination = self.destination
@@ -169,15 +177,36 @@ class ReviewSession:
     async def start_batch(self) -> int:
         if self.stopped:
             return 0
-        reviews = await asyncio.to_thread(self.get_reviews, self.batch_size)
+
+        # まず現在のブログを続け、残りがなければ次のブログへ移る。
+        reviews: list[dict[str, Any]] = []
+        if self.current_blog_id is not None:
+            reviews = await asyncio.to_thread(
+                self.get_reviews,
+                self.batch_size,
+                self.current_blog_id,
+            )
+
         if not reviews:
-            await self.send_message(f"✅ {self.queue_label}の写真はありません。")
-            self.stopped = True
-            return 0
+            first = await asyncio.to_thread(self.get_reviews, 1, None)
+            if not first:
+                await self.send_message(f"✅ {self.queue_label}の写真はありません。")
+                self.stopped = True
+                return 0
+            self.current_blog_id = int(first[0]["blog_id"])
+            reviews = await asyncio.to_thread(
+                self.get_reviews,
+                self.batch_size,
+                self.current_blog_id,
+            )
+
         self.active_image_ids = {int(review["image_id"]) for review in reviews}
         self.completed_image_ids.clear()
+        self.message_by_image_id.clear()
         for review in reviews:
-            await send_person_review(self.destination, review, session=self)
+            message = await send_person_review(self.destination, review, session=self)
+            if message is not None:
+                self.message_by_image_id[int(review["image_id"])] = message
         return len(reviews)
 
     async def mark_done(self, image_id: int) -> None:
@@ -190,6 +219,17 @@ class ReviewSession:
             finished_count = len(self.active_image_ids)
             self.active_image_ids.clear()
             self.completed_image_ids.clear()
+            self.message_by_image_id.clear()
+
+        same_blog_remaining = []
+        if self.current_blog_id is not None:
+            same_blog_remaining = await asyncio.to_thread(
+                self.get_reviews,
+                1,
+                self.current_blog_id,
+            )
+        if not same_blog_remaining:
+            self.current_blog_id = None
 
         if self.continuous:
             await self.send_message(
@@ -210,6 +250,60 @@ class ReviewSession:
             f"✅ {finished_count}件のレビューが完了しました。\n続けて確認しますか？",
             view=ReviewContinueView(self),
         )
+
+
+    async def complete_current_blog(
+        self,
+        interaction: discord.Interaction,
+        names: list[str],
+    ) -> int:
+        if self.current_blog_id is None:
+            await interaction.response.send_message("対象ブログを特定できませんでした。", ephemeral=True)
+            return 0
+
+        reviewer = get_reviewer_name(interaction.user)
+        await interaction.response.defer(ephemeral=True)
+        count = await asyncio.to_thread(
+            set_confirmed_blog_people,
+            self.current_blog_id,
+            names,
+            confirmed_by=reviewer,
+            note="Discordレビュー画面からブログ単位で一括確定",
+            statuses=(self.queue_status,),
+        )
+
+        for image_id, message in list(self.message_by_image_id.items()):
+            try:
+                embed = discord.Embed(
+                    title="✅ ブログ単位で一括確定",
+                    description=f"このブログの対象画像を **{'、'.join(names)}** で確定しました。",
+                    color=SUCCESS_EMBED_COLOR,
+                )
+                embed.add_field(name="画像ID", value=str(image_id), inline=True)
+                embed.add_field(name="確定人物", value="、".join(names), inline=False)
+                await message.edit(embed=embed, view=None, attachments=[])
+            except (discord.HTTPException, discord.NotFound):
+                pass
+
+        self.active_image_ids.clear()
+        self.completed_image_ids.clear()
+        self.message_by_image_id.clear()
+        self.current_blog_id = None
+        await interaction.followup.send(
+            f"✅ このブログの **{count}件** を **{'、'.join(names)}** で一括確定しました。",
+            ephemeral=True,
+        )
+
+        if self.continuous:
+            await self.start_batch()
+        else:
+            remaining = await asyncio.to_thread(self.get_reviews, 1, None)
+            if remaining:
+                await self.send_message("続けて確認しますか？", view=ReviewContinueView(self))
+            else:
+                await self.send_message(f"🎉 {self.queue_label}は0件になりました。")
+                self.stopped = True
+        return count
 
 
 class ReviewContinueView(discord.ui.View):
@@ -441,6 +535,29 @@ class SelectedPeopleView(OwnedView):
             await self.state.session.mark_done(int(self.state.review["image_id"]))
 
 
+class BlogBulkConfirmView(discord.ui.View):
+    def __init__(self, session: ReviewSession, author_name: str):
+        super().__init__(timeout=120)
+        self.session = session
+        self.author_name = author_name
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.session.owner_id:
+            await interaction.response.send_message("この操作はレビュー開始者だけが使えます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="一括確定する", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.session.complete_current_blog(interaction, [self.author_name])
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="一括確定をキャンセルしました。", view=None)
+        self.stop()
+
+
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=900)
@@ -543,6 +660,24 @@ class PersonReviewView(discord.ui.View):
         )
         if self.session:
             await self.session.mark_done(self.image_id)
+
+    @discord.ui.button(label="このブログを投稿者で一括確定", emoji="📚", style=discord.ButtonStyle.success, row=1)
+    async def confirm_blog_author(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        author = normalize_text(self.review.get("member_name"))
+        if not author:
+            await interaction.response.send_message("ブログ投稿者が取得できないため一括確定できません。", ephemeral=True)
+            return
+        if not self.session:
+            await interaction.response.send_message(
+                "一括確定は `!review_list` 系コマンドから開いたレビューで利用してください。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"このブログの確認待ち画像を **{author}** で一括確定しますか？",
+            view=BlogBulkConfirmView(self.session, author),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=1)
     async def no_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
