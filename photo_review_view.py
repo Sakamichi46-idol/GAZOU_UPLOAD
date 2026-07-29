@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any
@@ -12,6 +13,7 @@ from discord.ext import commands
 from photo_database import (
     get_connection,
     get_pending_person_reviews,
+    get_frequent_confirmed_people,
     get_skipped_person_reviews,
     save_person,
     set_confirmed_blog_people,
@@ -24,6 +26,8 @@ REVIEW_EMBED_COLOR = discord.Color.blue()
 SUCCESS_EMBED_COLOR = discord.Color.green()
 SKIP_EMBED_COLOR = discord.Color.orange()
 MAX_CANDIDATE_DISPLAY = 10
+QUICK_PEOPLE_CACHE_SECONDS = 300
+_QUICK_PEOPLE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 
 def normalize_text(value: Any) -> str:
@@ -48,6 +52,19 @@ def split_person_names(value: Any) -> list[str]:
 def get_reviewer_name(user: discord.abc.User) -> str:
     name = normalize_text(getattr(user, "display_name", "")) or normalize_text(getattr(user, "name", ""))
     return f"{name} ({user.id})".strip()
+
+
+def get_quick_people_cached(group_name: str, limit: int = 25) -> list[dict[str, Any]]:
+    """同じグループの頻出人物を短時間キャッシュし、DB集計回数を抑える。"""
+    cache_key = normalize_text(group_name) or "__all__"
+    now = time.monotonic()
+    cached = _QUICK_PEOPLE_CACHE.get(cache_key)
+    if cached and now - cached[0] < QUICK_PEOPLE_CACHE_SECONDS:
+        return cached[1][:limit]
+
+    people = get_frequent_confirmed_people(group_name, max(limit, 25))
+    _QUICK_PEOPLE_CACHE[cache_key] = (now, people)
+    return people[:limit]
 
 
 def build_candidate_names(review: dict[str, Any]) -> list[str]:
@@ -77,7 +94,7 @@ def mark_person_review_skipped(image_id: int, reviewed_by: str = "", note: str =
         connection.commit()
 
 
-def build_review_embed(review: dict[str, Any]) -> discord.Embed:
+def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]] | None = None) -> discord.Embed:
     candidates = build_candidate_names(review)
     confirmed = split_person_names(review.get("confirmed_people", ""))
     is_skipped = normalize_text(review.get("review_status")) == "skipped"
@@ -108,6 +125,14 @@ def build_review_embed(review: dict[str, Any]) -> discord.Embed:
         embed.add_field(name="投稿日", value=truncate_text(review.get("published_at"), 1000), inline=False)
     candidate_text = "\n".join(f"{i}. {name}" for i, name in enumerate(candidates[:MAX_CANDIDATE_DISPLAY], 1))
     embed.add_field(name="🤖 人物候補", value=candidate_text or "候補はありません。", inline=False)
+    if quick_people:
+        quick_text = " / ".join(
+            f"{item.get('person_name', '')}（{int(item.get('confirmed_count') or 0)}）"
+            for item in quick_people[:8]
+            if normalize_text(item.get("person_name"))
+        )
+        if quick_text:
+            embed.add_field(name="⚡ よく使う人物", value=truncate_text(quick_text, 1000), inline=False)
     embed.add_field(name="現在の確定人物", value="、".join(confirmed) if confirmed else "未確定", inline=False)
     if review.get("blog_url"):
         embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
@@ -558,6 +583,40 @@ class BlogBulkConfirmView(discord.ui.View):
         self.stop()
 
 
+class QuickPeopleSelect(discord.ui.Select):
+    """確認回数の多い人物を、検索可能な選択メニューで素早く確定する。"""
+
+    def __init__(self, parent: "PersonReviewView", people: list[dict[str, Any]]):
+        options: list[discord.SelectOption] = []
+        for item in people[:25]:
+            name = normalize_text(item.get("person_name"))
+            if not name:
+                continue
+            count = int(item.get("confirmed_count") or 0)
+            options.append(
+                discord.SelectOption(
+                    label=truncate_text(name, 100),
+                    value=name,
+                    description=truncate_text(f"確認済み写真 {count}件", 100),
+                )
+            )
+        super().__init__(
+            placeholder="よく使う人物から選択（複数可）",
+            min_values=1,
+            max_values=max(1, min(len(options), 10)),
+            options=options,
+            row=2,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.complete_review(
+            interaction,
+            list(self.values),
+            note="よく使う人物メニューから確定",
+        )
+
+
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=900)
@@ -565,7 +624,13 @@ class PersonReviewView(discord.ui.View):
         self.session = session
         self.image_id = int(review["image_id"])
         self.candidates = build_candidate_names(review)
+        self.quick_people = get_quick_people_cached(
+            normalize_text(review.get("group_name")),
+            25,
+        )
         self.accept_candidate.disabled = not bool(self.candidates)
+        if self.quick_people:
+            self.add_item(QuickPeopleSelect(self, self.quick_people))
 
         # スキップ済み一覧では再スキップすると同じ写真が再取得され続けるため、
         # スキップボタンを無効化して必ず確定・終了のどちらかを選べるようにする。
@@ -702,8 +767,8 @@ async def send_person_review(
     *,
     session: ReviewSession | None = None,
 ) -> discord.Message | None:
-    embed = build_review_embed(review)
     view = PersonReviewView(review, session=session)
+    embed = build_review_embed(review, view.quick_people)
     local_path = normalize_text(review.get("local_path"))
     image_url = normalize_text(review.get("image_url"))
     file: discord.File | None = None
