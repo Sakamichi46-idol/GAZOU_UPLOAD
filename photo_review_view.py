@@ -132,11 +132,13 @@ class ReviewSession:
         owner_id: int,
         batch_size: int = 5,
         queue_status: str = "pending",
+        group_name: str = "",
     ):
         self.destination = destination
         self.owner_id = owner_id
         self.batch_size = max(1, min(int(batch_size), 10))
         self.queue_status = "skipped" if queue_status == "skipped" else "pending"
+        self.group_name = normalize_text(group_name)
         self.continuous = False
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
@@ -145,12 +147,15 @@ class ReviewSession:
 
     @property
     def queue_label(self) -> str:
-        return "スキップ済み" if self.queue_status == "skipped" else "人物確認待ち"
+        status_label = "スキップ済み" if self.queue_status == "skipped" else "人物確認待ち"
+        if self.group_name:
+            return f"{self.group_name}の{status_label}"
+        return status_label
 
     def get_reviews(self, limit: int) -> list[dict[str, Any]]:
         if self.queue_status == "skipped":
-            return get_skipped_person_reviews(limit)
-        return get_pending_person_reviews(limit)
+            return get_skipped_person_reviews(limit, self.group_name)
+        return get_pending_person_reviews(limit, self.group_name)
 
     async def send_message(self, *args: Any, **kwargs: Any) -> discord.Message | None:
         destination = self.destination
@@ -584,8 +589,12 @@ async def send_person_review(
     return await destination.send(**kwargs)
 
 
-async def send_next_person_review(destination: commands.Context | discord.Interaction | discord.abc.Messageable) -> dict[str, Any] | None:
-    reviews = await asyncio.to_thread(get_pending_person_reviews, 1)
+async def send_next_person_review(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    *,
+    group_name: str = "",
+) -> dict[str, Any] | None:
+    reviews = await asyncio.to_thread(get_pending_person_reviews, 1, group_name)
     if not reviews:
         message = "✅ 人物確認待ちの写真はありません。"
         if isinstance(destination, discord.Interaction):
@@ -602,6 +611,7 @@ async def send_person_review_batch(
     limit: int = 5,
     *,
     queue_status: str = "pending",
+    group_name: str = "",
 ) -> int:
     owner = getattr(destination, "author", None) or getattr(destination, "user", None)
     owner_id = int(getattr(owner, "id", 0) or 0)
@@ -610,6 +620,7 @@ async def send_person_review_batch(
         owner_id=owner_id,
         batch_size=max(1, min(int(limit), 10)),
         queue_status=queue_status,
+        group_name=group_name,
     )
     return await session.start_batch()
 
@@ -617,10 +628,13 @@ async def send_person_review_batch(
 async def send_skipped_person_review_batch(
     destination: commands.Context | discord.Interaction | discord.abc.Messageable,
     limit: int = 5,
+    *,
+    group_name: str = "",
 ) -> int:
     """過去にスキップした人物レビューを再表示する。"""
     return await send_person_review_batch(
         destination,
         limit=limit,
         queue_status="skipped",
+        group_name=group_name,
     )
