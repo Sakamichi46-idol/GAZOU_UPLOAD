@@ -2735,6 +2735,30 @@ def complete_face_review(
         connection.commit()
 
 
+def skip_face_review(
+    face_id: int,
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> None:
+    """顔レビューを保留状態にする。顔の人物確定情報は変更しない。"""
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            UPDATE photo_face_reviews
+            SET status = 'skipped',
+                selected_person_id = NULL,
+                reviewed_by = ?,
+                review_note = ?,
+                reviewed_at = ?,
+                updated_at = ?
+            WHERE face_id = ?
+            """,
+            (reviewed_by, review_note, now, now, int(face_id)),
+        )
+        connection.commit()
+
+
 def get_pending_face_reviews(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
