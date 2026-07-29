@@ -47,6 +47,7 @@ from photo_review_view import (
     send_skipped_person_review_batch,
 )
 from photo_tag_explorer import send_photo_tag_explorer
+from photo_face_review_view import send_face_review_batch
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -545,6 +546,12 @@ def register_photo_commands(bot: commands.Bot) -> None:
             file=discord.File(io.BytesIO(data), filename=filename),
         )
 
+    @bot.command(name="face_review")
+    @commands.is_owner()
+    async def face_review_command(ctx: commands.Context, limit: int = 1) -> None:
+        """切り出し画像・候補選択・投稿者ボタン付きで顔を確認する。"""
+        await send_face_review_batch(ctx, max(1, min(int(limit), 5)))
+
     @bot.command(name="face_review_list")
     @commands.is_owner()
     async def face_review_list_command(ctx: commands.Context, limit: int = 5) -> None:
@@ -559,7 +566,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
                 f"Review **{item['id']}** / 顔ID **{item['face_id']}** / 画像ID **{item['image_id']}**\n"
                 f"{item.get('group_name','')} {item.get('member_name','')} / 候補: {candidates or 'なし'}"
             )
-        lines.append("\n確認画像: `!face_crop 顔ID`\n確定: `!face_review_done 顔ID 人物名`")
+        lines.append("\nボタンレビュー: `!face_review`\n確認画像: `!face_crop 顔ID`\n手動確定: `!face_review_done 顔ID 人物名`")
         await ctx.send("\n\n".join(lines)[:1900])
 
     @bot.command(name="face_review_done")
@@ -595,8 +602,6 @@ def register_photo_commands(bot: commands.Bot) -> None:
             return
         await asyncio.to_thread(
             confirm_face_person,
-    complete_face_review,
-    get_pending_face_reviews,
             face_id,
             int(person["id"]),
             confirmed_by=str(ctx.author.id),
