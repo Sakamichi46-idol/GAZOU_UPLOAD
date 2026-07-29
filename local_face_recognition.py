@@ -28,7 +28,7 @@ MODEL_NAME = "opencv-haar-gray32-v1"
 EMBEDDING_SIZE = 32
 DEFAULT_MATCH_THRESHOLD = 0.72
 MIN_FACE_SIZE = 48
-MAX_BATCH_SCAN = 100
+MAX_BATCH_SCAN = 1000
 
 
 class FaceEngineUnavailable(RuntimeError):
@@ -340,7 +340,7 @@ def get_unscanned_face_images(limit: int = 20, group_name: str = "") -> list[dic
             LEFT JOIN photo_face_scans ON photo_face_scans.image_id = photo_images.id
             WHERE photo_images.download_status = 'completed'
               AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
-              AND (photo_face_scans.image_id IS NULL OR photo_face_scans.status != 'completed')
+              AND (photo_face_scans.image_id IS NULL OR photo_face_scans.status = 'processing')
               {group_sql}
             ORDER BY photo_images.id ASC
             LIMIT ?
@@ -351,7 +351,11 @@ def get_unscanned_face_images(limit: int = 20, group_name: str = "") -> list[dic
 
 
 def scan_faces_batch(limit: int = 20, group_name: str = "") -> dict[str, Any]:
-    """未スキャン画像を一括処理する。OpenAIは呼ばない。"""
+    """未スキャン画像を一括処理する。OpenAIは呼ばない。
+
+    失敗済み画像は同じ一括実行内で無限に再試行しないよう対象外にする。
+    個別の ``!face_scan 画像ID`` を実行すれば再試行できる。
+    """
     targets = get_unscanned_face_images(limit, group_name)
     scanned = detected = auto_confirmed = failed = 0
     errors: list[str] = []
