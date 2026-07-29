@@ -686,6 +686,15 @@ def init_photo_db() -> None:
             """
         )
 
+
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_photo_image_people_status_image
+            ON photo_image_people(relation_status, image_id)
+            """
+        )
+
         cursor.execute(
             """
             CREATE INDEX IF NOT EXISTS
@@ -2009,6 +2018,48 @@ def get_person_by_name(
             cursor.fetchone()
         )
 
+
+
+def get_frequent_confirmed_people(
+    group_name: str = "",
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """確認済み写真でよく使われる人物を、使用回数順で返す。
+
+    OpenAIは呼ばずSQLiteだけで集計するため、レビュー候補の表示に使っても
+    API料金は増えない。グループ指定時は同じグループの写真に絞る。
+    """
+    safe_limit = max(1, min(int(limit), 25))
+    group_name = str(group_name or "").strip()
+
+    where = "WHERE pip.relation_status = 'confirmed'"
+    params: list[Any] = []
+    if group_name:
+        where += " AND photo_blogs.group_name = ?"
+        params.append(group_name)
+    params.append(safe_limit)
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                pip.person_name,
+                COUNT(DISTINCT pip.image_id) AS confirmed_count
+            FROM photo_image_people AS pip
+            JOIN photo_images
+                ON photo_images.id = pip.image_id
+            JOIN photo_blogs
+                ON photo_blogs.id = photo_images.blog_id
+            {where}
+              AND pip.person_name NOT IN ('人物不明', '')
+            GROUP BY pip.person_name
+            ORDER BY confirmed_count DESC, pip.person_name ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
+    return rows_to_dicts(rows)
 
 def get_all_people(
     active_only: bool = True,
