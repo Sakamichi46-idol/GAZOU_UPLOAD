@@ -10,3 +10,5 @@ lxml
 openai
 python-dotenv
 requests
+numpy
+opencv-python-headless
