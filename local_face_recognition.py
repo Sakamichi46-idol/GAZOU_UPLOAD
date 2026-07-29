@@ -122,12 +122,48 @@ def _confirmed_image_people(image_id: int) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
 
 
+def _save_face_scan_status(
+    image_id: int,
+    status: str,
+    *,
+    detected_faces: int = 0,
+    auto_confirmed_faces: int = 0,
+    error_message: str = "",
+) -> None:
+    """画像単位の顔スキャン履歴を保存する。顔が0件でも完了を記録する。"""
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            INSERT INTO photo_face_scans (
+                image_id, status, detected_faces, auto_confirmed_faces,
+                model_name, error_message, scanned_at, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), datetime('now'))
+            ON CONFLICT(image_id) DO UPDATE SET
+                status = excluded.status,
+                detected_faces = excluded.detected_faces,
+                auto_confirmed_faces = excluded.auto_confirmed_faces,
+                model_name = excluded.model_name,
+                error_message = excluded.error_message,
+                scanned_at = excluded.scanned_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(image_id), str(status), int(detected_faces),
+                int(auto_confirmed_faces), MODEL_NAME, str(error_message)[:1000],
+            ),
+        )
+        connection.commit()
+
+
 def detect_faces_for_image(image_id: int) -> dict[str, Any]:
     """Detect faces and save compact local embeddings. Runs only on command."""
     cv2, np = _load_dependencies()
     image = get_photo_image(int(image_id))
     if not image:
         raise ValueError("画像IDが見つかりません。")
+
+    _save_face_scan_status(int(image_id), "processing")
 
     cascade_path = str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
     detector = cv2.CascadeClassifier(cascade_path)
@@ -183,6 +219,13 @@ def detect_faces_for_image(image_id: int) -> dict[str, Any]:
     else:
         for face_id in face_ids:
             add_face_review(face_id, "この顔の人物を確認してください。", [])
+
+    _save_face_scan_status(
+        int(image_id),
+        "completed",
+        detected_faces=len(face_ids),
+        auto_confirmed_faces=auto_confirmed,
+    )
 
     return {
         "image_id": int(image_id),
@@ -279,7 +322,7 @@ def get_face_summary(image_id: int) -> list[dict[str, Any]]:
 
 
 def get_unscanned_face_images(limit: int = 20, group_name: str = "") -> list[dict[str, Any]]:
-    """顔データがまだない、ダウンロード済み画像を古い順に取得する。"""
+    """顔スキャンが完了していないダウンロード済み画像を古い順に取得する。"""
     limit = max(1, min(int(limit), MAX_BATCH_SCAN))
     params: list[Any] = []
     group_sql = ""
@@ -294,10 +337,10 @@ def get_unscanned_face_images(limit: int = 20, group_name: str = "") -> list[dic
                    photo_blogs.title
             FROM photo_images
             JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
-            LEFT JOIN photo_faces ON photo_faces.image_id = photo_images.id
+            LEFT JOIN photo_face_scans ON photo_face_scans.image_id = photo_images.id
             WHERE photo_images.download_status = 'completed'
               AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
-              AND photo_faces.id IS NULL
+              AND (photo_face_scans.image_id IS NULL OR photo_face_scans.status != 'completed')
               {group_sql}
             ORDER BY photo_images.id ASC
             LIMIT ?
@@ -320,6 +363,14 @@ def scan_faces_batch(limit: int = 20, group_name: str = "") -> dict[str, Any]:
             auto_confirmed += int(result["auto_confirmed"])
         except Exception as error:
             failed += 1
+            try:
+                _save_face_scan_status(
+                    int(target["id"]),
+                    "failed",
+                    error_message=f"{type(error).__name__}: {error}",
+                )
+            except Exception:
+                pass
             if len(errors) < 5:
                 errors.append(f"画像ID {target['id']}: {type(error).__name__}: {error}")
     return {
