@@ -49,6 +49,7 @@ from photo_review_view import (
 from photo_tag_explorer import send_photo_tag_explorer
 from local_face_recognition import (
     FaceEngineUnavailable,
+    MAX_BATCH_SCAN,
     detect_faces_for_image,
     get_face_engine_status,
     get_face_summary,
@@ -128,6 +129,10 @@ async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict
 
 
 def register_photo_commands(bot: commands.Bot) -> None:
+    # 顔一括処理は同時に1本だけ実行する。
+    # Railway上で重複実行するとCPU・メモリ・Bucket通信が競合するため。
+    face_scan_lock = asyncio.Lock()
+    face_scan_stop_event = asyncio.Event()
 
     @bot.command(name="photo_tags", aliases=["tag_search", "photo_explorer"])
     async def photo_tags_command(ctx: commands.Context) -> None:
@@ -397,39 +402,134 @@ def register_photo_commands(bot: commands.Bot) -> None:
             )
         await ctx.send("\n".join(lines)[:1900])
 
+    async def _run_face_scan_job(
+        ctx: commands.Context,
+        *,
+        requested_limit: int | None,
+        group_name: str,
+    ) -> None:
+        """顔一括処理を100枚ずつ進め、同じメッセージへ進捗を表示する。"""
+        if face_scan_lock.locked():
+            await ctx.send(
+                "⚠️ 別の顔一括検出が実行中です。停止する場合は `!face_scan_stop` を使ってください。"
+            )
+            return
+
+        group_name = group_name.strip()
+        is_all = requested_limit is None
+        target_limit = None if is_all else max(1, min(int(requested_limit), MAX_BATCH_SCAN))
+        label = f" / {group_name}" if group_name else ""
+        mode_text = "未スキャン画像をすべて" if is_all else f"最大{target_limit:,}枚"
+
+        async with face_scan_lock:
+            face_scan_stop_event.clear()
+            progress_message = await ctx.send(
+                f"🔍 顔一括検出を開始します: **{mode_text}{label}**\n"
+                "100枚ずつ処理し、進捗をこのメッセージへ更新します。\n"
+                "OpenAI APIは使用しません。"
+            )
+
+            total_targets = 0
+            total_scanned = 0
+            total_detected = 0
+            total_auto_confirmed = 0
+            total_failed = 0
+            errors: list[str] = []
+
+            while True:
+                if face_scan_stop_event.is_set():
+                    break
+                remaining = None if target_limit is None else target_limit - total_targets
+                if remaining is not None and remaining <= 0:
+                    break
+
+                chunk_size = 100 if remaining is None else min(100, remaining)
+                result = await asyncio.to_thread(scan_faces_batch, chunk_size, group_name)
+                chunk_targets = int(result.get("targets") or 0)
+                if chunk_targets == 0:
+                    break
+
+                total_targets += chunk_targets
+                total_scanned += int(result.get("scanned") or 0)
+                total_detected += int(result.get("detected") or 0)
+                total_auto_confirmed += int(result.get("auto_confirmed") or 0)
+                total_failed += int(result.get("failed") or 0)
+                for item in result.get("errors") or []:
+                    if len(errors) < 5:
+                        errors.append(str(item))
+
+                target_text = "すべて" if target_limit is None else f"{target_limit:,}枚"
+                try:
+                    await progress_message.edit(
+                        content=(
+                            "🔍 **顔一括検出を実行中**\n"
+                            f"指定: **{target_text}{label}**\n"
+                            f"取得済み対象: **{total_targets:,}枚**\n"
+                            f"処理成功: **{total_scanned:,}枚** / 失敗: **{total_failed:,}枚**\n"
+                            f"検出した顔: **{total_detected:,}件**\n"
+                            f"安全条件で参照登録: **{total_auto_confirmed:,}件**\n"
+                            "停止: `!face_scan_stop`"
+                        )
+                    )
+                except discord.HTTPException:
+                    pass
+
+                # Discord APIとRailwayの負荷をわずかに緩和する。
+                await asyncio.sleep(0.25)
+
+            stopped = face_scan_stop_event.is_set()
+            title = "⏹️ **顔一括検出を停止しました**" if stopped else "✅ **顔一括検出完了**"
+            lines = [
+                title,
+                f"対象: **{total_targets:,}枚**",
+                f"処理成功: **{total_scanned:,}枚**",
+                f"検出した顔: **{total_detected:,}件**",
+                f"安全条件で参照登録: **{total_auto_confirmed:,}件**",
+                f"失敗: **{total_failed:,}枚**",
+            ]
+            if is_all and not stopped and total_targets == 0:
+                lines.append("未スキャン画像はありませんでした。")
+            if errors:
+                lines.append("\n**先頭のエラー**")
+                lines.extend(f"・{item}" for item in errors)
+            lines.append("\n続きは未スキャン画像から再開されます。OpenAI APIは使用していません。")
+            await progress_message.edit(content="\n".join(lines)[:1900])
+            face_scan_stop_event.clear()
+
     @bot.command(name="face_scan_batch")
     @commands.is_owner()
     async def face_scan_batch_command(
         ctx: commands.Context,
-        limit: int = 20,
+        limit: int = 100,
         *,
         group_name: str = "",
     ) -> None:
-        """未スキャン画像をローカルで一括顔検出する。最大100件。"""
-        limit = max(1, min(int(limit), 100))
-        group_name = group_name.strip()
-        label = f" / {group_name}" if group_name else ""
-        await ctx.send(f"🔍 顔一括検出を開始します: **最大{limit}枚{label}**\nOpenAI APIは使用しません。")
-        try:
-            result = await asyncio.to_thread(scan_faces_batch, limit, group_name)
-        except FaceEngineUnavailable as error:
-            await ctx.send(f"⚠️ {error}")
+        """未スキャン画像を最大1000枚、100枚ずつローカル顔検出する。"""
+        await _run_face_scan_job(
+            ctx,
+            requested_limit=max(1, min(int(limit), MAX_BATCH_SCAN)),
+            group_name=group_name,
+        )
+
+    @bot.command(name="face_scan_all")
+    @commands.is_owner()
+    async def face_scan_all_command(
+        ctx: commands.Context,
+        *,
+        group_name: str = "",
+    ) -> None:
+        """未スキャン画像がなくなるまで100枚ずつ処理する。"""
+        await _run_face_scan_job(ctx, requested_limit=None, group_name=group_name)
+
+    @bot.command(name="face_scan_stop")
+    @commands.is_owner()
+    async def face_scan_stop_command(ctx: commands.Context) -> None:
+        """実行中の顔一括検出を、現在の100枚単位の処理後に停止する。"""
+        if not face_scan_lock.locked():
+            await ctx.send("ℹ️ 実行中の顔一括検出はありません。")
             return
-        except Exception as error:
-            await ctx.send(f"❌ 一括顔検出に失敗しました: `{type(error).__name__}: {error}`")
-            return
-        lines = [
-            "✅ **顔一括検出完了**",
-            f"対象: **{result['targets']}枚**",
-            f"処理成功: **{result['scanned']}枚**",
-            f"検出した顔: **{result['detected']}件**",
-            f"安全条件で参照登録: **{result['auto_confirmed']}件**",
-            f"失敗: **{result['failed']}枚**",
-        ]
-        if result.get("errors"):
-            lines.append("\n**先頭のエラー**")
-            lines.extend(f"・{item}" for item in result["errors"])
-        await ctx.send("\n".join(lines)[:1900])
+        face_scan_stop_event.set()
+        await ctx.send("⏹️ 停止を受け付けました。現在処理中のまとまりが終わり次第停止します。")
 
     @bot.command(name="face_crop")
     @commands.is_owner()
