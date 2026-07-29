@@ -30,7 +30,13 @@ from photo_database import (
     save_manual_tag,
 )
 from photo_image_downloader import download_photo_image
-from photo_search import send_photo_search_results, send_photo_author_search_results
+from photo_search import (
+    send_photo_author_search_results,
+    send_photo_blog_search_results,
+    send_photo_person_search_results,
+    send_photo_search_results,
+    send_photo_tag_search_results,
+)
 from photo_review_view import (
     send_next_person_review,
     send_person_review,
@@ -123,13 +129,27 @@ def register_photo_commands(bot: commands.Bot) -> None:
         """ボタンと選択メニューで写真タグを絞り込む。"""
         await send_photo_tag_explorer(ctx)
 
-    @bot.command(name="photo_search")
-    
+    @bot.command(name="photo_search", aliases=["search"])
     async def photo_search_command(ctx: commands.Context, *, query: str = "") -> None:
+        """人物・タグ・ブログ情報・AI解析を横断検索する。"""
         await send_photo_search_results(ctx, query)
 
+    @bot.command(name="person")
+    async def photo_person_search_command(ctx: commands.Context, *, person_name: str = "") -> None:
+        """確認済み人物だけを対象に写真を検索する。"""
+        await send_photo_person_search_results(ctx, person_name)
+
+    @bot.command(name="tag")
+    async def photo_tag_search_command(ctx: commands.Context, *, tag: str = "") -> None:
+        """AIタグと手動タグを横断検索する。"""
+        await send_photo_tag_search_results(ctx, tag)
+
+    @bot.command(name="blog")
+    async def photo_blog_search_command(ctx: commands.Context, *, query: str = "") -> None:
+        """ブログ投稿者・タイトル・グループを検索する。"""
+        await send_photo_blog_search_results(ctx, query)
+
     @bot.command(name="photo_search_author")
-    
     async def photo_search_author_command(ctx: commands.Context, *, author_name: str = "") -> None:
         await send_photo_author_search_results(ctx, author_name)
 
