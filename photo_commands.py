@@ -558,6 +558,36 @@ def register_photo_commands(bot: commands.Bot) -> None:
         """人物確認待ちを複数件表示する（最大10件）。"""
         await send_person_review_batch(ctx, limit=max(1, min(int(limit), 10)))
 
+    @bot.command(name="review_list_ng")
+    @commands.is_owner()
+    async def review_list_ng_command(ctx: commands.Context, limit: int = 5) -> None:
+        """乃木坂46の人物確認待ちだけを複数件表示する（最大10件）。"""
+        await send_person_review_batch(
+            ctx,
+            limit=max(1, min(int(limit), 10)),
+            group_name="乃木坂46",
+        )
+
+    @bot.command(name="review_list_skr")
+    @commands.is_owner()
+    async def review_list_skr_command(ctx: commands.Context, limit: int = 5) -> None:
+        """櫻坂46の人物確認待ちだけを複数件表示する（最大10件）。"""
+        await send_person_review_batch(
+            ctx,
+            limit=max(1, min(int(limit), 10)),
+            group_name="櫻坂46",
+        )
+
+    @bot.command(name="review_list_hnt")
+    @commands.is_owner()
+    async def review_list_hnt_command(ctx: commands.Context, limit: int = 5) -> None:
+        """日向坂46の人物確認待ちだけを複数件表示する（最大10件）。"""
+        await send_person_review_batch(
+            ctx,
+            limit=max(1, min(int(limit), 10)),
+            group_name="日向坂46",
+        )
+
     @bot.command(name="review_skipped")
     @commands.is_owner()
     async def review_skipped_command(ctx: commands.Context, limit: int = 5) -> None:
