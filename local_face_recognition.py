@@ -6,8 +6,6 @@ continues to run without the optional face-recognition dependencies.
 from __future__ import annotations
 
 import base64
-import math
-import os
 import tempfile
 import zlib
 from contextlib import closing, contextmanager
@@ -28,7 +26,9 @@ from photo_database import (
 
 MODEL_NAME = "opencv-haar-gray32-v1"
 EMBEDDING_SIZE = 32
-DEFAULT_MATCH_THRESHOLD = 0.86
+DEFAULT_MATCH_THRESHOLD = 0.72
+MIN_FACE_SIZE = 48
+MAX_BATCH_SCAN = 100
 
 
 class FaceEngineUnavailable(RuntimeError):
@@ -141,7 +141,7 @@ def detect_faces_for_image(image_id: int) -> dict[str, Any]:
 
     gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
     height, width = gray.shape[:2]
-    min_side = max(32, min(width, height) // 12)
+    min_side = max(MIN_FACE_SIZE, min(width, height) // 12)
     boxes = detector.detectMultiScale(
         gray,
         scaleFactor=1.1,
@@ -149,6 +149,13 @@ def detect_faces_for_image(image_id: int) -> dict[str, Any]:
         minSize=(min_side, min_side),
     )
     boxes = sorted(boxes, key=lambda box: (int(box[1]), int(box[0])))
+
+    # 再スキャン時に古い検出結果が残らないよう、画像単位で作り直す。
+    # photo_face_candidates / photo_face_reviews は外部キーのCASCADEで削除される。
+    with closing(get_connection()) as connection:
+        connection.execute("DELETE FROM photo_faces WHERE image_id = ?", (int(image_id),))
+        connection.commit()
+
     face_ids: list[int] = []
     for index, (x, y, w, h) in enumerate(boxes, 1):
         crop = gray[int(y):int(y+h), int(x):int(x+w)]
@@ -236,13 +243,18 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
             except Exception:
                 continue
             similarity = float(np.dot(target, vector))
+            # 正規化済みベクトルのコサイン類似度を0〜1へ丸める。
+            # (similarity + 1) / 2 は無関係な顔まで50%前後に見せるため使わない。
+            confidence = max(0.0, min(similarity, 1.0))
+            if confidence < DEFAULT_MATCH_THRESHOLD:
+                continue
             person_id = int(reference["person_id"])
             current = best_by_person.get(person_id)
-            if current is None or similarity > float(current["confidence"]):
+            if current is None or confidence > float(current["confidence"]):
                 best_by_person[person_id] = {
                     "person_id": person_id,
                     "person_name": str(reference["person_name"]),
-                    "confidence": max(0.0, min((similarity + 1.0) / 2.0, 1.0)),
+                    "confidence": confidence,
                 }
         candidates = sorted(best_by_person.values(), key=lambda item: item["confidence"], reverse=True)[:max(1, min(limit_per_face, 10))]
         for rank, candidate in enumerate(candidates, 1):
@@ -263,3 +275,89 @@ def get_face_summary(image_id: int) -> list[dict[str, Any]]:
         item["candidates"] = get_face_candidates(int(face["id"]))[:5]
         result.append(item)
     return result
+
+
+
+def get_unscanned_face_images(limit: int = 20, group_name: str = "") -> list[dict[str, Any]]:
+    """顔データがまだない、ダウンロード済み画像を古い順に取得する。"""
+    limit = max(1, min(int(limit), MAX_BATCH_SCAN))
+    params: list[Any] = []
+    group_sql = ""
+    if group_name.strip():
+        group_sql = " AND photo_blogs.group_name = ?"
+        params.append(group_name.strip())
+    params.append(limit)
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT photo_images.id, photo_blogs.group_name, photo_blogs.member_name,
+                   photo_blogs.title
+            FROM photo_images
+            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            LEFT JOIN photo_faces ON photo_faces.image_id = photo_images.id
+            WHERE photo_images.download_status = 'completed'
+              AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
+              AND photo_faces.id IS NULL
+              {group_sql}
+            ORDER BY photo_images.id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+def scan_faces_batch(limit: int = 20, group_name: str = "") -> dict[str, Any]:
+    """未スキャン画像を一括処理する。OpenAIは呼ばない。"""
+    targets = get_unscanned_face_images(limit, group_name)
+    scanned = detected = auto_confirmed = failed = 0
+    errors: list[str] = []
+    for target in targets:
+        try:
+            result = detect_faces_for_image(int(target["id"]))
+            scanned += 1
+            detected += int(result["detected"])
+            auto_confirmed += int(result["auto_confirmed"])
+        except Exception as error:
+            failed += 1
+            if len(errors) < 5:
+                errors.append(f"画像ID {target['id']}: {type(error).__name__}: {error}")
+    return {
+        "targets": len(targets), "scanned": scanned, "detected": detected,
+        "auto_confirmed": auto_confirmed, "failed": failed, "errors": errors,
+    }
+
+
+def get_face_crop_bytes(face_id: int, padding_ratio: float = 0.18) -> tuple[bytes, str]:
+    """レビュー用に顔周辺をJPEGで切り出す。永続保存はしない。"""
+    cv2, _ = _load_dependencies()
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT photo_faces.*, photo_images.local_path, photo_images.bucket_key,
+                   photo_images.file_name
+            FROM photo_faces
+            JOIN photo_images ON photo_images.id = photo_faces.image_id
+            WHERE photo_faces.id = ?
+            """, (int(face_id),),
+        ).fetchone()
+    if not row:
+        raise ValueError("顔IDが見つかりません。")
+    face = dict(row)
+    with _local_image_path(face) as path:
+        source = cv2.imread(path)
+    if source is None:
+        raise RuntimeError("画像をOpenCVで読み込めませんでした。")
+    height, width = source.shape[:2]
+    x, y = int(face["box_x"]), int(face["box_y"])
+    w, h = int(face["box_width"]), int(face["box_height"])
+    pad = int(max(w, h) * max(0.0, min(float(padding_ratio), 0.5)))
+    x1, y1 = max(0, x-pad), max(0, y-pad)
+    x2, y2 = min(width, x+w+pad), min(height, y+h+pad)
+    crop = source[y1:y2, x1:x2]
+    if crop.size == 0:
+        raise RuntimeError("顔の切り出し範囲が不正です。")
+    ok, encoded = cv2.imencode('.jpg', crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError("顔画像をJPEGへ変換できませんでした。")
+    return encoded.tobytes(), f"face_{int(face_id)}.jpg"
