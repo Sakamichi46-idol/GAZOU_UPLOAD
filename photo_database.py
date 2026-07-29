@@ -3050,6 +3050,7 @@ def search_photo_images(
             """
             (
                 photo_blogs.group_name LIKE ?
+                OR photo_blogs.member_name LIKE ?
                 OR photo_blogs.title LIKE ?
                 OR EXISTS (
                     SELECT 1 FROM photo_image_people pip
@@ -3080,7 +3081,7 @@ def search_photo_images(
         )
 
         parameters.extend(
-            [like_value] * 11
+            [like_value] * 12
         )
 
     where_clause = " AND ".join(
@@ -3180,6 +3181,150 @@ def search_photo_images(
         return rows_to_dicts(
             cursor.fetchall()
         )
+
+
+# =========================
+# Phase 5: 専用検索
+# =========================
+
+def _search_photo_images_with_where(
+    where_sql: str,
+    parameters: tuple[Any, ...],
+    *,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """信頼済みのWHERE句を使って写真検索結果を取得する内部関数。"""
+
+    safe_limit = max(1, min(int(limit), 50))
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT
+                photo_images.*,
+                photo_blogs.blog_url,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = photo_images.id
+                      AND pip.relation_status = 'confirmed'
+                ), '') AS confirmed_people,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = photo_images.id
+                      AND pip.relation_status = 'candidate'
+                ), '') AS candidate_people,
+                COALESCE(photo_ai_analysis.person_name, '') AS ai_person_name,
+                COALESCE(photo_ai_analysis.clothing, '') AS clothing,
+                COALESCE(photo_ai_analysis.expression, '') AS expression,
+                COALESCE(photo_ai_analysis.background, '') AS background,
+                COALESCE(photo_ai_analysis.pose, '') AS pose,
+                COALESCE(photo_ai_analysis.objects, '') AS objects,
+                COALESCE((
+                    SELECT GROUP_CONCAT(tag, '、')
+                    FROM (
+                        SELECT tag
+                        FROM photo_ai_tags
+                        WHERE photo_ai_tags.image_id = photo_images.id
+                        ORDER BY confidence DESC, id ASC
+                        LIMIT 12
+                    )
+                ), '') AS ai_tags,
+                COALESCE((
+                    SELECT GROUP_CONCAT(tag, '、')
+                    FROM (
+                        SELECT tag
+                        FROM photo_manual_tags
+                        WHERE photo_manual_tags.image_id = photo_images.id
+                        ORDER BY id ASC
+                        LIMIT 12
+                    )
+                ), '') AS manual_tags
+            FROM photo_images
+            INNER JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            LEFT JOIN photo_ai_analysis ON photo_ai_analysis.image_id = photo_images.id
+            WHERE photo_images.download_status = 'completed'
+              AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
+              AND ({where_sql})
+            ORDER BY photo_blogs.published_at DESC, photo_images.image_index ASC, photo_images.id DESC
+            LIMIT ?
+            """,
+            (*parameters, safe_limit),
+        ).fetchall()
+
+    return rows_to_dicts(rows)
+
+
+def search_photo_images_by_person(person_name: str, limit: int = 20) -> list[dict[str, Any]]:
+    """確認済み人物を対象に検索する。"""
+
+    clean_name = str(person_name or '').strip()
+    if not clean_name:
+        return []
+
+    return _search_photo_images_with_where(
+        """
+        EXISTS (
+            SELECT 1
+            FROM photo_image_people pip
+            WHERE pip.image_id = photo_images.id
+              AND pip.relation_status = 'confirmed'
+              AND pip.person_name LIKE ?
+        )
+        """,
+        (f'%{clean_name}%',),
+        limit=limit,
+    )
+
+
+def search_photo_images_by_tag(tag: str, limit: int = 20) -> list[dict[str, Any]]:
+    """AIタグと手動タグを横断して検索する。"""
+
+    clean_tag = str(tag or '').strip()
+    if not clean_tag:
+        return []
+
+    like_value = f'%{clean_tag}%'
+    return _search_photo_images_with_where(
+        """
+        EXISTS (
+            SELECT 1 FROM photo_ai_tags
+            WHERE photo_ai_tags.image_id = photo_images.id
+              AND photo_ai_tags.tag LIKE ?
+        )
+        OR EXISTS (
+            SELECT 1 FROM photo_manual_tags
+            WHERE photo_manual_tags.image_id = photo_images.id
+              AND photo_manual_tags.tag LIKE ?
+        )
+        """,
+        (like_value, like_value),
+        limit=limit,
+    )
+
+
+def search_photo_images_by_blog(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    """ブログ投稿者・タイトル・グループを対象に検索する。"""
+
+    clean_query = str(query or '').strip()
+    if not clean_query:
+        return []
+
+    like_value = f'%{clean_query}%'
+    return _search_photo_images_with_where(
+        """
+        photo_blogs.member_name LIKE ?
+        OR photo_blogs.title LIKE ?
+        OR photo_blogs.group_name LIKE ?
+        """,
+        (like_value, like_value, like_value),
+        limit=limit,
+    )
 
 
 # =========================
