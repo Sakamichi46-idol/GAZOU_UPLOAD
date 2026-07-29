@@ -16,6 +16,8 @@ from photo_database import (
     get_ai_cost_summary,
     get_all_people,
     get_image_people,
+    get_person_by_name,
+    confirm_face_person,
     set_confirmed_image_people,
     get_connection,
     get_photo_db_counts,
@@ -36,6 +38,13 @@ from photo_review_view import (
     send_skipped_person_review_batch,
 )
 from photo_tag_explorer import send_photo_tag_explorer
+from local_face_recognition import (
+    FaceEngineUnavailable,
+    detect_faces_for_image,
+    get_face_engine_status,
+    get_face_summary,
+    suggest_face_candidates,
+)
 
 
 def _now() -> str:
@@ -246,6 +255,109 @@ def register_photo_commands(bot: commands.Bot) -> None:
         else:
             await ctx.send("⚠️ 指定されたタグは見つかりませんでした。")
 
+
+    @bot.command(name="face_status")
+    @commands.is_owner()
+    async def face_status_command(ctx: commands.Context) -> None:
+        status = await asyncio.to_thread(get_face_engine_status)
+        if not status.get("available"):
+            await ctx.send(
+                "🧩 **ローカル顔認識: 未導入**\n"
+                f"{status.get('error', 'OpenCVを利用できません。')}\n"
+                "`requirements-face.txt` の依存関係を `requirements.txt` に追加すると有効化できます。"
+            )
+            return
+        await ctx.send(
+            "✅ **ローカル顔認識: 利用可能**\n"
+            f"モデル: `{status.get('model_name')}`\n"
+            f"OpenCV: `{status.get('opencv_version')}`\n"
+            f"NumPy: `{status.get('numpy_version')}`\n"
+            "OpenAI APIは使用しません。処理はコマンド実行時だけです。"
+        )
+
+    @bot.command(name="face_scan")
+    @commands.is_owner()
+    async def face_scan_command(ctx: commands.Context, image_id: int) -> None:
+        await ctx.send(f"🔍 画像ID **{image_id}** をローカル顔検出しています…")
+        try:
+            result = await asyncio.to_thread(detect_faces_for_image, image_id)
+        except FaceEngineUnavailable as error:
+            await ctx.send(f"⚠️ {error}")
+            return
+        except Exception as error:
+            await ctx.send(f"❌ 顔検出に失敗しました: `{type(error).__name__}: {error}`")
+            return
+        await ctx.send(
+            f"✅ 顔検出完了: **{result['detected']}件**\n"
+            f"顔ID: **{', '.join(map(str, result['face_ids'])) or 'なし'}**\n"
+            f"安全条件で自動参照登録: **{result['auto_confirmed']}件**"
+        )
+
+    @bot.command(name="face_suggest")
+    @commands.is_owner()
+    async def face_suggest_command(ctx: commands.Context, image_id: int) -> None:
+        try:
+            results = await asyncio.to_thread(suggest_face_candidates, image_id, 5)
+        except FaceEngineUnavailable as error:
+            await ctx.send(f"⚠️ {error}")
+            return
+        except Exception as error:
+            await ctx.send(f"❌ 候補照合に失敗しました: `{type(error).__name__}: {error}`")
+            return
+        if not results:
+            await ctx.send("⚠️ 照合できる顔または確定済み参照顔がありません。")
+            return
+        lines = [f"🧠 **画像ID {image_id} のローカル顔候補**"]
+        for item in results:
+            candidates = item.get("candidates", [])
+            text = " / ".join(
+                f"{candidate['person_name']} {float(candidate['confidence'])*100:.1f}%"
+                for candidate in candidates
+            ) or "候補なし"
+            lines.append(f"顔ID **{item['face_id']}**: {text}")
+        lines.append("※ OpenAI APIは使用していません。候補は必ず人間が確認してください。")
+        await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="face_info")
+    @commands.is_owner()
+    async def face_info_command(ctx: commands.Context, image_id: int) -> None:
+        faces = await asyncio.to_thread(get_face_summary, image_id)
+        if not faces:
+            await ctx.send("⚠️ この画像には保存済みの顔情報がありません。")
+            return
+        lines = [f"👤 **画像ID {image_id} の顔情報**"]
+        for face in faces:
+            confirmed = face.get("confirmed_person_name") or "未確定"
+            candidates = face.get("candidates", [])
+            candidate_text = " / ".join(
+                f"{item.get('person_name')} {float(item.get('confidence') or 0)*100:.1f}%"
+                for item in candidates
+            ) or "なし"
+            lines.append(
+                f"顔ID **{face['id']}** / 番号 {face.get('face_index')} / "
+                f"確定: **{confirmed}** / 候補: {candidate_text}"
+            )
+        await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="face_confirm")
+    @commands.is_owner()
+    async def face_confirm_command(ctx: commands.Context, face_id: int, *, person_name: str = "") -> None:
+        person_name = person_name.strip()
+        if not person_name:
+            await ctx.send("使い方: `!face_confirm 顔ID 人物名`")
+            return
+        person = await asyncio.to_thread(get_person_by_name, person_name)
+        if not person:
+            await ctx.send("⚠️ 人物マスターにその名前がありません。")
+            return
+        await asyncio.to_thread(
+            confirm_face_person,
+            face_id,
+            int(person["id"]),
+            confirmed_by=str(ctx.author.id),
+            confirmation_status="manually_confirmed",
+        )
+        await ctx.send(f"✅ 顔ID **{face_id}** を **{person_name}** として確定しました。")
 
     @bot.command(name="ai_cost")
     @commands.is_owner()
