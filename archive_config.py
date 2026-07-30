@@ -4,11 +4,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 # =========================
-# 自動処理の稼働時間帯
+# ブログアーカイブの稼働時間帯
 # =========================
 
-# true の場合、ブログアーカイブ・写真アーカイブ・AI自動解析を
-# 指定時間帯だけ実行する。Bot本体と手動コマンドは常時利用できる。
+# true の場合、ブログアーカイブだけを指定時間帯に限定する。
+# 写真アーカイブ・AI自動解析・Bot本体・手動コマンドは24時間利用できる。
 def _env_flag(name: str, default: bool) -> bool:
     default_text = "true" if default else "false"
     return os.getenv(name, default_text).strip().lower() in {
@@ -54,7 +54,7 @@ def get_archive_local_now() -> datetime:
 
 
 def is_archive_active_time(now: datetime | None = None) -> bool:
-    """自動処理を実行してよい時間帯か判定する。
+    """ブログアーカイブを実行してよい時間帯か判定する。
 
     開始時刻と終了時刻が同じ場合は24時間稼働として扱う。
     例: 0〜5 は 00:00:00 以上 05:00:00 未満。
@@ -232,7 +232,7 @@ def print_archive_config():
     )
 
     print(
-        "ARCHIVE_ACTIVE_HOURS: "
+        "BLOG_ARCHIVE_ACTIVE_HOURS: "
         f"{archive_active_hours_text()}"
     )
 
