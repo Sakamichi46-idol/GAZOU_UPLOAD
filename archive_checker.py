@@ -20,16 +20,19 @@ from archive_parsers.utils import (
 from archive_parsers.nogizaka import (
     get_oldest_first as get_nogizaka,
     enrich_all_details as enrich_nogizaka_details,
+    get_unregistered_candidates as get_nogizaka_candidates,
 )
 
 from archive_parsers.sakurazaka import (
     get_oldest_first as get_sakurazaka,
     enrich_all_details as enrich_sakurazaka_details,
+    get_unregistered_candidates as get_sakurazaka_candidates,
 )
 
 from archive_parsers.hinatazaka import (
     get_oldest_first as get_hinatazaka,
     enrich_all_details as enrich_hinatazaka_details,
+    get_unregistered_candidates as get_hinatazaka_candidates,
 )
 
 
@@ -586,3 +589,102 @@ async def get_archive_targets():
     )
 
     return blogs
+
+
+# =========================
+# 写真アーカイブ向け差分巡回
+# =========================
+
+PHOTO_CANDIDATE_PARSERS = {
+    "乃木坂46": get_nogizaka_candidates,
+    "櫻坂46": get_sakurazaka_candidates,
+    "日向坂46": get_hinatazaka_candidates,
+}
+
+
+def _select_photo_candidate_parsers(group_filter: str):
+    """通常の対象グループ設定と写真側の指定を両方反映する。"""
+
+    selected = get_selected_parsers()
+    normalized = str(group_filter or "all").strip()
+
+    result = {}
+    for group in selected:
+        if normalized != "all" and group != normalized:
+            continue
+        parser = PHOTO_CANDIDATE_PARSERS.get(group)
+        if parser is not None:
+            result[group] = parser
+    return result
+
+
+async def get_photo_archive_candidates(
+    *,
+    known_urls: set[str],
+    target_count: int,
+    group_filter: str = "all",
+):
+    """
+    最新側から一覧を巡回し、DB未登録候補が必要数に達した時点で止める。
+
+    全記事一覧や全詳細ページを毎回取得しないため、
+    写真アーカイブの通信量と実行時間を抑えられる。
+    """
+
+    target_count = max(int(target_count), 1)
+    selected = _select_photo_candidate_parsers(group_filter)
+
+    if not selected:
+        print("写真差分巡回の対象グループがありません。")
+        return []
+
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=30,
+        sock_read=60,
+    )
+    connector = aiohttp.TCPConnector(
+        limit=12,
+        limit_per_host=4,
+        ttl_dns_cache=300,
+    )
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        tasks = [
+            parser(session, known_urls, target_count)
+            for parser in selected.values()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    candidates = []
+    for group, result in zip(selected.keys(), results):
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, Exception):
+            print(f"[{group}] 写真差分巡回エラー:", result)
+            traceback.print_exception(type(result), result, result.__traceback__)
+            continue
+        for blog in result:
+            if isinstance(blog, dict):
+                blog.setdefault("group", group)
+                candidates.append(blog)
+
+    # 各グループから集めた候補を日付の新しい順で統合する。
+    candidates.sort(key=blog_datetime_key, reverse=True)
+
+    unique = []
+    seen = set()
+    for blog in candidates:
+        url = str(blog.get("url", "")).strip()
+        if not url or url in seen or url in known_urls:
+            continue
+        seen.add(url)
+        unique.append(blog)
+        if len(unique) >= target_count:
+            break
+
+    print(
+        "写真差分巡回結果:",
+        f"候補{len(unique)}件 / 登録済みURL{len(known_urls)}件",
+    )
+    return unique
