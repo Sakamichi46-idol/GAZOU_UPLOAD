@@ -56,6 +56,7 @@ from low_egress_media import (
 from photo_archive_runner import (
     is_photo_archive_running,
     request_photo_archive_stop,
+    repair_zero_image_photo_blogs,
     run_photo_archive_once,
 )
 from photo_commands import register_photo_commands
@@ -1816,6 +1817,46 @@ async def photo_archive_run_command(
         f"画像保存: **{result.get('downloaded', 0)}件**\n"
         f"AI解析完了: **{result.get('analyzed', 0)}件**\n"
         f"AI確認待ち: **{result.get('analysis_review', 0)}件**"
+    )
+
+
+@bot.command(
+    name="photo_archive_repair_zero"
+)
+@commands.is_owner()
+async def photo_archive_repair_zero_command(
+    ctx: commands.Context,
+    limit: int = 100,
+    group: str | None = None,
+) -> None:
+    """画像0件で登録済みの記事を再判定して修復する。"""
+
+    if is_photo_archive_running():
+        await ctx.send("⚠️ 写真アーカイブは現在処理中です。")
+        return
+
+    selected_limit = max(1, min(int(limit), 1000))
+    await ctx.send(
+        "🛠️ 画像0件で登録済みの記事を再判定します。\n"
+        f"上限: **{selected_limit}件** / "
+        f"グループ: **{group or 'all'}**"
+    )
+
+    result = await repair_zero_image_photo_blogs(
+        limit=selected_limit,
+        group=group,
+    )
+
+    await ctx.send(
+        "✅ **画像0件記事の再判定結果**\n"
+        f"状態: **{result.get('status', '不明')}**\n"
+        f"対象: **{result.get('targets', 0)}件**\n"
+        f"処理: **{result.get('processed', 0)}件**\n"
+        f"修復: **{result.get('repaired', 0)}件**\n"
+        f"再判定後も画像なし: **{result.get('still_no_images', 0)}件**\n"
+        f"失敗: **{result.get('failed', 0)}件**\n"
+        f"画像保存: **{result.get('downloaded', 0)}件**\n"
+        f"AI解析完了: **{result.get('analyzed', 0)}件**"
     )
 
 
