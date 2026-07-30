@@ -10,6 +10,7 @@ from photo_ai_analyzer import analyze_photo_image, get_photo_ai_status
 from photo_database import (
     get_photo_blog_by_url,
     get_registered_photo_blog_urls,
+    get_zero_image_photo_blogs,
     add_image_person_candidate,
     init_photo_db,
     save_photo_blog,
@@ -538,6 +539,136 @@ async def run_photo_archive_once(
 
         finally:
             print("写真アーカイブ巡回結果:", summary)
+            print("=" * 60)
+
+        return summary
+
+
+# =========================
+# 画像0件記事の再判定
+# =========================
+
+
+async def repair_zero_image_photo_blogs(
+    *,
+    limit: int = 100,
+    group: str | None = None,
+    analyze_images: bool | None = None,
+) -> dict[str, Any]:
+    """
+    登録済みだが画像が1件もない記事を再取得して修復する。
+
+    通常巡回は登録済みURLを除外するため、過去に画像0件として
+    保存された記事はこの処理で明示的に再判定する。
+    """
+
+    if is_photo_archive_running():
+        return {
+            "status": "already_running",
+            "message": "写真アーカイブは既に実行中です。",
+            "targets": 0,
+            "processed": 0,
+        }
+
+    async with _photo_archive_lock:
+        clear_photo_archive_stop_request()
+
+        selected_limit = max(1, min(safe_int(limit, 100), 1000))
+        selected_group = normalize_group_filter(group or "all")
+        selected_ai = (
+            analyze_images
+            if analyze_images is not None
+            else PHOTO_ARCHIVE_AI_ANALYZE
+        )
+
+        summary: dict[str, Any] = {
+            "status": "running",
+            "group": selected_group,
+            "limit": selected_limit,
+            "targets": 0,
+            "processed": 0,
+            "repaired": 0,
+            "still_no_images": 0,
+            "failed": 0,
+            "downloaded": 0,
+            "download_failed": 0,
+            "analyzed": 0,
+            "analysis_review": 0,
+            "analysis_failed": 0,
+            "stopped": False,
+            "results": [],
+        }
+
+        try:
+            await asyncio.to_thread(init_photo_db)
+            targets = await asyncio.to_thread(
+                get_zero_image_photo_blogs,
+                selected_limit,
+                selected_group,
+            )
+            summary["targets"] = len(targets)
+
+            print("=" * 60)
+            print("画像0件記事の再判定を開始します。")
+            print("対象グループ:", selected_group)
+            print("再判定対象:", len(targets), "件")
+            print("=" * 60)
+
+            if not targets:
+                summary["status"] = "completed"
+                return summary
+
+            timeout = aiohttp.ClientTimeout(total=PHOTO_ARCHIVE_REQUEST_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for index, blog in enumerate(targets, start=1):
+                    if _photo_archive_stop_requested:
+                        summary["stopped"] = True
+                        summary["status"] = "stopped"
+                        break
+
+                    print(
+                        f"画像0件再判定 {index}/{len(targets)}:",
+                        blog.get("group", ""),
+                        blog.get("member", ""),
+                        blog.get("url", ""),
+                    )
+
+                    result = await process_photo_blog(
+                        session,
+                        blog,
+                        analyze_images=bool(selected_ai),
+                    )
+                    summary["results"].append(result)
+                    summary["processed"] += 1
+                    summary["downloaded"] += safe_int(result.get("downloaded", 0))
+                    summary["download_failed"] += safe_int(result.get("download_failed", 0))
+                    summary["analyzed"] += safe_int(result.get("analyzed", 0))
+                    summary["analysis_review"] += safe_int(result.get("analysis_review", 0))
+                    summary["analysis_failed"] += safe_int(result.get("analysis_failed", 0))
+
+                    status = str(result.get("status", ""))
+                    if status == "completed" and safe_int(result.get("registered", 0)) > 0:
+                        summary["repaired"] += 1
+                    elif status == "no_images":
+                        summary["still_no_images"] += 1
+                    else:
+                        summary["failed"] += 1
+
+                    if PHOTO_ARCHIVE_BLOG_DELAY > 0:
+                        await asyncio.sleep(PHOTO_ARCHIVE_BLOG_DELAY)
+
+            if summary["status"] == "running":
+                summary["status"] = "completed"
+
+        except asyncio.CancelledError:
+            summary["status"] = "cancelled"
+            raise
+        except Exception as error:
+            summary["status"] = "failed"
+            summary["error"] = f"{type(error).__name__}: {error}"
+            print("画像0件記事の再判定エラー:", summary["error"])
+        finally:
+            print("画像0件記事の再判定結果:", summary)
             print("=" * 60)
 
         return summary
