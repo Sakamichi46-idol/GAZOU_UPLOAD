@@ -1420,3 +1420,73 @@ async def get_oldest_first(
 
 
     return blogs
+
+
+# =========================
+# 写真アーカイブ向け差分一覧取得
+# =========================
+
+async def get_unregistered_candidates(
+    session: aiohttp.ClientSession,
+    known_urls: set[str],
+    target_count: int,
+) -> list[dict]:
+    """最新ページから巡回し、DB未登録URLが必要数に達したら終了する。"""
+
+    target_count = max(int(target_count), 1)
+    candidates = []
+    seen_urls = set()
+    previous_page_urls = None
+    max_safety_page = 3000
+
+    print(f"日向坂 差分巡回開始: page=0から未登録{target_count}件を探索")
+
+    for page in range(0, max_safety_page + 1):
+        try:
+            page_blogs = await get_page_blogs(session, page)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"日向坂 差分 page={page} 取得エラー:", error)
+            break
+
+        if not page_blogs:
+            break
+
+        page_urls = [
+            str(blog.get("url", "")).strip()
+            for blog in page_blogs
+            if str(blog.get("url", "")).strip()
+        ]
+        if previous_page_urls is not None and page_urls == previous_page_urls:
+            break
+        previous_page_urls = page_urls
+
+        new_url_count = 0
+        for blog in page_blogs:
+            url = str(blog.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            new_url_count += 1
+            if url not in known_urls:
+                candidates.append(blog)
+                if len(candidates) >= target_count:
+                    print(
+                        f"日向坂 差分候補が必要数に到達: "
+                        f"page={page} / 確認{len(seen_urls)}件 / "
+                        f"未登録{len(candidates)}件"
+                    )
+                    return candidates
+
+        print(
+            f"日向坂 差分進捗 page={page}: "
+            f"確認{len(seen_urls)}件 / 未登録{len(candidates)}件"
+        )
+
+        if new_url_count == 0:
+            break
+        await asyncio.sleep(PAGE_REQUEST_DELAY)
+
+    print(f"日向坂 差分巡回終了: 未登録{len(candidates)}件")
+    return candidates
