@@ -50,7 +50,6 @@ from photo_tag_explorer import send_photo_tag_explorer
 from photo_face_review_view import (
     send_face_review_batch,
     send_fast_face_review,
-    send_person_group_face_review,
 )
 from local_face_recognition import (
     FaceEngineUnavailable,
@@ -580,6 +579,22 @@ def register_photo_commands(bot: commands.Bot) -> None:
         min_confidence: float = 90.0,
     ) -> None:
         """指定人物が1位候補の顔をまとめてプレビューし、一括確定する。"""
+        # Phase 8-3 is imported lazily so a partial/mixed deployment does not
+        # crash the entire Bot during startup. The complete release includes
+        # the matching implementation in photo_face_review_view.py.
+        try:
+            from photo_face_review_view import send_person_group_face_review
+        except ImportError as error:
+            await ctx.send(
+                "❌ 人物別一括確認のファイル構成が一致していません。"
+                " `photo_commands.py` と `photo_face_review_view.py` を"
+                "同じ完成版から更新してください。"
+            )
+            raise RuntimeError(
+                "send_person_group_face_review is missing from "
+                "photo_face_review_view.py"
+            ) from error
+
         await send_person_group_face_review(
             ctx,
             person_name,
