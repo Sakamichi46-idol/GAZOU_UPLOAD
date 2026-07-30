@@ -47,7 +47,11 @@ from photo_review_view import (
     send_skipped_person_review_batch,
 )
 from photo_tag_explorer import send_photo_tag_explorer
-from photo_face_review_view import send_face_review_batch, send_fast_face_review
+from photo_face_review_view import (
+    send_face_review_batch,
+    send_fast_face_review,
+    send_person_group_face_review,
+)
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -565,6 +569,22 @@ def register_photo_commands(bot: commands.Bot) -> None:
             ctx,
             max(1, min(int(limit), 100)),
             max(90.0, min(float(min_confidence), 100.0)),
+        )
+
+    @bot.command(name="face_review_person", aliases=["face_review_same"])
+    @commands.is_owner()
+    async def face_review_person_command(
+        ctx: commands.Context,
+        person_name: str = "",
+        limit: int = 50,
+        min_confidence: float = 90.0,
+    ) -> None:
+        """指定人物が1位候補の顔をまとめてプレビューし、一括確定する。"""
+        await send_person_group_face_review(
+            ctx,
+            person_name,
+            max(1, min(int(limit), 100)),
+            max(80.0, min(float(min_confidence), 100.0)),
         )
 
     @bot.command(name="face_review_list")
