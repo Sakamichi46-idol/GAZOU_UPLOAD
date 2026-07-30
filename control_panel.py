@@ -298,6 +298,17 @@ class AdminQuickView(discord.ui.View):
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "review_next", admin_required=True)
 
+    @discord.ui.button(label="画像0件を再判定", emoji="🛠️", style=discord.ButtonStyle.success)
+    async def repair_zero_images(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CommandArgumentsModal(
+            title="画像0件の記事を再判定",
+            command_name="photo_archive_repair_zero",
+            label="上限件数とグループ（省略可）",
+            placeholder="例: 100 櫻坂46",
+            required=False,
+            admin_required=True,
+        ))
+
     @discord.ui.button(label="写真巡回停止", emoji="🛑", style=discord.ButtonStyle.danger)
     async def photo_stop(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "photo_archive_stop", admin_required=True)
