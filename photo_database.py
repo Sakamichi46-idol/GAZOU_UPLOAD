@@ -2828,6 +2828,96 @@ def get_pending_face_reviews(
         )
 
 
+def get_pending_face_embeddings(limit: int = 200) -> list[dict[str, Any]]:
+    """顔特徴量を持つ確認待ちレビューを取得する。"""
+    safe_limit = max(2, min(int(limit), 500))
+    with closing(get_connection()) as connection:
+        cursor = connection.execute(
+            """
+            SELECT
+                photo_face_reviews.id AS review_id,
+                photo_face_reviews.face_id,
+                photo_faces.image_id,
+                photo_faces.face_index,
+                photo_faces.face_embedding,
+                photo_images.local_path,
+                photo_images.bucket_key,
+                photo_images.file_name,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at
+            FROM photo_face_reviews
+            JOIN photo_faces ON photo_faces.id = photo_face_reviews.face_id
+            JOIN photo_images ON photo_images.id = photo_faces.image_id
+            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            WHERE photo_face_reviews.status = 'pending'
+              AND photo_faces.face_embedding <> ''
+              AND photo_faces.confirmed_person_id IS NULL
+            ORDER BY photo_face_reviews.id ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        )
+        return rows_to_dicts(cursor.fetchall())
+
+
+def complete_face_cluster(
+    face_ids: list[int],
+    person_id: int,
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> int:
+    """同一クラスタの確認待ち顔を、1トランザクションで一括確定する。"""
+    normalized_ids = sorted({int(face_id) for face_id in face_ids if int(face_id) > 0})
+    if not normalized_ids:
+        return 0
+    now = utc_now_text()
+    placeholders = ",".join("?" for _ in normalized_ids)
+    with closing(get_connection()) as connection:
+        valid_rows = connection.execute(
+            f"""
+            SELECT face_id
+            FROM photo_face_reviews
+            WHERE status = 'pending'
+              AND face_id IN ({placeholders})
+            """,
+            tuple(normalized_ids),
+        ).fetchall()
+        valid_ids = [int(row["face_id"]) for row in valid_rows]
+        if not valid_ids:
+            return 0
+        valid_placeholders = ",".join("?" for _ in valid_ids)
+        connection.execute(
+            f"""
+            UPDATE photo_face_reviews
+            SET status = 'completed',
+                selected_person_id = ?,
+                reviewed_by = ?,
+                review_note = ?,
+                reviewed_at = ?,
+                updated_at = ?
+            WHERE status = 'pending'
+              AND face_id IN ({valid_placeholders})
+            """,
+            (int(person_id), reviewed_by, review_note, now, now, *valid_ids),
+        )
+        connection.execute(
+            f"""
+            UPDATE photo_faces
+            SET confirmed_person_id = ?,
+                confirmation_status = 'manually_confirmed',
+                confirmed_by = ?,
+                confirmed_at = ?,
+                updated_at = ?
+            WHERE id IN ({valid_placeholders})
+            """,
+            (int(person_id), reviewed_by, now, now, *valid_ids),
+        )
+        connection.commit()
+        return len(valid_ids)
+
+
 # =========================
 # 人物検索
 # =========================
