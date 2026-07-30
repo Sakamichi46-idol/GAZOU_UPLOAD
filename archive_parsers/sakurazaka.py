@@ -1215,7 +1215,9 @@ async def enrich_all_details(
 # =========================
 
 async def get_all_blogs(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     max_page = await get_max_page(
@@ -1323,10 +1325,13 @@ async def get_all_blogs(
 
 
     # 詳細ページから時刻を取得
-    blogs = await enrich_all_details(
-        session,
-        blogs
-    )
+    if enrich_details:
+        blogs = await enrich_all_details(
+            session,
+            blogs
+        )
+    else:
+        print("櫻坂 詳細取得を省略しました。")
 
 
     # 時刻込みで正確に並べ替え
@@ -1343,11 +1348,14 @@ async def get_all_blogs(
 # =========================
 
 async def get_oldest_first(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     blogs = await get_all_blogs(
-        session
+        session,
+        enrich_details=enrich_details,
     )
 
 
