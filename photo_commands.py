@@ -51,6 +51,7 @@ from photo_face_review_view import (
     send_face_review_batch,
     send_fast_face_review,
 )
+from photo_face_cluster_view import send_face_cluster_review
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -718,6 +719,16 @@ def register_photo_commands(bot: commands.Bot) -> None:
             lines.append("該当する学習データはありません。")
         lines.append("\n確定した顔は自動的に次回のローカル候補計算へ使われます。OpenAI APIは使用しません。")
         await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="face_cluster", aliases=["face_cluster_review"])
+    @commands.is_owner()
+    async def face_cluster_command(
+        ctx: commands.Context,
+        limit: int = 200,
+        similarity_percent: float = 90.0,
+    ) -> None:
+        """確認待ちの顔をローカル特徴量でクラスタリングし、まとめて確認する。"""
+        await send_face_cluster_review(ctx, limit, similarity_percent)
 
     @bot.command(name="face_relearn")
     @commands.is_owner()
