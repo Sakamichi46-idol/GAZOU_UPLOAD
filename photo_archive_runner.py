@@ -4,7 +4,7 @@ from typing import Any
 
 import aiohttp
 
-from archive_checker import get_all_blogs
+from archive_checker import get_all_blogs, enrich_selected_blogs
 from archive_image_getter import get_images
 from photo_ai_analyzer import analyze_photo_image, get_photo_ai_status
 from photo_database import (
@@ -443,7 +443,9 @@ async def run_photo_archive_once(
         try:
             await asyncio.to_thread(init_photo_db)
 
-            blogs = await get_all_blogs()
+            # 一覧情報だけを取得し、全記事の詳細ページ取得は行わない。
+            # DB未登録判定後、今回処理する少数の記事だけ詳細取得する。
+            blogs = await get_all_blogs(enrich_details=False)
             blogs = remove_duplicate_blog_urls(blogs)
             summary["collected"] = len(blogs)
 
@@ -461,6 +463,10 @@ async def run_photo_archive_once(
 
             print("写真DB未登録記事:", summary["unregistered"], "件")
             print("今回の写真処理対象:", len(targets), "件")
+
+            if targets:
+                targets = await enrich_selected_blogs(targets)
+                print("詳細取得完了後の処理対象:", len(targets), "件")
 
             if not targets:
                 summary["status"] = "completed"
