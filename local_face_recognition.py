@@ -300,6 +300,16 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
                     "confidence": confidence,
                 }
         candidates = sorted(best_by_person.values(), key=lambda item: item["confidence"], reverse=True)[:max(1, min(limit_per_face, 10))]
+
+        # 最新の確定顔を学習元として再計算するため、古い候補をいったん削除する。
+        # これにより手動確定・一括確定した顔が、次回の候補生成へ確実に反映される。
+        with closing(get_connection()) as connection:
+            connection.execute(
+                "DELETE FROM photo_face_candidates WHERE face_id = ?",
+                (int(face["id"]),),
+            )
+            connection.commit()
+
         for rank, candidate in enumerate(candidates, 1):
             save_face_candidate(
                 int(face["id"]), int(candidate["person_id"]), float(candidate["confidence"]),
