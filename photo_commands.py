@@ -655,7 +655,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
         total = await asyncio.to_thread(
             _row,
             """
-            SELECT COUNT(*) AS references, COUNT(DISTINCT confirmed_person_id) AS people
+            SELECT COUNT(*) AS reference_total, COUNT(DISTINCT confirmed_person_id) AS people
             FROM photo_faces
             WHERE confirmed_person_id IS NOT NULL
               AND face_embedding <> ''
@@ -668,7 +668,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
         )
         lines = [
             "🧠 **顔学習状況**",
-            f"学習用の確定顔: **{int((total or {}).get('references') or 0):,}件**",
+            f"学習用の確定顔: **{int((total or {}).get('reference_total') or 0):,}件**",
             f"学習済み人物: **{int((total or {}).get('people') or 0):,}人**",
             f"再判定待ち: **{int((pending or {}).get('count') or 0):,}件**",
             "",
