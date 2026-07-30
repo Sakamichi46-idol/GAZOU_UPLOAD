@@ -1069,6 +1069,35 @@ def get_photo_blog_by_url(
         )
 
 
+def get_registered_photo_blog_urls(
+    group_name: str | None = None,
+) -> set[str]:
+    """
+    写真DBへ登録済みのブログURLをまとめて返す。
+
+    1件ずつSELECTする代わりに巡回開始時に一括取得し、
+    一覧巡回中の判定をメモリ上で行うために使用する。
+    """
+
+    sql = "SELECT blog_url FROM photo_blogs"
+    params: tuple[Any, ...] = ()
+
+    normalized_group = str(group_name or "").strip()
+
+    if normalized_group and normalized_group != "all":
+        sql += " WHERE group_name = ?"
+        params = (normalized_group,)
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, params).fetchall()
+
+    return {
+        str(row["blog_url"]).strip()
+        for row in rows
+        if row["blog_url"] and str(row["blog_url"]).strip()
+    }
+
+
 # =========================
 # 画像登録
 # =========================
