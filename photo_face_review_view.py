@@ -404,3 +404,185 @@ async def send_fast_face_review(
     message = await ctx.send(embed=build_fast_review_embed(items, threshold), view=view)
     view.message = message
     return len(items)
+
+
+def build_person_group_review_embed(
+    items: list[dict[str, Any]],
+    person_name: str,
+    min_confidence: float,
+) -> discord.Embed:
+    """同じ人物が1位候補の顔をまとめて確認するプレビュー。"""
+    confidences = [float(item.get("confidence") or 0) for item in items]
+    embed = discord.Embed(
+        title="👥 同じ人物候補をまとめて確認",
+        description=(
+            f"1位候補が **{discord.utils.escape_markdown(person_name)}** の顔だけを集めています。\n"
+            "一括確定すると、表示中の顔すべてがこの人物の学習用参照に追加されます。"
+        ),
+        color=discord.Color.purple(),
+    )
+    embed.add_field(name="人物", value=person_name, inline=True)
+    embed.add_field(name="対象件数", value=f"{len(items):,}件", inline=True)
+    embed.add_field(name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
+    if confidences:
+        embed.add_field(
+            name="候補信頼度",
+            value=(
+                f"最低 {min(confidences) * 100:.1f}% / "
+                f"平均 {sum(confidences) / len(confidences) * 100:.1f}% / "
+                f"最高 {max(confidences) * 100:.1f}%"
+            ),
+            inline=False,
+        )
+
+    samples = []
+    for item in items[:10]:
+        samples.append(
+            f"・顔ID **{int(item['face_id'])}** / "
+            f"画像ID **{int(item['image_id'])}** / "
+            f"{float(item.get('confidence') or 0) * 100:.1f}%"
+        )
+    embed.add_field(
+        name="先頭10件",
+        value="\n".join(samples) or "対象なし",
+        inline=False,
+    )
+    embed.set_footer(text="安全のため自動確定は行いません。OpenAI APIも使用しません。")
+    return embed
+
+
+class PersonGroupFaceReviewView(discord.ui.View):
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        person_name: str,
+        *,
+        owner_id: int,
+        min_confidence: float,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.items = items
+        self.person_name = person_name
+        self.owner_id = int(owner_id)
+        self.min_confidence = float(min_confidence)
+        self.finished = False
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "この一括確認は開始した本人だけが操作できます。",
+                ephemeral=True,
+            )
+            return False
+        if self.finished:
+            await interaction.response.send_message(
+                "この一括確認はすでに終了しています。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="この人物で一括確定", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm_all(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from photo_database import complete_face_reviews_bulk
+
+        await interaction.response.defer()
+        completed = await asyncio.to_thread(
+            complete_face_reviews_bulk,
+            self.items,
+            _reviewer(interaction.user),
+            (
+                f"人物別一括確定 person={self.person_name} "
+                f"threshold={self.min_confidence:.4f}"
+            ),
+        )
+        self.finished = True
+        self.stop()
+        embed = discord.Embed(
+            title="✅ 同じ人物候補を一括確定しました",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="人物", value=self.person_name, inline=True)
+        embed.add_field(name="確定件数", value=f"{completed:,}件", inline=True)
+        embed.add_field(
+            name="最低信頼度",
+            value=f"{self.min_confidence * 100:.1f}%",
+            inline=True,
+        )
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.finished = True
+        self.stop()
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title="✖️ 人物別の一括確定をキャンセルしました",
+                color=discord.Color.light_grey(),
+            ),
+            view=None,
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def send_person_group_face_review(
+    ctx: commands.Context,
+    person_name: str,
+    limit: int = 50,
+    min_confidence_percent: float = 90.0,
+) -> int:
+    """指定人物が1位候補の確認待ち顔をまとめて確定する。"""
+    from photo_database import get_person_pending_face_reviews, get_person_by_name
+
+    person_name = _text(person_name)
+    if not person_name:
+        await ctx.send(
+            "使い方: `!face_review_person 人物名 [件数] [最低信頼度]`\n"
+            "例: `!face_review_person 井上和 50 95`"
+        )
+        return 0
+
+    person = await asyncio.to_thread(get_person_by_name, person_name)
+    if not person:
+        await ctx.send(
+            f"⚠️ 人物マスターに **{discord.utils.escape_markdown(person_name)}** は見つかりません。"
+        )
+        return 0
+
+    limit = max(1, min(int(limit), 100))
+    percent = max(80.0, min(float(min_confidence_percent), 100.0))
+    threshold = percent / 100.0
+    items = await asyncio.to_thread(
+        get_person_pending_face_reviews,
+        person_name,
+        limit,
+        threshold,
+    )
+    if not items:
+        await ctx.send(
+            f"✅ **{discord.utils.escape_markdown(person_name)}** が1位候補で、"
+            f"信頼度 **{percent:.1f}%以上** の確認待ちはありません。"
+        )
+        return 0
+
+    view = PersonGroupFaceReviewView(
+        items,
+        person_name,
+        owner_id=ctx.author.id,
+        min_confidence=threshold,
+    )
+    message = await ctx.send(
+        embed=build_person_group_review_embed(items, person_name, threshold),
+        view=view,
+    )
+    view.message = message
+    return len(items)
