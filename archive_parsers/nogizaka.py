@@ -1934,7 +1934,9 @@ async def get_all_blog_urls(
 # =========================
 
 async def get_all_blogs(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     blogs = await get_all_blog_urls(
@@ -1988,10 +1990,13 @@ async def get_all_blogs(
     )
 
 
-    blogs = await enrich_all_details(
-        session,
-        blogs
-    )
+    if enrich_details:
+        blogs = await enrich_all_details(
+            session,
+            blogs
+        )
+    else:
+        print("乃木坂 詳細取得を省略しました。")
 
 
     blogs.sort(
@@ -2007,11 +2012,14 @@ async def get_all_blogs(
 # =========================
 
 async def get_oldest_first(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     blogs = await get_all_blogs(
-        session
+        session,
+        enrich_details=enrich_details,
     )
 
 
