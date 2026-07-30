@@ -2071,3 +2071,84 @@ async def get_oldest_first(
 
 
     return blogs
+
+
+# =========================
+# 写真アーカイブ向け差分一覧取得
+# =========================
+
+async def get_unregistered_candidates(
+    session: aiohttp.ClientSession,
+    known_urls: set[str],
+    target_count: int,
+) -> list[dict]:
+    """最新側から巡回し、DB未登録URLが必要数に達したら終了する。"""
+
+    target_count = max(int(target_count), 1)
+    row_count = 100
+    start = 0
+    candidates = []
+    seen_urls = set()
+    previous_page_urls = None
+    max_requests = 3000
+
+    print(f"乃木坂 差分巡回開始: 未登録{target_count}件を探索")
+
+    for request_count in range(1, max_requests + 1):
+        try:
+            items, data = await fetch_api_items(
+                session,
+                start=start,
+                row_count=row_count,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"乃木坂 差分API st={start} 取得エラー:", error)
+            break
+
+        if not items:
+            break
+
+        page_blogs = [
+            blog for blog in (convert_item(item) for item in items) if blog
+        ]
+        page_urls = [blog.get("url", "") for blog in page_blogs if blog.get("url")]
+
+        if previous_page_urls is not None and page_urls == previous_page_urls:
+            break
+        previous_page_urls = page_urls
+
+        for blog in page_blogs:
+            url = str(blog.get("url", "")).strip()
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            if url not in known_urls:
+                candidates.append(blog)
+                if len(candidates) >= target_count:
+                    print(
+                        f"乃木坂 差分候補が必要数に到達: "
+                        f"API {request_count}回 / 未登録{len(candidates)}件"
+                    )
+                    return candidates
+
+        print(
+            f"乃木坂 差分進捗 st={start}: "
+            f"確認{len(seen_urls)}件 / 未登録{len(candidates)}件"
+        )
+
+        total_count = data.get("count")
+        try:
+            total_count = int(total_count)
+        except (TypeError, ValueError):
+            total_count = 0
+
+        if total_count > 0 and start + len(items) >= total_count:
+            break
+
+        start += row_count
+        await asyncio.sleep(PAGE_REQUEST_DELAY)
+
+    print(f"乃木坂 差分巡回終了: 未登録{len(candidates)}件")
+    return candidates
