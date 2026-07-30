@@ -276,3 +276,131 @@ async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
         view.message = message
         sent += 1
     return sent
+
+
+def build_fast_review_embed(
+    items: list[dict[str, Any]],
+    min_confidence: float,
+) -> discord.Embed:
+    """高信頼度の1位候補を一括確認するためのプレビュー。"""
+    embed = discord.Embed(
+        title="⚡ 高信頼度の顔候補を一括確認",
+        description=(
+            "ローカル顔認識の1位候補だけを表示しています。\n"
+            "画像を個別確認せず一括確定する機能なので、内容を確認してから実行してください。"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="対象件数", value=f"{len(items):,}件", inline=True)
+    embed.add_field(name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
+
+    grouped: dict[str, list[float]] = {}
+    for item in items:
+        name = _text(item.get("person_name")) or "不明"
+        grouped.setdefault(name, []).append(float(item.get("confidence") or 0))
+
+    lines: list[str] = []
+    for name, values in sorted(grouped.items(), key=lambda pair: (-len(pair[1]), pair[0])):
+        lines.append(
+            f"・**{discord.utils.escape_markdown(name)}**: {len(values)}件 "
+            f"({min(values) * 100:.1f}〜{max(values) * 100:.1f}%)"
+        )
+    embed.add_field(
+        name="候補別内訳",
+        value="\n".join(lines[:20]) or "候補なし",
+        inline=False,
+    )
+    if len(lines) > 20:
+        embed.set_footer(text=f"ほか {len(lines) - 20}人物。OpenAI APIは使用しません。")
+    else:
+        embed.set_footer(text="OpenAI APIは使用しません。")
+    return embed
+
+
+class FastFaceReviewView(discord.ui.View):
+    def __init__(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        owner_id: int,
+        min_confidence: float,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.items = items
+        self.owner_id = int(owner_id)
+        self.min_confidence = float(min_confidence)
+        self.finished = False
+        self.message: discord.Message | None = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("この一括確認は開始した本人だけが操作できます。", ephemeral=True)
+            return False
+        if self.finished:
+            await interaction.response.send_message("この一括確認はすでに終了しています。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="表示中をすべて確定", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm_all(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from photo_database import complete_face_reviews_bulk
+
+        await interaction.response.defer()
+        completed = await asyncio.to_thread(
+            complete_face_reviews_bulk,
+            self.items,
+            _reviewer(interaction.user),
+            f"高信頼度一括確定 threshold={self.min_confidence:.4f}",
+        )
+        self.finished = True
+        self.stop()
+        embed = discord.Embed(title="✅ 高信頼度の顔候補を一括確定しました", color=discord.Color.green())
+        embed.add_field(name="確定件数", value=f"{completed:,}件", inline=True)
+        embed.add_field(name="最低信頼度", value=f"{self.min_confidence * 100:.1f}%", inline=True)
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.finished = True
+        self.stop()
+        embed = discord.Embed(title="✖️ 一括確定をキャンセルしました", color=discord.Color.light_grey())
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def send_fast_face_review(
+    ctx: commands.Context,
+    limit: int = 20,
+    min_confidence_percent: float = 95.0,
+) -> int:
+    """高信頼度の1位候補をまとめてプレビューし、ボタンで一括確定する。"""
+    from photo_database import get_high_confidence_pending_face_reviews
+
+    limit = max(1, min(int(limit), 100))
+    percent = max(90.0, min(float(min_confidence_percent), 100.0))
+    threshold = percent / 100.0
+    items = await asyncio.to_thread(
+        get_high_confidence_pending_face_reviews,
+        limit,
+        threshold,
+    )
+    if not items:
+        await ctx.send(f"✅ 信頼度 **{percent:.1f}%以上** の顔確認待ちはありません。")
+        return 0
+
+    view = FastFaceReviewView(
+        items,
+        owner_id=ctx.author.id,
+        min_confidence=threshold,
+    )
+    message = await ctx.send(embed=build_fast_review_embed(items, threshold), view=view)
+    view.message = message
+    return len(items)
