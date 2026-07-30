@@ -196,6 +196,30 @@ def is_unwanted_image(
 
 
 # =========================
+# サイト別画像判定
+# =========================
+
+def is_allowed_article_image(page_url: str, image_url: str) -> bool:
+    """記事本文画像として許可するURLかをサイト別に判定する。"""
+
+    if not image_url:
+        return False
+
+    page_host = urlsplit(page_url).netloc.lower()
+    image_parts = urlsplit(image_url)
+    image_host = image_parts.netloc.lower()
+    image_path = image_parts.path.lower()
+
+    if "sakurazaka46.com" in page_host:
+        if image_host not in {"sakurazaka46.com", "www.sakurazaka46.com"}:
+            return False
+        # 旧記事は /files/、新記事は /images/ を使用する。
+        return image_path.startswith("/images/") or "/files/" in image_path
+
+    return True
+
+
+# =========================
 # 画像URL抽出
 # =========================
 
@@ -274,6 +298,10 @@ def extract_image_urls(
             continue
 
 
+        if not is_allowed_article_image(page_url, image_url):
+            continue
+
+
         if image_url in seen:
             continue
 
@@ -323,6 +351,10 @@ def extract_image_urls(
             continue
 
 
+        if not is_allowed_article_image(page_url, image_url):
+            continue
+
+
         if image_url in seen:
             continue
 
@@ -365,6 +397,10 @@ def extract_image_urls(
         if is_unwanted_image(
             image_url
         ):
+            continue
+
+
+        if not is_allowed_article_image(page_url, image_url):
             continue
 
 
@@ -576,7 +612,9 @@ async def get_images(
             e
         )
 
-        return []
+        raise RuntimeError(
+            f"記事HTML取得に失敗しました: {page_url}"
+        ) from e
 
 
     try:
@@ -616,4 +654,6 @@ async def get_images(
             e
         )
 
-        return []
+        raise RuntimeError(
+            f"記事画像解析に失敗しました: {page_url}"
+        ) from e
