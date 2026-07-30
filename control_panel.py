@@ -68,6 +68,13 @@ async def invoke_existing_command(
     *,
     admin_required: bool = False,
 ) -> None:
+    """ボタン／Modalから既存のprefix commandを安全に実行する。
+
+    ``Context.from_interaction`` はスラッシュコマンド専用であり、
+    ButtonやModalのInteractionにはcommand dataがないため使用しない。
+    代わりに、Interactionを保持したContextを手動で組み立てて
+    prefix command本来の引数変換・check・cooldownをそのまま利用する。
+    """
     bot = interaction.client
     if not isinstance(bot, commands.Bot):
         await _reply(interaction, "⚠️ Botのコマンドシステムを取得できませんでした。")
@@ -82,20 +89,51 @@ async def invoke_existing_command(
         await _reply(interaction, f"⚠️ `{command_name}` コマンドが見つかりません。")
         return
 
+    # ボタンInteractionにはApplication Commandのdataがないため、
+    # Context.from_interaction(interaction) は ValueError になる。
+    # Contextを直接生成すれば、既存prefix commandのパーサーを再利用できる。
+    message = interaction.message
+    if message is None:
+        # Modal送信時などmessageが無い場合の最小限のMessage互換オブジェクト。
+        class _PanelMessage:
+            def __init__(self) -> None:
+                self.author = interaction.user
+                self.channel = interaction.channel
+                self.guild = interaction.guild
+                self.content = f"!{command_name} {raw_arguments}".rstrip()
+                self.attachments = []
+                self.id = int(getattr(interaction, "id", 0))
+                self._state = getattr(bot, "_connection", None)
+
+        message = _PanelMessage()  # type: ignore[assignment]
+
+    ctx = commands.Context(
+        message=message,
+        bot=bot,
+        view=StringView(raw_arguments.strip()),
+        args=[],
+        kwargs={},
+        prefix="!",
+        command=command,
+        invoked_with=command_name,
+        invoked_parents=[],
+        invoked_subcommand=None,
+        subcommand_passed=None,
+        command_failed=False,
+        interaction=interaction,
+    )
+
     try:
-        ctx = await commands.Context.from_interaction(interaction)
-        ctx.command = command
-        ctx.invoked_with = command_name
-        ctx.invoked_parents = []
-        ctx.invoked_subcommand = None
-        ctx.subcommand_passed = None
-        ctx.command_failed = False
-        ctx.view = StringView(raw_arguments.strip())
+        # 3秒以内に応答を確定させる。Context.sendは以後followupを利用できる。
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
         await command.invoke(ctx)
     except commands.CommandError as error:
-        await bot.on_command_error(ctx, error)  # type: ignore[arg-type]
+        ctx.command_failed = True
+        await bot.on_command_error(ctx, error)
     except Exception as error:
-        await _reply(interaction, f"⚠️ 操作中にエラーが発生しました。\n`{error}`")
+        ctx.command_failed = True
+        await _reply(interaction, f"⚠️ 操作中にエラーが発生しました。\n`{type(error).__name__}: {error}`")
 
 
 class CommandArgumentsModal(discord.ui.Modal):
