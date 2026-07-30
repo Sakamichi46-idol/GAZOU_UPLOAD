@@ -19,14 +19,17 @@ from archive_parsers.utils import (
 
 from archive_parsers.nogizaka import (
     get_oldest_first as get_nogizaka,
+    enrich_all_details as enrich_nogizaka_details,
 )
 
 from archive_parsers.sakurazaka import (
     get_oldest_first as get_sakurazaka,
+    enrich_all_details as enrich_sakurazaka_details,
 )
 
 from archive_parsers.hinatazaka import (
     get_oldest_first as get_hinatazaka,
+    enrich_all_details as enrich_hinatazaka_details,
 )
 
 
@@ -114,12 +117,15 @@ def get_selected_parsers():
 # 1グループ取得
 # =========================
 
-async def run_parser(group, parser, session):
+async def run_parser(group, parser, session, *, enrich_details=True):
     print("=" * 50)
     print(f"[{group}] 巡回開始")
 
     try:
-        result = await parser(session)
+        result = await parser(
+            session,
+            enrich_details=enrich_details,
+        )
 
         if not result:
             print(f"[{group}] 記事なし")
@@ -160,7 +166,7 @@ async def run_parser(group, parser, session):
 # 全対象グループ取得
 # =========================
 
-async def get_all_blogs():
+async def get_all_blogs(*, enrich_details=True):
     selected_parsers = get_selected_parsers()
 
     if not selected_parsers:
@@ -189,7 +195,12 @@ async def get_all_blogs():
         connector=connector,
     ) as session:
         tasks = [
-            run_parser(group, parser, session)
+            run_parser(
+                group,
+                parser,
+                session,
+                enrich_details=enrich_details,
+            )
             for group, parser in selected_parsers.items()
         ]
 
@@ -216,6 +227,96 @@ async def get_all_blogs():
     print("=" * 50)
     print(f"取得合計: {len(blogs)}件")
     return blogs
+
+
+# =========================
+# 選択記事だけ詳細取得
+# =========================
+
+DETAIL_ENRICHERS = {
+    "乃木坂46": enrich_nogizaka_details,
+    "櫻坂46": enrich_sakurazaka_details,
+    "日向坂46": enrich_hinatazaka_details,
+}
+
+
+async def enrich_selected_blogs(blogs):
+    """
+    渡された記事だけ詳細ページを取得して情報を補完する。
+
+    写真アーカイブでは、一覧URLをDB照合した後の少数記事だけを
+    詳細取得するために使用する。
+    """
+
+    if not blogs:
+        return []
+
+    grouped = {}
+    original_order = []
+
+    for blog in blogs:
+        if not isinstance(blog, dict):
+            continue
+
+        url = str(blog.get("url", "")).strip()
+        group = str(blog.get("group", "")).strip()
+
+        if not url:
+            continue
+
+        original_order.append(url)
+        grouped.setdefault(group, []).append(blog)
+
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        connect=30,
+        sock_read=60,
+    )
+
+    connector = aiohttp.TCPConnector(
+        limit=10,
+        limit_per_host=5,
+        ttl_dns_cache=300,
+    )
+
+    enriched_by_url = {}
+
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+    ) as session:
+        for group, group_blogs in grouped.items():
+            enricher = DETAIL_ENRICHERS.get(group)
+
+            if enricher is None:
+                for blog in group_blogs:
+                    enriched_by_url[blog.get("url", "")] = blog
+                continue
+
+            print(
+                f"[{group}] DB未登録候補だけ詳細取得: "
+                f"{len(group_blogs)}件"
+            )
+
+            try:
+                enriched = await enricher(session, group_blogs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                print(f"[{group}] 選択記事の詳細取得エラー:", error)
+                traceback.print_exc()
+                enriched = group_blogs
+
+            for blog in enriched:
+                url = str(blog.get("url", "")).strip()
+                if url:
+                    enriched_by_url[url] = blog
+
+    return [
+        enriched_by_url[url]
+        for url in original_order
+        if url in enriched_by_url
+    ]
 
 
 # =========================
