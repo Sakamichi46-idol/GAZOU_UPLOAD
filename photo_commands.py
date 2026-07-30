@@ -52,6 +52,7 @@ from photo_face_review_view import (
     send_fast_face_review,
 )
 from photo_face_cluster_view import send_face_cluster_review
+from photo_id_view import send_photo_by_id
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -168,6 +169,12 @@ def register_photo_commands(bot: commands.Bot) -> None:
     @bot.command(name="photo_search_author")
     async def photo_search_author_command(ctx: commands.Context, *, author_name: str = "") -> None:
         await send_photo_author_search_results(ctx, author_name)
+
+
+    @bot.command(name="photo_id")
+    async def photo_id_command(ctx: commands.Context, image_id: int) -> None:
+        """画像IDから元画像と登録情報を表示する。"""
+        await send_photo_by_id(ctx, image_id)
 
     @bot.command(name="photo_person_set")
     @commands.is_owner()
