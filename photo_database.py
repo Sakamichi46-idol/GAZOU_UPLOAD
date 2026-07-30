@@ -1069,6 +1069,57 @@ def get_photo_blog_by_url(
         )
 
 
+def get_zero_image_photo_blogs(
+    limit: int = 100,
+    group_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    photo_blogsへ登録済みだが、photo_imagesが1件もない記事を返す。
+
+    過去に画像抽出の不具合や一時的な取得失敗によって
+    「画像なし」として登録された記事を再判定するために使用する。
+    """
+
+    selected_limit = max(1, min(int(limit), 1000))
+    normalized_group = str(group_name or "").strip()
+
+    sql = """
+        SELECT
+            photo_blogs.id,
+            photo_blogs.blog_url AS url,
+            photo_blogs.group_name AS "group",
+            photo_blogs.member_name AS member,
+            photo_blogs.title AS title,
+            photo_blogs.published_at AS date,
+            photo_blogs.created_at,
+            photo_blogs.updated_at
+        FROM photo_blogs
+        LEFT JOIN photo_images
+            ON photo_images.blog_id = photo_blogs.id
+    """
+    params: list[Any] = []
+
+    if normalized_group and normalized_group != "all":
+        sql += " WHERE photo_blogs.group_name = ?"
+        params.append(normalized_group)
+
+    sql += """
+        GROUP BY photo_blogs.id
+        HAVING COUNT(photo_images.id) = 0
+        ORDER BY
+            CASE WHEN photo_blogs.published_at = '' THEN 1 ELSE 0 END,
+            photo_blogs.published_at DESC,
+            photo_blogs.id DESC
+        LIMIT ?
+    """
+    params.append(selected_limit)
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+
+    return rows_to_dicts(rows)
+
+
 def get_registered_photo_blog_urls(
     group_name: str | None = None,
 ) -> set[str]:
