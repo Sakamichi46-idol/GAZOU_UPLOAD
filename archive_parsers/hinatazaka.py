@@ -1137,7 +1137,9 @@ async def enrich_all_details(
 # =========================
 
 async def get_all_blogs(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     print(
@@ -1345,10 +1347,13 @@ async def get_all_blogs(
 
     # 選ばれた候補だけ詳細ページを開き、
     # 正確な時刻を取得する
-    blogs = await enrich_all_details(
-        session,
-        blogs
-    )
+    if enrich_details:
+        blogs = await enrich_all_details(
+            session,
+            blogs
+        )
+    else:
+        print("日向坂 詳細取得を省略しました。")
 
 
     # 時刻込みで最終的に古い順へ並べる
@@ -1364,11 +1369,14 @@ async def get_all_blogs(
 # =========================
 
 async def get_oldest_first(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    *,
+    enrich_details: bool = True,
 ) -> list[dict]:
 
     blogs = await get_all_blogs(
-        session
+        session,
+        enrich_details=enrich_details,
     )
 
 
