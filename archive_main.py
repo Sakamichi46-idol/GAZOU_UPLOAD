@@ -59,6 +59,10 @@ from photo_archive_runner import (
     run_photo_archive_once,
 )
 from photo_commands import register_photo_commands
+from control_panel import (
+    add_persistent_control_panel_views,
+    register_control_panel,
+)
 
 
 # =========================
@@ -76,6 +80,7 @@ bot = commands.Bot(
 )
 
 register_photo_commands(bot)
+register_control_panel(bot)
 
 # =========================
 # チャンネル設定
@@ -1400,6 +1405,9 @@ async def run_ai_analysis_batch(
 async def on_ready() -> None:
 
     global startup_initialized
+
+    # 常設ボタンを再起動後も有効にする。
+    add_persistent_control_panel_views(bot)
 
     print(
         "=" * 50
