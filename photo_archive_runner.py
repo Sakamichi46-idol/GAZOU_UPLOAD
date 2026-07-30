@@ -4,11 +4,12 @@ from typing import Any
 
 import aiohttp
 
-from archive_checker import get_all_blogs, enrich_selected_blogs
+from archive_checker import get_photo_archive_candidates, enrich_selected_blogs
 from archive_image_getter import get_images
 from photo_ai_analyzer import analyze_photo_image, get_photo_ai_status
 from photo_database import (
     get_photo_blog_by_url,
+    get_registered_photo_blog_urls,
     add_image_person_candidate,
     init_photo_db,
     save_photo_blog,
@@ -443,23 +444,26 @@ async def run_photo_archive_once(
         try:
             await asyncio.to_thread(init_photo_db)
 
-            # 一覧情報だけを取得し、全記事の詳細ページ取得は行わない。
-            # DB未登録判定後、今回処理する少数の記事だけ詳細取得する。
-            blogs = await get_all_blogs(enrich_details=False)
-            blogs = remove_duplicate_blog_urls(blogs)
-            summary["collected"] = len(blogs)
+            normalized_group = normalize_group_filter(selected_group)
 
-            blogs = filter_blogs_by_group(blogs, selected_group)
-            summary["group_filtered"] = len(blogs)
-
-            targets = await asyncio.to_thread(
-                get_unregistered_photo_blogs,
-                blogs,
+            # 登録済みURLを最初に一括取得する。
+            # 各URLごとのSELECTと全記事一覧取得を避け、最新側から
+            # 必要な未登録件数が見つかった時点で一覧巡回を終了する。
+            known_urls = await asyncio.to_thread(
+                get_registered_photo_blog_urls,
+                normalized_group,
             )
-            summary["unregistered"] = len(targets)
 
-            # get_all_blogs側の並び順を維持する。
-            targets = targets[:selected_limit]
+            targets = await get_photo_archive_candidates(
+                known_urls=known_urls,
+                target_count=selected_limit,
+                group_filter=normalized_group,
+            )
+            targets = remove_duplicate_blog_urls(targets)
+
+            summary["collected"] = len(targets)
+            summary["group_filtered"] = len(targets)
+            summary["unregistered"] = len(targets)
 
             print("写真DB未登録記事:", summary["unregistered"], "件")
             print("今回の写真処理対象:", len(targets), "件")
