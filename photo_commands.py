@@ -134,6 +134,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
     # Railway上で重複実行するとCPU・メモリ・Bucket通信が競合するため。
     face_scan_lock = asyncio.Lock()
     face_scan_stop_event = asyncio.Event()
+    face_relearn_lock = asyncio.Lock()
 
     @bot.command(name="photo_tags", aliases=["tag_search", "photo_explorer"])
     async def photo_tags_command(ctx: commands.Context) -> None:
@@ -622,6 +623,134 @@ def register_photo_commands(bot: commands.Bot) -> None:
             confirmation_status="manually_confirmed",
         )
         await ctx.send(f"✅ 顔ID **{face_id}** を **{person_name}** として確定しました。")
+
+    @bot.command(name="face_learning_status")
+    @commands.is_owner()
+    async def face_learning_status_command(ctx: commands.Context, *, person_name: str = "") -> None:
+        """確定済み顔がローカル学習用参照として何件使えるか表示する。"""
+        person_name = person_name.strip()
+        params: tuple[Any, ...] = ()
+        where = ""
+        if person_name:
+            where = " AND photo_people.person_name = ?"
+            params = (person_name,)
+
+        rows = await asyncio.to_thread(
+            _rows,
+            f"""
+            SELECT photo_people.person_name, photo_people.group_name,
+                   COUNT(photo_faces.id) AS reference_count,
+                   MAX(photo_faces.confirmed_at) AS last_learned_at
+            FROM photo_people
+            JOIN photo_faces ON photo_faces.confirmed_person_id = photo_people.id
+            WHERE photo_faces.face_embedding <> ''
+              AND photo_faces.confirmation_status IN ('confirmed','manually_confirmed','auto_seeded')
+              {where}
+            GROUP BY photo_people.id, photo_people.person_name, photo_people.group_name
+            ORDER BY reference_count DESC, photo_people.person_name ASC
+            LIMIT 25
+            """,
+            params,
+        )
+        total = await asyncio.to_thread(
+            _row,
+            """
+            SELECT COUNT(*) AS references, COUNT(DISTINCT confirmed_person_id) AS people
+            FROM photo_faces
+            WHERE confirmed_person_id IS NOT NULL
+              AND face_embedding <> ''
+              AND confirmation_status IN ('confirmed','manually_confirmed','auto_seeded')
+            """,
+        )
+        pending = await asyncio.to_thread(
+            _row,
+            "SELECT COUNT(*) AS count FROM photo_face_reviews WHERE status = 'pending'",
+        )
+        lines = [
+            "🧠 **顔学習状況**",
+            f"学習用の確定顔: **{int((total or {}).get('references') or 0):,}件**",
+            f"学習済み人物: **{int((total or {}).get('people') or 0):,}人**",
+            f"再判定待ち: **{int((pending or {}).get('count') or 0):,}件**",
+            "",
+            "**人物別の学習用顔数**",
+        ]
+        if rows:
+            for item in rows:
+                group = str(item.get("group_name") or "")
+                prefix = f"[{group}] " if group else ""
+                lines.append(f"・{prefix}{item['person_name']}: **{int(item['reference_count']):,}件**")
+        else:
+            lines.append("該当する学習データはありません。")
+        lines.append("\n確定した顔は自動的に次回のローカル候補計算へ使われます。OpenAI APIは使用しません。")
+        await ctx.send("\n".join(lines)[:1900])
+
+    @bot.command(name="face_relearn")
+    @commands.is_owner()
+    async def face_relearn_command(ctx: commands.Context, limit: int = 20) -> None:
+        """最新の確定顔を使い、確認待ちの候補をローカルで再計算する。"""
+        limit = max(1, min(int(limit), 100))
+        if face_relearn_lock.locked():
+            await ctx.send("⚠️ 顔候補の再学習処理は現在実行中です。")
+            return
+
+        async with face_relearn_lock:
+            targets = await asyncio.to_thread(
+                _rows,
+                """
+                SELECT DISTINCT photo_faces.image_id
+                FROM photo_face_reviews
+                JOIN photo_faces ON photo_faces.id = photo_face_reviews.face_id
+                WHERE photo_face_reviews.status = 'pending'
+                  AND photo_faces.face_embedding <> ''
+                ORDER BY photo_face_reviews.id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            if not targets:
+                await ctx.send("✅ 再学習できる顔確認待ちはありません。")
+                return
+
+            message = await ctx.send(
+                f"🧠 最新の確定顔を使って候補を再学習しています… **0/{len(targets)}画像**\n"
+                "OpenAI APIは使用しません。"
+            )
+            completed = 0
+            failed = 0
+            updated_faces = 0
+            for index, item in enumerate(targets, 1):
+                try:
+                    result = await asyncio.to_thread(
+                        suggest_face_candidates, int(item["image_id"]), 5
+                    )
+                    updated_faces += len(result)
+                    completed += 1
+                except Exception as error:
+                    failed += 1
+                    print(
+                        f"顔再学習失敗 image_id={item['image_id']}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                if index == len(targets) or index % 10 == 0:
+                    try:
+                        await message.edit(
+                            content=(
+                                f"🧠 最新の確定顔を使って候補を再学習しています… "
+                                f"**{index}/{len(targets)}画像**\nOpenAI APIは使用しません。"
+                            )
+                        )
+                    except discord.HTTPException:
+                        pass
+
+            await message.edit(
+                content=(
+                    "✅ **顔候補の再学習が完了しました**\n"
+                    f"処理画像: **{completed:,}件**\n"
+                    f"候補を再計算した顔: **{updated_faces:,}件**\n"
+                    f"失敗: **{failed:,}件**\n"
+                    "手動確定・一括確定した顔が、今後の候補計算に反映されます。"
+                )
+            )
 
     @bot.command(name="ai_cost")
     @commands.is_owner()
