@@ -4107,6 +4107,62 @@ def get_high_confidence_pending_face_reviews(
         return rows_to_dicts(cursor.fetchall())
 
 
+def get_person_pending_face_reviews(
+    person_name: str,
+    limit: int = 50,
+    min_confidence: float = 0.90,
+) -> list[dict[str, Any]]:
+    """指定人物が1位候補の確認待ち顔を、信頼度順に取得する。"""
+    person_name = str(person_name or "").strip()
+    if not person_name:
+        return []
+
+    limit = max(1, min(int(limit), 100))
+    min_confidence = max(0.0, min(float(min_confidence), 1.0))
+
+    with closing(get_connection()) as connection:
+        cursor = connection.execute(
+            """
+            SELECT
+                photo_face_reviews.id AS review_id,
+                photo_face_reviews.face_id,
+                photo_faces.image_id,
+                photo_faces.face_index,
+                photo_face_candidates.person_id,
+                photo_face_candidates.confidence,
+                photo_face_candidates.candidate_rank,
+                photo_people.person_name,
+                photo_people.group_name AS person_group_name,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at,
+                photo_blogs.blog_url
+            FROM photo_face_reviews
+            INNER JOIN photo_faces
+                ON photo_face_reviews.face_id = photo_faces.id
+            INNER JOIN photo_face_candidates
+                ON photo_face_reviews.face_id = photo_face_candidates.face_id
+            INNER JOIN photo_people
+                ON photo_face_candidates.person_id = photo_people.id
+            INNER JOIN photo_images
+                ON photo_faces.image_id = photo_images.id
+            INNER JOIN photo_blogs
+                ON photo_images.blog_id = photo_blogs.id
+            WHERE photo_face_reviews.status = 'pending'
+              AND photo_face_candidates.candidate_rank = 1
+              AND photo_face_candidates.confidence >= ?
+              AND photo_people.person_name = ?
+            ORDER BY
+                photo_face_candidates.confidence DESC,
+                photo_face_reviews.id ASC
+            LIMIT ?
+            """,
+            (min_confidence, person_name, limit),
+        )
+        return rows_to_dicts(cursor.fetchall())
+
+
 def complete_face_reviews_bulk(
     items: list[dict[str, Any]],
     reviewed_by: str = "",
