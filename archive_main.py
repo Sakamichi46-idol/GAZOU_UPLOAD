@@ -12,6 +12,9 @@ from archive_checker import get_archive_targets
 from archive_config import (
     ARCHIVE_INTERVAL,
     SEND_DELAY,
+    archive_active_hours_text,
+    get_archive_local_now,
+    is_archive_active_time,
 )
 from archive_database import (
     archive_count,
@@ -392,6 +395,7 @@ PHOTO_AI_AUTO_INTERVAL = max(
 archive_cycle_lock = asyncio.Lock()
 ai_analysis_lock = asyncio.Lock()
 startup_initialized = False
+automatic_window_state: bool | None = None
 
 T = TypeVar("T")
 
@@ -422,6 +426,32 @@ def local_time_text(value: datetime | None) -> str:
 
 def log_event(level: str, message: str) -> None:
     print(f"[{level.upper()}] {message}")
+
+
+def automatic_archive_allowed(task_name: str) -> bool:
+    """自動タスクの時間帯制限を共通判定する。"""
+    global automatic_window_state
+
+    allowed = is_archive_active_time()
+
+    # 状態が切り替わった時だけログを出し、短い巡回間隔でもログを汚さない。
+    if automatic_window_state is None or automatic_window_state != allowed:
+        automatic_window_state = allowed
+        now_text = get_archive_local_now().strftime("%Y-%m-%d %H:%M:%S %Z")
+        if allowed:
+            log_event(
+                "INFO",
+                f"自動アーカイブ稼働時間に入りました: {now_text} / "
+                f"{archive_active_hours_text()}",
+            )
+        else:
+            log_event(
+                "INFO",
+                f"自動アーカイブは時間外のため待機します: {now_text} / "
+                f"{archive_active_hours_text()}",
+            )
+
+    return allowed
 
 
 async def run_with_retry(
@@ -1422,6 +1452,11 @@ async def on_ready() -> None:
     )
 
     print(
+        "自動アーカイブ稼働時間:",
+        archive_active_hours_text(),
+    )
+
+    print(
         "写真保存先:",
         get_photo_storage_path(),
     )
@@ -2260,6 +2295,9 @@ async def process_archive_blog(
 )
 async def archive_loop() -> None:
 
+    if not automatic_archive_allowed("ブログアーカイブ"):
+        return
+
     await run_archive_cycle()
 
 
@@ -2285,6 +2323,9 @@ async def archive_loop_error(
 )
 async def photo_archive_loop() -> None:
 
+    if not automatic_archive_allowed("写真アーカイブ"):
+        return
+
     await run_photo_archive_once()
 
 
@@ -2309,7 +2350,10 @@ async def photo_archive_loop_error(
     seconds=PHOTO_AI_AUTO_INTERVAL
 )
 async def ai_analysis_loop() -> None:
-    """pending画像がある時だけAI解析を実行する。"""
+    """稼働時間内にpending画像がある時だけAI解析を実行する。"""
+
+    if not automatic_archive_allowed("AI自動解析"):
+        return
 
     status = get_photo_ai_status()
 
