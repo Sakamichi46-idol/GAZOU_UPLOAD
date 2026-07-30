@@ -4052,3 +4052,109 @@ def get_ai_cost_summary(days: int | None = None) -> dict[str, Any]:
         "total": row_to_dict(total) or {},
         "models": rows_to_dicts(models),
     }
+
+# =========================
+# 高信頼度顔レビュー一括処理
+# =========================
+
+def get_high_confidence_pending_face_reviews(
+    limit: int = 20,
+    min_confidence: float = 0.95,
+) -> list[dict[str, Any]]:
+    """確認待ちの顔から、1位候補が指定信頼度以上の項目を取得する。"""
+    limit = max(1, min(int(limit), 100))
+    min_confidence = max(0.0, min(float(min_confidence), 1.0))
+
+    with closing(get_connection()) as connection:
+        cursor = connection.execute(
+            """
+            SELECT
+                photo_face_reviews.id AS review_id,
+                photo_face_reviews.face_id,
+                photo_faces.image_id,
+                photo_faces.face_index,
+                photo_face_candidates.person_id,
+                photo_face_candidates.confidence,
+                photo_face_candidates.candidate_rank,
+                photo_people.person_name,
+                photo_people.group_name AS person_group_name,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at,
+                photo_blogs.blog_url
+            FROM photo_face_reviews
+            INNER JOIN photo_faces
+                ON photo_face_reviews.face_id = photo_faces.id
+            INNER JOIN photo_face_candidates
+                ON photo_face_reviews.face_id = photo_face_candidates.face_id
+            INNER JOIN photo_people
+                ON photo_face_candidates.person_id = photo_people.id
+            INNER JOIN photo_images
+                ON photo_faces.image_id = photo_images.id
+            INNER JOIN photo_blogs
+                ON photo_images.blog_id = photo_blogs.id
+            WHERE photo_face_reviews.status = 'pending'
+              AND photo_face_candidates.candidate_rank = 1
+              AND photo_face_candidates.confidence >= ?
+            ORDER BY
+                photo_face_candidates.confidence DESC,
+                photo_face_reviews.id ASC
+            LIMIT ?
+            """,
+            (min_confidence, limit),
+        )
+        return rows_to_dicts(cursor.fetchall())
+
+
+def complete_face_reviews_bulk(
+    items: list[dict[str, Any]],
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> int:
+    """顔レビューを1トランザクションで一括確定する。"""
+    if not items:
+        return 0
+
+    now = utc_now_text()
+    completed = 0
+
+    with closing(get_connection()) as connection:
+        for item in items:
+            face_id = int(item["face_id"])
+            person_id = int(item["person_id"])
+
+            cursor = connection.execute(
+                """
+                UPDATE photo_face_reviews
+                SET status = 'completed',
+                    selected_person_id = ?,
+                    reviewed_by = ?,
+                    review_note = ?,
+                    reviewed_at = ?,
+                    updated_at = ?
+                WHERE face_id = ?
+                  AND status = 'pending'
+                """,
+                (person_id, reviewed_by, review_note, now, now, face_id),
+            )
+            if cursor.rowcount <= 0:
+                continue
+
+            connection.execute(
+                """
+                UPDATE photo_faces
+                SET confirmed_person_id = ?,
+                    confirmation_status = 'manually_confirmed',
+                    confirmed_by = ?,
+                    confirmed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (person_id, reviewed_by, now, now, face_id),
+            )
+            completed += 1
+
+        connection.commit()
+
+    return completed
