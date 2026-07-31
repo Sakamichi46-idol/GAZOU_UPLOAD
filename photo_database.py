@@ -2892,6 +2892,38 @@ def skip_face_review(
         connection.commit()
 
 
+def get_face_debug_info(face_id: int) -> dict[str, Any] | None:
+    """顔IDから、元画像と顔レビューの保存状態をまとめて取得する。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                photo_faces.id AS face_id,
+                photo_faces.image_id,
+                photo_faces.face_index,
+                photo_faces.confirmation_status,
+                photo_face_reviews.status AS review_status,
+                photo_images.local_path,
+                photo_images.bucket_key,
+                photo_images.file_name,
+                photo_images.image_url,
+                photo_images.download_status,
+                photo_images.download_error,
+                photo_blogs.blog_url,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title
+            FROM photo_faces
+            JOIN photo_images ON photo_images.id = photo_faces.image_id
+            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            LEFT JOIN photo_face_reviews ON photo_face_reviews.face_id = photo_faces.id
+            WHERE photo_faces.id = ?
+            """,
+            (int(face_id),),
+        ).fetchone()
+        return row_to_dict(row)
+
+
 def get_pending_face_reviews(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -2921,7 +2953,11 @@ def get_pending_face_reviews(
                 photo_faces.box_height,
 
                 photo_images.local_path,
+                photo_images.bucket_key,
+                photo_images.file_name,
                 photo_images.image_url,
+                photo_images.download_status,
+                photo_images.download_error,
 
                 photo_blogs.blog_url,
                 photo_blogs.group_name,
