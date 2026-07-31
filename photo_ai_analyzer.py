@@ -5,6 +5,8 @@ import mimetypes
 import os
 import traceback
 import io
+import tempfile
+from contextlib import contextmanager
 
 from PIL import Image, ImageOps
 
@@ -12,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
+
+from bucket_storage import download_to_file
 
 from photo_database import (
     clear_ai_tags,
@@ -1334,6 +1338,38 @@ def save_analysis_result(
     }
 
 
+@contextmanager
+def materialize_analysis_image(image: dict[str, Any]):
+    """AI解析用画像をローカルまたはBucketから一時的に用意する。"""
+
+    local_path = normalize_text(image.get("local_path", ""))
+    if local_path and Path(local_path).is_file():
+        yield local_path
+        return
+
+    bucket_key = normalize_text(image.get("bucket_key", ""))
+    if not bucket_key:
+        if local_path:
+            raise FileNotFoundError(f"画像ファイルがありません: {local_path}")
+        raise ValueError("画像のlocal_pathとbucket_keyが両方空です。")
+
+    file_name = normalize_text(image.get("file_name", "")) or "analysis-image"
+    suffix = Path(file_name).suffix or mimetypes.guess_extension(
+        normalize_text(image.get("mime_type", ""))
+    ) or ".img"
+
+    with tempfile.TemporaryDirectory(prefix="photo-ai-") as temp_dir:
+        temp_path = str(Path(temp_dir) / f"image{suffix}")
+        download_to_file(key=bucket_key, file_path=temp_path)
+        validate_image_file(temp_path)
+        print(
+            "AI解析用画像をBucketから一時取得:",
+            f"image_id={image.get('id', '')}",
+            f"bucket_key={bucket_key}",
+        )
+        yield temp_path
+
+
 # =========================
 # 画像1枚の解析
 # =========================
@@ -1402,12 +1438,13 @@ def analyze_photo_image_sync(
                     "source_image_id": source_image_id,
                 }
 
-        analysis, raw_output, usage_data = (
-            request_photo_analysis(
-                image_path=image_path,
-                stored_mime_type=mime_type,
+        with materialize_analysis_image(image) as analysis_image_path:
+            analysis, raw_output, usage_data = (
+                request_photo_analysis(
+                    image_path=analysis_image_path,
+                    stored_mime_type=mime_type,
+                )
             )
-        )
 
         result = save_analysis_result(
             image_id=image_id,
