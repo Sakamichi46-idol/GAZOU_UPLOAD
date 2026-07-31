@@ -11,6 +11,7 @@ from photo_database import (
     search_photo_images_by_author,
     search_photo_images_by_blog,
     search_photo_images_by_person,
+    search_photo_images_by_person_with_candidates,
     search_photo_images_by_tag,
 )
 
@@ -291,9 +292,9 @@ async def send_photo_person_search_results(ctx, person_name: str, limit: int = D
     await _send_search(
         ctx,
         query=person_name,
-        search_label="確定人物検索",
+        search_label="人物検索（確認済み＋AI推定）",
         usage="!person 賀喜遥香",
-        search_function=search_photo_images_by_person,
+        search_function=search_photo_images_by_person_with_candidates,
         limit=limit,
     )
 
