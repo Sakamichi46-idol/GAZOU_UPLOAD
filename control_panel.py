@@ -89,23 +89,30 @@ async def invoke_existing_command(
         await _reply(interaction, f"⚠️ `{command_name}` コマンドが見つかりません。")
         return
 
-    # ボタンInteractionにはApplication Commandのdataがないため、
-    # Context.from_interaction(interaction) は ValueError になる。
-    # Contextを直接生成すれば、既存prefix commandのパーサーを再利用できる。
-    message = interaction.message
-    if message is None:
-        # Modal送信時などmessageが無い場合の最小限のMessage互換オブジェクト。
-        class _PanelMessage:
-            def __init__(self) -> None:
-                self.author = interaction.user
-                self.channel = interaction.channel
-                self.guild = interaction.guild
-                self.content = f"!{command_name} {raw_arguments}".rstrip()
-                self.attachments = []
-                self.id = int(getattr(interaction, "id", 0))
-                self._state = getattr(bot, "_connection", None)
+    # ボタンInteractionの interaction.message は、パネルを送信したBot自身が
+    # author になっている。そのMessageをそのままContextへ渡すと、ctx.authorも
+    # Botになり、顔レビューなどの「開始者本人」判定が必ず失敗する。
+    #
+    # 元Messageの属性は可能な限り委譲しつつ、author/content/channel/guildだけを
+    # Interaction実行者の情報で上書きしたMessage互換オブジェクトを使用する。
+    class _PanelMessage:
+        def __init__(self, original: object | None) -> None:
+            self._original = original
+            self.author = interaction.user
+            self.channel = interaction.channel
+            self.guild = interaction.guild
+            self.content = f"!{command_name} {raw_arguments}".rstrip()
+            self.attachments = list(getattr(original, "attachments", []) or [])
+            self.id = int(getattr(interaction, "id", 0))
+            self._state = getattr(bot, "_connection", None)
 
-        message = _PanelMessage()  # type: ignore[assignment]
+        def __getattr__(self, name: str):
+            original = object.__getattribute__(self, "_original")
+            if original is None:
+                raise AttributeError(name)
+            return getattr(original, name)
+
+    message = _PanelMessage(interaction.message)
 
     ctx = commands.Context(
         message=message,
