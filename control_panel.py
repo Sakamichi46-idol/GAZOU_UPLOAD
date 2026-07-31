@@ -370,6 +370,12 @@ class AdminPanelView(discord.ui.View):
         await _reply(interaction, "🛠️ 管理操作を選んでください。", ephemeral=True)
         await interaction.followup.send("管理クイックメニュー", view=AdminQuickView(), ephemeral=True)
 
+    @discord.ui.button(label="選択式管理", emoji="🧭", style=discord.ButtonStyle.success, custom_id="photo:admin:guided")
+    async def guided(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from admin_workflow import make_admin_category_view
+        await _reply(interaction, "🧭 管理カテゴリーを選択してください。", ephemeral=True)
+        await interaction.followup.send("選択式管理メニュー", view=make_admin_category_view(), ephemeral=True)
+
     @discord.ui.button(label="全コマンド", emoji="⌨️", style=discord.ButtonStyle.danger, custom_id="photo:admin:all_commands")
     async def all_commands(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(AdminCommandModal())
