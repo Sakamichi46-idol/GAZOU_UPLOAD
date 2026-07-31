@@ -12,6 +12,7 @@ from local_face_recognition import (
     get_face_crop_bytes,
     suggest_face_candidates,
 )
+from photo_image_repair import repair_photo_image
 from photo_database import (
     complete_face_review,
     get_face_candidates,
@@ -262,18 +263,38 @@ async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
         try:
             data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
         except FileNotFoundError as error:
-            # 取得不能な古い顔データが先頭に残り続け、レビュー全体が止まらないよう保留へ移す。
-            await asyncio.to_thread(
-                skip_face_review,
-                int(review["face_id"]),
-                "system: unavailable source image",
-                f"確認画像を取得できないため自動保留: {type(error).__name__}: {error}",
-            )
-            await ctx.send(
-                f"⚠️ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）は元画像を取得できないため、"
-                f"自動的に保留へ移しました。\n`{type(error).__name__}: {error}`"
-            )
-            continue
+            # 保存情報が欠けた古い画像は、元URLまたは元記事から自動修復して一度だけ再試行する。
+            repair_result = await repair_photo_image(int(review["image_id"]))
+            if repair_result.get("success"):
+                try:
+                    data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
+                    await ctx.send(
+                        f"🔧 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）の元画像を"
+                        "自動修復しました。"
+                    )
+                except Exception as retry_error:
+                    error = retry_error
+                else:
+                    error = None
+
+            if error is not None:
+                # 修復不能な古い顔データが先頭に残り続け、レビュー全体が止まらないよう保留へ移す。
+                repair_error = str(repair_result.get("error") or "修復できませんでした。")
+                await asyncio.to_thread(
+                    skip_face_review,
+                    int(review["face_id"]),
+                    "system: unavailable source image",
+                    (
+                        f"確認画像を取得できず自動修復にも失敗したため保留: "
+                        f"{type(error).__name__}: {error} / repair: {repair_error}"
+                    ),
+                )
+                await ctx.send(
+                    f"⚠️ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）は元画像の"
+                    "自動修復にも失敗したため、保留へ移しました。\n"
+                    f"`{repair_error[:1200]}`"
+                )
+                continue
         except Exception as error:
             await ctx.send(
                 f"❌ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）の確認画像を作成できませんでした: "
