@@ -4511,3 +4511,98 @@ def complete_face_reviews_bulk(
         connection.commit()
 
     return completed
+
+# =========================
+# ZIP42: 管理画面・推定人物検索・ブログ単位処理
+# =========================
+
+def search_photo_images_by_person_with_candidates(person_name: str, limit: int = 20) -> list[dict[str, Any]]:
+    """確認済みに加え、AI人物候補・顔認証候補も含めて人物検索する。"""
+    clean_name = str(person_name or '').strip()
+    if not clean_name:
+        return []
+    pattern = f'%{clean_name}%'
+    return _search_photo_images_with_where(
+        """
+        EXISTS (
+            SELECT 1 FROM photo_image_people pip
+            WHERE pip.image_id = photo_images.id
+              AND pip.person_name LIKE ?
+              AND pip.relation_status IN ('confirmed', 'candidate')
+        )
+        OR EXISTS (
+            SELECT 1
+            FROM photo_faces pf
+            JOIN photo_face_candidates pfc ON pfc.face_id = pf.id
+            JOIN photo_people pp ON pp.id = pfc.person_id
+            WHERE pf.image_id = photo_images.id
+              AND pp.person_name LIKE ?
+              AND pfc.candidate_rank = 1
+        )
+        """,
+        (pattern, pattern),
+        limit=limit,
+    )
+
+
+def get_blog_authors_for_admin(group_name: str = '', limit: int = 25) -> list[dict[str, Any]]:
+    group_name = str(group_name or '').strip()
+    params: list[Any] = []
+    where = "WHERE member_name <> ''"
+    if group_name:
+        where += " AND group_name = ?"
+        params.append(group_name)
+    params.append(max(1, min(int(limit), 25)))
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT member_name, group_name, COUNT(*) AS blog_count,
+                   MAX(published_at) AS latest_published_at
+            FROM photo_blogs
+            {where}
+            GROUP BY group_name, member_name
+            ORDER BY latest_published_at DESC, member_name ASC
+            LIMIT ?
+            """, tuple(params)
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_blogs_for_admin(group_name: str, member_name: str, limit: int = 25) -> list[dict[str, Any]]:
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT pb.id, pb.group_name, pb.member_name, pb.title, pb.published_at,
+                   pb.blog_url, COUNT(pi.id) AS image_count,
+                   SUM(CASE WHEN pi.analysis_status IN ('completed','review') THEN 1 ELSE 0 END) AS analyzed_count,
+                   SUM(CASE WHEN pfs.status = 'completed' THEN 1 ELSE 0 END) AS face_scanned_count
+            FROM photo_blogs pb
+            LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+            LEFT JOIN photo_face_scans pfs ON pfs.image_id = pi.id
+            WHERE pb.group_name = ? AND pb.member_name = ?
+            GROUP BY pb.id
+            ORDER BY pb.published_at DESC, pb.id DESC
+            LIMIT ?
+            """, (str(group_name), str(member_name), max(1, min(int(limit), 25)))
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_blog_image_ids(blog_id: int, *, only_unanalyzed: bool = False, only_unscanned: bool = False) -> list[int]:
+    clauses = ["pi.blog_id = ?", "pi.download_status = 'completed'", "(pi.local_path <> '' OR pi.bucket_key <> '')"]
+    params: list[Any] = [int(blog_id)]
+    if only_unanalyzed:
+        clauses.append("pi.analysis_status NOT IN ('completed','review')")
+    if only_unscanned:
+        clauses.append("(pfs.image_id IS NULL OR pfs.status <> 'completed')")
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            f"""
+            SELECT pi.id
+            FROM photo_images pi
+            LEFT JOIN photo_face_scans pfs ON pfs.image_id = pi.id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY pi.image_index ASC, pi.id ASC
+            """, tuple(params)
+        ).fetchall()
+    return [int(row['id']) for row in rows]
