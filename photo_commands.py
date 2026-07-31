@@ -51,7 +51,12 @@ from photo_review_view import (
     send_person_review_batch,
     send_skipped_person_review_batch,
 )
-from photo_tag_explorer import send_photo_tag_explorer
+from photo_tag_explorer import (
+    CATEGORY_DEFS,
+    get_tag_category_summary,
+    get_uncategorized_tag_summary,
+    send_photo_tag_explorer,
+)
 from photo_face_review_view import (
     send_face_review_batch,
     send_fast_face_review,
@@ -316,6 +321,68 @@ def register_photo_commands(bot: commands.Bot) -> None:
     async def photo_tags_command(ctx: commands.Context) -> None:
         """ボタンと選択メニューで写真タグを絞り込む。"""
         await send_photo_tag_explorer(ctx)
+
+    async def _send_text_lines_chunked(
+        ctx: commands.Context,
+        title: str,
+        lines: list[str],
+    ) -> None:
+        """Discordの文字数上限を超えないよう、行単位で分割して送信する。"""
+        current = title
+        continuation = title.rstrip() + "（続き）\n"
+        for line in lines:
+            addition = ("" if current.endswith("\n") else "\n") + line
+            if len(current) + len(addition) > 1900:
+                await ctx.send(current)
+                current = continuation + line
+            else:
+                current += addition
+        if current.strip():
+            await ctx.send(current)
+
+    @bot.command(name="tag_category_list")
+    @commands.is_owner()
+    async def tag_category_list_command(ctx: commands.Context) -> None:
+        """現在登録されているタグをカテゴリー別・使用画像数付きで表示する。"""
+        summary = await asyncio.to_thread(get_tag_category_summary)
+        lines: list[str] = []
+        for category, (emoji, label) in CATEGORY_DEFS.items():
+            tags = summary.get(category, [])
+            if not tags:
+                continue
+            if lines:
+                lines.append("")
+            lines.append(f"{emoji} **{label}**")
+            lines.extend(f"・{tag}（{count}枚）" for tag, count in tags)
+
+        if not lines:
+            await ctx.send("🏷️ 登録タグはまだありません。")
+            return
+
+        await _send_text_lines_chunked(
+            ctx,
+            "🏷️ **登録タグ一覧（カテゴリー別）**\n",
+            lines,
+        )
+
+    @bot.command(name="uncategorized_tags")
+    @commands.is_owner()
+    async def uncategorized_tags_command(ctx: commands.Context) -> None:
+        """カテゴリーが空欄・manual・未知値のタグだけを表示する。"""
+        rows = await asyncio.to_thread(get_uncategorized_tag_summary)
+        if not rows:
+            await ctx.send("✅ 未分類タグはありません。")
+            return
+
+        lines = [
+            f"・{tag}（{count}枚 / 元カテゴリー: `{category or '空欄'}`）"
+            for category, tag, count in rows
+        ]
+        await _send_text_lines_chunked(
+            ctx,
+            "⚠️ **未分類タグ一覧**\n",
+            lines,
+        )
 
     @bot.command(name="photo_search", aliases=["search"])
     async def photo_search_command(ctx: commands.Context, *, query: str = "") -> None:
