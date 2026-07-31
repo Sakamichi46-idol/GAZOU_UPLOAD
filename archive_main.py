@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
 import aiohttp
@@ -46,6 +47,7 @@ from photo_image_downloader import (
     download_blog_images,
     get_photo_storage_path,
 )
+from bucket_storage import STORAGE_MODE, bucket_is_configured
 from low_egress_media import (
     IMAGE_EMBEDS_PER_MESSAGE,
     LOW_EGRESS_MODE,
@@ -1997,15 +1999,39 @@ async def photo_storage_command(
 
     storage_path = get_photo_storage_path()
 
+    storage_mode_label = {
+        "bucket": "Bucket",
+        "dual": "Bucket + Volume",
+        "local": "Volume",
+    }.get(STORAGE_MODE, STORAGE_MODE or "不明")
+
+    try:
+        local_size = await asyncio.to_thread(
+            lambda: sum(
+                file.stat().st_size
+                for file in Path(storage_path).rglob("*")
+                if file.is_file()
+            )
+        )
+    except Exception:
+        local_size = 0
+
+    bucket_note = (
+        "設定済み" if bucket_is_configured() else "未設定"
+    )
+
     await ctx.send(
         "💾 **写真保存状況**\n"
-        f"保存先: `{storage_path}`\n"
+        f"保存モード: **{storage_mode_label}** "
+        f"（Bucket: {bucket_note}）\n"
+        f"一時保存先: `{storage_path}`\n"
         f"画像総数: **{stats.get('total_images', 0)}件**\n"
         f"保存完了: **{stats.get('completed', 0)}件**\n"
         f"保存待ち: **{stats.get('pending', 0)}件**\n"
         f"保存失敗: **{stats.get('failed', 0)}件**\n"
-        "合計容量: "
-        f"**{format_bytes(stats.get('total_size', 0))}**"
+        "DB記録上の累計サイズ: "
+        f"**{format_bytes(stats.get('total_size', 0))}**\n"
+        f"現在のローカル使用量: **{format_bytes(local_size)}**"
     )
 
 
