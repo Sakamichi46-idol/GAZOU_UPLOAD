@@ -37,6 +37,7 @@ from photo_database import (
     save_manual_tag,
 )
 from photo_image_downloader import download_photo_image
+from photo_image_repair import repair_photo_image
 from photo_search import (
     send_photo_author_search_results,
     send_photo_blog_search_results,
@@ -564,6 +565,74 @@ def register_photo_commands(bot: commands.Bot) -> None:
         lines.append("※ OpenAI APIは使用していません。候補は必ず人間が確認してください。")
         await ctx.send("\n".join(lines)[:1900])
 
+
+    @bot.command(name="photo_repair_metadata")
+    @commands.is_owner()
+    async def photo_repair_metadata_command(
+        ctx: commands.Context,
+        limit: int = 20,
+    ) -> None:
+        """保存先情報がない画像を元URL・元記事から修復する。"""
+        limit = max(1, min(int(limit), 100))
+        targets = await asyncio.to_thread(
+            _rows,
+            """
+            SELECT photo_images.id
+            FROM photo_images
+            WHERE COALESCE(TRIM(photo_images.local_path), '') = ''
+              AND COALESCE(TRIM(photo_images.bucket_key), '') = ''
+            ORDER BY photo_images.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        if not targets:
+            await ctx.send("✅ 修復対象の画像はありません。")
+            return
+
+        progress = await ctx.send(
+            f"🔧 画像情報を修復しています… 0/{len(targets)}"
+        )
+        success = 0
+        failed = 0
+        details: list[str] = []
+        async with aiohttp.ClientSession() as session:
+            for index, target in enumerate(targets, start=1):
+                image_id = int(target["id"])
+                try:
+                    result = await repair_photo_image(image_id, session=session)
+                except Exception as error:
+                    result = {
+                        "success": False,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+                if result.get("success"):
+                    success += 1
+                else:
+                    failed += 1
+                    details.append(
+                        f"ID {image_id}: {str(result.get('error') or '不明なエラー')[:180]}"
+                    )
+                if index == len(targets) or index % 5 == 0:
+                    try:
+                        await progress.edit(
+                            content=(
+                                f"🔧 画像情報を修復しています… {index}/{len(targets)}\n"
+                                f"✅ 成功 {success} / ❌ 失敗 {failed}"
+                            )
+                        )
+                    except discord.HTTPException:
+                        pass
+
+        message = (
+            f"🔧 **画像情報修復完了**\n"
+            f"対象: **{len(targets)}件** / 成功: **{success}件** / 失敗: **{failed}件**"
+        )
+        if details:
+            message += "\n\n" + "\n".join(details[:8])
+            if len(details) > 8:
+                message += f"\nほか **{len(details) - 8}件**"
+        await ctx.send(message[:1900])
 
     @bot.command(name="face_debug")
     @commands.is_owner()
