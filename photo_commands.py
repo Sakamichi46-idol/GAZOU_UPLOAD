@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import discord
@@ -31,6 +32,7 @@ from photo_database import (
     PHOTO_DB_PATH,
     reset_image_analysis_status,
     reset_image_download_status,
+    update_image_download_terminal_failure,
     save_manual_tag,
 )
 from photo_image_downloader import download_photo_image
@@ -136,6 +138,24 @@ def _update_redownload_image_url(image_id: int, image_url: str) -> None:
         connection.commit()
 
 
+def _is_supported_http_url(url: str) -> bool:
+    parsed = urlparse(str(url or "").strip())
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
+async def _mark_terminal_download_failure(
+    image_id: int,
+    status: str,
+    message: str,
+) -> None:
+    await asyncio.to_thread(
+        update_image_download_terminal_failure,
+        image_id,
+        status,
+        message,
+    )
+
+
 def _looks_like_not_found(error_message: str) -> bool:
     normalized = str(error_message or "").lower()
     return (
@@ -155,6 +175,17 @@ async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict
             "error": "画像IDが見つかりません。",
         }
 
+    original_url = str(record.get("image_url") or "").strip()
+    if not _is_supported_http_url(original_url):
+        message = f"不正な画像URLのため再試行対象から除外しました: {original_url[:300]}"
+        await _mark_terminal_download_failure(image_id, "invalid_url", message)
+        return {
+            "success": False,
+            "image_id": image_id,
+            "error": message,
+            "terminal_status": "invalid_url",
+        }
+
     await asyncio.to_thread(reset_image_download_status, image_id)
 
     async def attempt(image_url: str) -> dict[str, Any]:
@@ -169,7 +200,6 @@ async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict
             published_at=str(record["published_at"]),
         )
 
-    original_url = str(record.get("image_url") or "").strip()
     result = await attempt(original_url)
     if result.get("success"):
         result["recovered_by"] = "original_url"
@@ -210,8 +240,22 @@ async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict
         return result
 
     refreshed_url = str(refreshed_url).strip()
+    if not _is_supported_http_url(refreshed_url):
+        message = f"元記事から不正な画像URLが取得されました: {refreshed_url[:300]}"
+        await _mark_terminal_download_failure(image_id, "invalid_url", message)
+        result["refresh_error"] = message
+        result["terminal_status"] = "invalid_url"
+        return result
+
     if refreshed_url == original_url:
-        result["refresh_error"] = "元記事を再解析しても画像URLが変わりませんでした。"
+        message = "元記事を再解析しても画像URLが変わらず、元URLも404でした。"
+        await _mark_terminal_download_failure(
+            image_id,
+            "permanent_failed",
+            message,
+        )
+        result["refresh_error"] = message
+        result["terminal_status"] = "permanent_failed"
         return result
 
     print(
@@ -244,6 +288,18 @@ async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict
 
     refreshed_result["original_error"] = original_error
     refreshed_result["refreshed_url"] = refreshed_url
+    refreshed_error = str(refreshed_result.get("error") or "")
+    if _looks_like_not_found(refreshed_error):
+        message = (
+            "元記事の現在URLでも404だったため、再試行対象から除外しました。"
+        )
+        await _mark_terminal_download_failure(
+            image_id,
+            "permanent_failed",
+            message,
+        )
+        refreshed_result["refresh_error"] = message
+        refreshed_result["terminal_status"] = "permanent_failed"
     return refreshed_result
 
 
@@ -1034,6 +1090,8 @@ def register_photo_commands(bot: commands.Bot) -> None:
         await ctx.send(f"🔄 {len(targets)}件の再ダウンロードを開始します。")
         succeeded = 0
         reparsed = 0
+        invalid_urls = 0
+        permanent_failures = 0
         failures: list[str] = []
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1045,6 +1103,12 @@ def register_photo_commands(bot: commands.Bot) -> None:
                     if result.get("recovered_by") == "article_reparse":
                         reparsed += 1
                     continue
+
+                terminal_status = str(result.get("terminal_status") or "")
+                if terminal_status == "invalid_url":
+                    invalid_urls += 1
+                elif terminal_status == "permanent_failed":
+                    permanent_failures += 1
 
                 error_text = str(
                     result.get("refresh_error")
@@ -1064,6 +1128,10 @@ def register_photo_commands(bot: commands.Bot) -> None:
         )
         if reparsed:
             message += f"\n🔎 元記事の再解析で復旧: **{reparsed}件**"
+        if invalid_urls:
+            message += f"\n🚫 不正URLとして除外: **{invalid_urls}件**"
+        if permanent_failures:
+            message += f"\n⛔ 復旧不能として除外: **{permanent_failures}件**"
         if failures:
             detail_lines = failures[:8]
             if len(failures) > len(detail_lines):
