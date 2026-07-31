@@ -23,6 +23,7 @@ from photo_database import (
     confirm_face_person,
     complete_face_review,
     get_pending_face_reviews,
+    get_face_debug_info,
     set_confirmed_image_people,
     get_connection,
     get_photo_db_counts,
@@ -561,6 +562,42 @@ def register_photo_commands(bot: commands.Bot) -> None:
             ) or "候補なし"
             lines.append(f"顔ID **{item['face_id']}**: {text}")
         lines.append("※ OpenAI APIは使用していません。候補は必ず人間が確認してください。")
+        await ctx.send("\n".join(lines)[:1900])
+
+
+    @bot.command(name="face_debug")
+    @commands.is_owner()
+    async def face_debug_command(ctx: commands.Context, face_id: int) -> None:
+        """顔IDから元画像・保存先・レビュー状態を確認する。"""
+        info = await asyncio.to_thread(get_face_debug_info, face_id)
+        if not info:
+            await ctx.send(f"⚠️ 顔ID **{face_id}** は見つかりません。")
+            return
+
+        local_path = str(info.get("local_path") or "").strip()
+        bucket_key = str(info.get("bucket_key") or "").strip()
+        image_url = str(info.get("image_url") or "").strip()
+        local_exists = bool(local_path and os.path.isfile(local_path))
+        parsed = urlparse(image_url)
+        http_url = parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+        lines = [
+            f"🔎 **顔ID {face_id} の診断情報**",
+            f"顔ID: **{info.get('face_id')}** / 画像ID: **{info.get('image_id')}** / 顔番号: **{info.get('face_index')}**",
+            f"顔確定状態: `{info.get('confirmation_status') or '不明'}`",
+            f"レビュー状態: `{info.get('review_status') or 'なし'}`",
+            f"画像DL状態: `{info.get('download_status') or '不明'}`",
+            f"ローカル画像: {'✅ 存在' if local_exists else '❌ なし'}",
+            f"Bucketキー: `{bucket_key or 'なし'}`",
+            f"HTTP画像URL: {'✅ あり' if http_url else '❌ なしまたは無効'}",
+            f"記事: {info.get('group_name') or '不明'} / {info.get('member_name') or '不明'}",
+        ]
+        if info.get("download_error"):
+            lines.append(f"DLエラー: `{str(info.get('download_error'))[:500]}`")
+        if image_url:
+            lines.append(f"画像URL: <{image_url}>")
+        if info.get("blog_url"):
+            lines.append(f"ブログURL: <{info.get('blog_url')}>")
         await ctx.send("\n".join(lines)[:1900])
 
     @bot.command(name="face_info")
