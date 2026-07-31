@@ -166,6 +166,7 @@ class ReviewSession:
         group_name: str = "",
         continuous: bool = False,
         require_final_confirmation: bool = False,
+        fixed_blog_id: int | None = None,
     ):
         self.destination = destination
         self.owner_id = owner_id
@@ -174,7 +175,8 @@ class ReviewSession:
         self.group_name = normalize_text(group_name)
         self.continuous = bool(continuous)
         self.require_final_confirmation = bool(require_final_confirmation)
-        self.current_blog_id: int | None = None
+        self.current_blog_id: int | None = int(fixed_blog_id) if fixed_blog_id is not None else None
+        self.fixed_blog_id: int | None = int(fixed_blog_id) if fixed_blog_id is not None else None
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
         self.message_by_image_id: dict[int, discord.Message] = {}
@@ -214,6 +216,11 @@ class ReviewSession:
                 self.batch_size,
                 self.current_blog_id,
             )
+
+        if not reviews and self.fixed_blog_id is not None:
+            await self.send_message("✅ このブログには人物確認待ちの写真がありません。")
+            self.stopped = True
+            return 0
 
         if not reviews:
             first = await asyncio.to_thread(self.get_reviews, 1, None)
@@ -256,7 +263,7 @@ class ReviewSession:
                 1,
                 self.current_blog_id,
             )
-        if not same_blog_remaining:
+        if not same_blog_remaining and self.fixed_blog_id is None:
             self.current_blog_id = None
 
         if self.continuous:
@@ -902,3 +909,28 @@ async def send_skipped_person_review_batch(
         queue_status="skipped",
         group_name=group_name,
     )
+
+async def send_blog_person_review_batch(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    blog_id: int,
+    limit: int = 5,
+    *,
+    continuous: bool = True,
+    require_final_confirmation: bool = True,
+) -> int:
+    """指定ブログだけを対象に人物確認レビューを開始する。"""
+    owner = getattr(destination, "author", None) or getattr(destination, "user", None)
+    owner_id = int(getattr(owner, "id", 0) or 0)
+    session = ReviewSession(
+        destination,
+        owner_id=owner_id,
+        batch_size=max(1, min(int(limit), 10)),
+        queue_status="pending",
+        continuous=continuous,
+        require_final_confirmation=require_final_confirmation,
+        fixed_blog_id=int(blog_id),
+    )
+    count = await session.start_batch()
+    # 指定記事に対象がないとき、通常のstart_batchは次の記事へ移るため、
+    # 呼び出し後に別記事へ切り替わっていないかを防ぐ。
+    return count
