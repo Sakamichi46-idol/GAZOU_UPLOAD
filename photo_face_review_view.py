@@ -249,7 +249,9 @@ class FaceReviewView(discord.ui.View):
 async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
     """確認待ちの顔を、切り出し画像と操作UI付きで送る。"""
     limit = max(1, min(int(limit), 5))
-    reviews = await asyncio.to_thread(get_pending_face_reviews, limit)
+    # 取得不能な古いレビューを飛ばしても、要求件数ぶん表示できるよう多めに取得する。
+    fetch_limit = min(max(limit * 10, 20), 100)
+    reviews = await asyncio.to_thread(get_pending_face_reviews, fetch_limit)
     if not reviews:
         await ctx.send("✅ 顔の確認待ちはありません。")
         return 0
@@ -259,9 +261,22 @@ async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
         candidates = await _load_candidates(review)
         try:
             data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
+        except FileNotFoundError as error:
+            # 取得不能な古い顔データが先頭に残り続け、レビュー全体が止まらないよう保留へ移す。
+            await asyncio.to_thread(
+                skip_face_review,
+                int(review["face_id"]),
+                "system: unavailable source image",
+                f"確認画像を取得できないため自動保留: {type(error).__name__}: {error}",
+            )
+            await ctx.send(
+                f"⚠️ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）は元画像を取得できないため、"
+                f"自動的に保留へ移しました。\n`{type(error).__name__}: {error}`"
+            )
+            continue
         except Exception as error:
             await ctx.send(
-                f"❌ 顔ID **{review['face_id']}** の確認画像を作成できませんでした: "
+                f"❌ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）の確認画像を作成できませんでした: "
                 f"`{type(error).__name__}: {error}`"
             )
             continue
@@ -275,6 +290,8 @@ async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
         )
         view.message = message
         sent += 1
+        if sent >= limit:
+            break
     return sent
 
 
