@@ -13,6 +13,7 @@ from local_face_recognition import (
     suggest_face_candidates,
 )
 from photo_image_repair import repair_photo_image
+from sakamichi_members import SAKAMICHI_MEMBERS
 from photo_database import (
     complete_face_review,
     get_face_candidates,
@@ -59,7 +60,7 @@ def build_face_review_embed(
 ) -> discord.Embed:
     embed = discord.Embed(
         title="👤 顔の人物確認",
-        description="候補を選ぶか、別の人物名を入力して確定してください。候補はローカル処理による参考値です。",
+        description="候補・投稿者ボタン、またはメンバー選択メニューから確定してください。候補はローカル処理による参考値です。",
         color=discord.Color.blue(),
     )
     embed.add_field(name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
@@ -77,7 +78,7 @@ def build_face_review_embed(
         ]
         candidate_text = "\n".join(lines)
     else:
-        candidate_text = "一致閾値を超えた候補はありません。別人物入力または投稿者ボタンを使ってください。"
+        candidate_text = "一致閾値を超えた候補はありません。メンバー選択または投稿者ボタンを使ってください。"
     embed.add_field(name="ローカル顔候補", value=candidate_text, inline=False)
 
     if review.get("blog_url"):
@@ -157,6 +158,146 @@ class CandidateSelect(discord.ui.Select):
         )
 
 
+class FaceMemberSelectionState:
+    """顔レビュー用の階層式メンバー選択状態。"""
+
+    def __init__(self, parent_view: "FaceReviewView") -> None:
+        self.parent_view = parent_view
+        self.owner_id = parent_view.owner_id
+        self.group_name = ""
+        self.generation_name = ""
+
+
+def _face_selection_text(state: FaceMemberSelectionState) -> str:
+    lines = ["👤 **顔に写っているメンバーを選択してください。**"]
+    if state.group_name:
+        lines.append(f"グループ: **{discord.utils.escape_markdown(state.group_name)}**")
+    if state.generation_name:
+        lines.append(f"期・区分: **{discord.utils.escape_markdown(state.generation_name)}**")
+    return "\n".join(lines)
+
+
+class FaceMemberOwnedView(discord.ui.View):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        super().__init__(timeout=300)
+        self.state = state
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.state.owner_id:
+            await interaction.response.send_message(
+                "このメンバー選択は顔レビューを開始した本人だけが操作できます。",
+                ephemeral=True,
+            )
+            return False
+        if self.state.parent_view.finished:
+            await interaction.response.send_message(
+                "この顔レビューはすでに完了しています。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+
+class FaceGroupSelect(discord.ui.Select):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        options = [discord.SelectOption(label=name, value=name) for name in SAKAMICHI_MEMBERS]
+        super().__init__(
+            placeholder="グループを選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.state.group_name = self.values[0]
+        self.state.generation_name = ""
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceGenerationView(self.state),
+        )
+
+
+class FaceGroupView(FaceMemberOwnedView):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        super().__init__(state)
+        self.add_item(FaceGroupSelect(state))
+
+
+class FaceGenerationSelect(discord.ui.Select):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        generations = SAKAMICHI_MEMBERS[state.group_name]
+        options = [discord.SelectOption(label=name, value=name) for name in generations]
+        super().__init__(
+            placeholder="期・区分を選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.state.generation_name = self.values[0]
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceMemberView(self.state),
+        )
+
+
+class FaceGenerationView(FaceMemberOwnedView):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        super().__init__(state)
+        self.add_item(FaceGenerationSelect(state))
+
+    @discord.ui.button(label="グループへ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.group_name = ""
+        self.state.generation_name = ""
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceGroupView(self.state),
+        )
+
+
+class FaceMemberSelect(discord.ui.Select):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        names = SAKAMICHI_MEMBERS[state.group_name][state.generation_name]
+        options = [discord.SelectOption(label=name, value=name) for name in names]
+        super().__init__(
+            placeholder="メンバーを選択して確定",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.state.parent_view.complete_from_member_select(interaction, self.values[0])
+
+
+class FaceMemberView(FaceMemberOwnedView):
+    def __init__(self, state: FaceMemberSelectionState) -> None:
+        super().__init__(state)
+        self.add_item(FaceMemberSelect(state))
+
+    @discord.ui.button(label="別の期・区分へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def generation(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.generation_name = ""
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceGenerationView(self.state),
+        )
+
+    @discord.ui.button(label="別グループへ戻る", emoji="🌳", style=discord.ButtonStyle.secondary, row=1)
+    async def group(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.group_name = ""
+        self.state.generation_name = ""
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceGroupView(self.state),
+        )
+
+
 class FaceReviewView(discord.ui.View):
     def __init__(
         self,
@@ -206,6 +347,41 @@ class FaceReviewView(discord.ui.View):
         embed = build_completed_embed(self.review, person_name, interaction.user)
         await interaction.response.edit_message(embed=embed, view=None)
 
+
+    async def complete_from_member_select(
+        self,
+        interaction: discord.Interaction,
+        person_name: str,
+    ) -> None:
+        """階層式セレクトメニューで選ばれた人物を確定し、元レビューも更新する。"""
+        person = await asyncio.to_thread(get_person_by_name, person_name)
+        if not person:
+            await interaction.response.send_message(
+                f"⚠️ 人物マスターに **{discord.utils.escape_markdown(person_name)}** が見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        await asyncio.to_thread(
+            complete_face_review,
+            int(self.review["face_id"]),
+            int(person["id"]),
+            _reviewer(interaction.user),
+            "階層式メンバー選択メニュー",
+        )
+        self.finished = True
+        self.stop()
+        embed = build_completed_embed(self.review, _text(person["person_name"]), interaction.user)
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+        await interaction.response.edit_message(
+            content=f"✅ **{discord.utils.escape_markdown(_text(person['person_name']))}** で確定しました。",
+            view=None,
+        )
+
     @discord.ui.button(label="投稿者で確定", emoji="📝", style=discord.ButtonStyle.primary, row=1)
     async def author_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         member_name = _text(self.review.get("member_name"))
@@ -218,9 +394,14 @@ class FaceReviewView(discord.ui.View):
             return
         await self.complete(interaction, int(person["id"]), _text(person["person_name"]), "ブログ投稿者ボタン")
 
-    @discord.ui.button(label="別人物を入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="別人物を選択", emoji="👥", style=discord.ButtonStyle.secondary, row=1)
     async def other_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(FacePersonModal(self))
+        state = FaceMemberSelectionState(self)
+        await interaction.response.send_message(
+            _face_selection_text(state),
+            view=FaceGroupView(state),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="今回は保留", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
     async def skip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
