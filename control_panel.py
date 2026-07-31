@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Iterable
 
 import discord
@@ -143,6 +144,24 @@ async def invoke_existing_command(
         await _reply(interaction, f"⚠️ 操作中にエラーが発生しました。\n`{type(error).__name__}: {error}`")
 
 
+_IMAGE_ID_COMMANDS = {"photo_id", "favorite_add", "favorite_remove"}
+
+
+def normalize_image_id_argument(value: str) -> str:
+    """画像ID入力を既存コマンドが受け取れる数字文字列へ正規化する。
+
+    対応例: ``100`` / ``ID 100`` / ``ID:100`` / ``画像ID：100``。
+    数字が複数含まれる曖昧な入力は、そのまま返してコマンド側の
+    引数エラーに任せる。
+    """
+    text = str(value or "").strip()
+    match = re.fullmatch(
+        r"(?i)\s*(?:(?:画像\s*)?id\s*[:：#]?\s*)?(\d+)\s*",
+        text,
+    )
+    return match.group(1) if match else text
+
+
 class CommandArgumentsModal(discord.ui.Modal):
     def __init__(
         self,
@@ -166,10 +185,14 @@ class CommandArgumentsModal(discord.ui.Modal):
         self.add_item(self.arguments)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        arguments = str(self.arguments.value)
+        if self.command_name in _IMAGE_ID_COMMANDS:
+            arguments = normalize_image_id_argument(arguments)
+
         await invoke_existing_command(
             interaction,
             self.command_name,
-            str(self.arguments.value),
+            arguments,
             admin_required=self.admin_required,
         )
 
@@ -206,14 +229,14 @@ class FavoriteView(discord.ui.View):
     async def add(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CommandArgumentsModal(
             title="お気に入り追加", command_name="favorite_add",
-            label="画像ID", placeholder="例: 125", required=True,
+            label="画像ID", placeholder="例: 125 / ID 125", required=True,
         ))
 
     @discord.ui.button(label="削除", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def remove(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CommandArgumentsModal(
             title="お気に入り削除", command_name="favorite_remove",
-            label="画像ID", placeholder="例: 125", required=True,
+            label="画像ID", placeholder="例: 125 / ID 125", required=True,
         ))
 
     @discord.ui.button(label="一覧", emoji="📂", style=discord.ButtonStyle.primary)
@@ -241,16 +264,14 @@ class UserPanelView(discord.ui.View):
 
     @discord.ui.button(label="タグで探す", emoji="🏷️", style=discord.ButtonStyle.primary, custom_id="photo:user:tag")
     async def tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(CommandArgumentsModal(
-            title="タグで写真検索", command_name="tag",
-            label="タグ", placeholder="例: 制服", required=True,
-        ))
+        # DBに存在するカテゴリー → タグの順で選べる検索画面を開く。
+        await invoke_existing_command(interaction, "photo_tags")
 
     @discord.ui.button(label="画像ID", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id="photo:user:id")
     async def image_id(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CommandArgumentsModal(
             title="画像IDから表示", command_name="photo_id",
-            label="画像ID", placeholder="例: 125", required=True,
+            label="画像ID", placeholder="例: 125 / ID 125", required=True,
         ))
 
     @discord.ui.button(label="お気に入り", emoji="⭐", style=discord.ButtonStyle.success, custom_id="photo:user:favorites")
@@ -261,10 +282,6 @@ class UserPanelView(discord.ui.View):
     @discord.ui.button(label="最近の写真", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="photo:user:recent")
     async def recent(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "photo_recent", "10")
-
-    @discord.ui.button(label="統計", emoji="📊", style=discord.ButtonStyle.secondary, custom_id="photo:user:stats")
-    async def stats(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "photo_stats")
 
     @discord.ui.button(label="人物一覧", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="photo:user:people")
     async def people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
