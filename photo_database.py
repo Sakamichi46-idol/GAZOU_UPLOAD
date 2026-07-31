@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
+from photo_search_tags import searchable_aliases
+
 
 # =========================
 # データベース設定
@@ -3623,27 +3625,37 @@ def search_photo_images_by_person(person_name: str, limit: int = 20) -> list[dic
 
 
 def search_photo_images_by_tag(tag: str, limit: int = 20) -> list[dict[str, Any]]:
-    """AIタグと手動タグを横断して検索する。"""
+    """AIタグと手動タグを、検索用タグの同義語も含めて横断検索する。"""
 
-    clean_tag = str(tag or '').strip()
-    if not clean_tag:
+    aliases = searchable_aliases(tag)
+    if not aliases:
         return []
 
-    like_value = f'%{clean_tag}%'
-    return _search_photo_images_with_where(
-        """
+    ai_clauses = []
+    manual_clauses = []
+    params: list[str] = []
+    for alias in aliases:
+        ai_clauses.append("photo_ai_tags.tag LIKE ?")
+        params.append(f"%{alias}%")
+    for alias in aliases:
+        manual_clauses.append("photo_manual_tags.tag LIKE ?")
+        params.append(f"%{alias}%")
+
+    where_sql = f"""
         EXISTS (
             SELECT 1 FROM photo_ai_tags
             WHERE photo_ai_tags.image_id = photo_images.id
-              AND photo_ai_tags.tag LIKE ?
+              AND ({' OR '.join(ai_clauses)})
         )
         OR EXISTS (
             SELECT 1 FROM photo_manual_tags
             WHERE photo_manual_tags.image_id = photo_images.id
-              AND photo_manual_tags.tag LIKE ?
+              AND ({' OR '.join(manual_clauses)})
         )
-        """,
-        (like_value, like_value),
+    """
+    return _search_photo_images_with_where(
+        where_sql,
+        tuple(params),
         limit=limit,
     )
 
