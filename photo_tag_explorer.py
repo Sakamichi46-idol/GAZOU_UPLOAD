@@ -10,22 +10,21 @@ import discord
 
 from photo_database import get_connection
 from photo_search import get_display_image_url
+from photo_search_tags import (
+    SEARCH_CATEGORY_DEFS,
+    build_curated_index,
+    match_canonical_tag,
+)
 
 
 PAGE_SIZE = 5
 OPTIONS_PER_PAGE = 25
 
-CATEGORY_DEFS: dict[str, tuple[str, str]] = {
-    "person": ("👤", "人物"),
-    "clothing": ("👕", "服装"),
-    "expression": ("😊", "表情"),
-    "location": ("📍", "場所・背景"),
-    "composition": ("📷", "撮影・構図"),
-    "pose": ("🕺", "ポーズ"),
-    "event": ("🎪", "イベント"),
-    "season": ("🌸", "季節・天候"),
-    "object": ("🎀", "小物"),
-    "other": ("✨", "その他"),
+CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
+
+RAW_CATEGORY_KEYS = {
+    "person", "clothing", "expression", "location", "composition",
+    "pose", "event", "season", "object", "other",
 }
 
 CATEGORY_ALIASES = {
@@ -63,6 +62,7 @@ def _all_image_ids() -> set[int]:
 
 
 def _load_tag_index() -> dict[str, dict[str, set[int]]]:
+    """確認済み人物と、人間向けに整理した検索タグの索引を作る。"""
     index: dict[str, dict[str, set[int]]] = {
         category: {} for category in CATEGORY_DEFS
     }
@@ -76,18 +76,16 @@ def _load_tag_index() -> dict[str, dict[str, set[int]]]:
               AND TRIM(person_name) != ''
             """
         ).fetchall()
-
         ai_tags = connection.execute(
             """
-            SELECT image_id, category, tag
+            SELECT image_id, tag
             FROM photo_ai_tags
             WHERE TRIM(tag) != ''
             """
         ).fetchall()
-
         manual_tags = connection.execute(
             """
-            SELECT image_id, category, tag
+            SELECT image_id, tag
             FROM photo_manual_tags
             WHERE TRIM(tag) != ''
             """
@@ -97,10 +95,13 @@ def _load_tag_index() -> dict[str, dict[str, set[int]]]:
         tag = str(person_name).strip()
         index["person"].setdefault(tag, set()).add(int(image_id))
 
-    for image_id, category, tag_value in [*ai_tags, *manual_tags]:
+    raw_tag_ids: dict[str, set[int]] = {}
+    for image_id, tag_value in [*ai_tags, *manual_tags]:
         tag = str(tag_value).strip()
-        category_key = _normalized_category(str(category or ""))
-        index[category_key].setdefault(tag, set()).add(int(image_id))
+        raw_tag_ids.setdefault(tag, set()).add(int(image_id))
+
+    for category, tags in build_curated_index(raw_tag_ids).items():
+        index[category].update(tags)
 
     return index
 
@@ -392,7 +393,8 @@ def build_explorer_embed(
     embed = discord.Embed(
         title="🔍 写真検索",
         description=(
-            "カテゴリーを選んで条件を絞り込みます。\n"
+            "整理済みの検索用タグから条件を絞り込みます。\n"
+            "「タグ名入力」では同義語も候補になります。\n"
             "人物は **全員写っている（AND）／いずれか（OR）** を切り替えられます。"
         ),
         color=0x2B90D9,
@@ -515,6 +517,83 @@ class PersonMatchView(OwnedView):
         self.add_item(PersonMatchSelect(self))
 
 
+class SearchTagMatchSelect(discord.ui.Select):
+    def __init__(self, parent: "SearchTagMatchView"):
+        self.parent_view = parent
+        options = []
+        for index, (category, label) in enumerate(parent.matches):
+            emoji, category_label = CATEGORY_DEFS[category]
+            options.append(discord.SelectOption(
+                label=_short(label, 85),
+                description=f"{category_label}に追加"[:100],
+                emoji=emoji,
+                value=str(index),
+            ))
+        super().__init__(
+            placeholder="追加する検索タグを選択（複数可）",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        for value in self.values:
+            category, label = self.parent_view.matches[int(value)]
+            if label in self.parent_view.state.index.get(category, {}):
+                self.parent_view.state.selections[category].add(label)
+        await interaction.response.send_message(
+            "✅ 検索条件へ追加しました。元の検索画面へ戻ってください。",
+            ephemeral=True,
+        )
+        self.parent_view.stop()
+
+
+class SearchTagMatchView(OwnedView):
+    def __init__(self, state: ExplorerState, matches: list[tuple[str, str]]):
+        super().__init__(state, timeout=180)
+        self.matches = matches[:25]
+        self.add_item(SearchTagMatchSelect(self))
+
+
+class SearchTagModal(discord.ui.Modal, title="検索タグを入力"):
+    query = discord.ui.TextInput(
+        label="タグ名（部分一致可）",
+        placeholder="例：海、ロング、顔アップ、ケーキ",
+        max_length=50,
+    )
+
+    def __init__(self, state: ExplorerState):
+        super().__init__()
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        matches = [
+            (category, label)
+            for category, label in match_canonical_tag(str(self.query))
+            if label in self.state.index.get(category, {})
+        ]
+        if not matches:
+            await interaction.response.send_message(
+                "⚠️ 一致する検索用タグ、または該当画像が見つかりませんでした。",
+                ephemeral=True,
+            )
+            return
+        if len(matches) == 1:
+            category, label = matches[0]
+            self.state.selections[category].add(label)
+            view = ExplorerView(self.state)
+            await interaction.response.edit_message(
+                embed=build_explorer_embed(self.state),
+                view=view,
+            )
+            return
+        await interaction.response.send_message(
+            "候補から検索タグを選んでください。",
+            view=SearchTagMatchView(self.state, matches),
+            ephemeral=True,
+        )
+
+
 class ConditionRemoveSelect(discord.ui.Select):
     def __init__(self, parent: "ConditionRemoveView"):
         self.parent_view = parent
@@ -587,6 +666,12 @@ class ExplorerView(OwnedView):
             await interaction.response.send_modal(PersonNameModal(self.state))
         name_button.callback = name_callback
         self.add_item(name_button)
+
+        tag_input_button = discord.ui.Button(label="タグ名入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=2)
+        async def tag_input_callback(interaction: discord.Interaction) -> None:
+            await interaction.response.send_modal(SearchTagModal(self.state))
+        tag_input_button.callback = tag_input_callback
+        self.add_item(tag_input_button)
 
         mode_label = "人物：全員" if self.state.person_match_mode == "and" else "人物：いずれか"
         mode_button = discord.ui.Button(label=mode_label, emoji="👥", style=discord.ButtonStyle.primary, row=2)
@@ -1359,10 +1444,10 @@ def get_uncategorized_tag_summary() -> list[tuple[str, str, int]]:
             GROUP BY raw_category, tag
             ORDER BY image_count DESC, tag
             """.format(
-                known=','.join('?' for _ in CATEGORY_DEFS),
+                known=','.join('?' for _ in RAW_CATEGORY_KEYS),
                 aliases=','.join('?' for _ in CATEGORY_ALIASES if _),
             ),
-            tuple(CATEGORY_DEFS) + tuple(key for key in CATEGORY_ALIASES if key),
+            tuple(RAW_CATEGORY_KEYS) + tuple(key for key in CATEGORY_ALIASES if key),
         ).fetchall()
 
     return [
