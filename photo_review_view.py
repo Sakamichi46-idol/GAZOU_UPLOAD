@@ -164,13 +164,16 @@ class ReviewSession:
         batch_size: int = 5,
         queue_status: str = "pending",
         group_name: str = "",
+        continuous: bool = False,
+        require_final_confirmation: bool = False,
     ):
         self.destination = destination
         self.owner_id = owner_id
         self.batch_size = max(1, min(int(batch_size), 10))
         self.queue_status = "skipped" if queue_status == "skipped" else "pending"
         self.group_name = normalize_text(group_name)
-        self.continuous = False
+        self.continuous = bool(continuous)
+        self.require_final_confirmation = bool(require_final_confirmation)
         self.current_blog_id: int | None = None
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
@@ -372,20 +375,20 @@ class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
     person_names = discord.ui.TextInput(label="人物名", placeholder="複数人は「、」で区切ってください。", style=discord.TextStyle.paragraph, max_length=500)
     note = discord.ui.TextInput(label="メモ", required=False, max_length=500)
 
-    def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
+    def __init__(self, parent: "PersonReviewView"):
         super().__init__(timeout=300)
-        self.review = review
-        self.session = session
+        self.parent_view = parent
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         names = split_person_names(self.person_names.value)
         if not names:
             await interaction.response.send_message("人物名を入力してください。", ephemeral=True)
             return
-        await asyncio.to_thread(set_confirmed_image_people, int(self.review["image_id"]), names, confirmed_by=get_reviewer_name(interaction.user), note=normalize_text(self.note.value))
-        await interaction.response.edit_message(embed=build_completed_embed(self.review, names, interaction.user), view=None)
-        if self.session:
-            await self.session.mark_done(int(self.review["image_id"]))
+        await self.parent_view.complete_review(
+            interaction,
+            names,
+            note=normalize_text(self.note.value) or "人物名を手入力",
+        )
 
 
 @dataclass
@@ -617,12 +620,40 @@ class QuickPeopleSelect(discord.ui.Select):
         )
 
 
+class FinalPersonConfirmView(discord.ui.View):
+    """人物候補をDBへ保存する直前の最終確認。"""
+
+    def __init__(self, parent: "PersonReviewView", names: list[str], note: str):
+        super().__init__(timeout=180)
+        self.parent = parent
+        self.names = list(names)
+        self.note = note
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if self.parent.session and interaction.user.id != self.parent.session.owner_id:
+            await interaction.response.send_message("この最終確認はレビュー開始者だけが操作できます。", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="この内容で確定", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.parent.commit_review(interaction, self.names, note=self.note)
+        self.stop()
+
+    @discord.ui.button(label="選び直す", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="↩️ 確定せず、元のレビュー画面に戻りました。", view=None)
+        self.stop()
+
+
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=900)
         self.review = review
         self.session = session
         self.image_id = int(review["image_id"])
+        self.message: discord.Message | None = None
+        self.source_message_id = 0
         self.candidates = build_candidate_names(review)
         self.quick_people = get_quick_people_cached(
             normalize_text(review.get("group_name")),
@@ -672,6 +703,23 @@ class PersonReviewView(discord.ui.View):
         *,
         note: str,
     ) -> None:
+        if self.session and self.session.require_final_confirmation:
+            label = "人物なし" if not names else "、".join(names)
+            await interaction.response.send_message(
+                f"🔎 **最終確認**\n写真ID **{self.image_id}** を **{discord.utils.escape_markdown(label)}** で確定しますか？",
+                view=FinalPersonConfirmView(self, names, note),
+                ephemeral=True,
+            )
+            return
+        await self.commit_review(interaction, names, note=note)
+
+    async def commit_review(
+        self,
+        interaction: discord.Interaction,
+        names: list[str],
+        *,
+        note: str,
+    ) -> None:
         await asyncio.to_thread(
             set_confirmed_image_people,
             self.image_id,
@@ -679,10 +727,17 @@ class PersonReviewView(discord.ui.View):
             confirmed_by=get_reviewer_name(interaction.user),
             note=note,
         )
-        await interaction.response.edit_message(
-            embed=build_completed_embed(self.review, names, interaction.user),
-            view=None,
-        )
+        completed = build_completed_embed(self.review, names, interaction.user)
+        if interaction.message and interaction.message.id == getattr(self, "source_message_id", 0):
+            await interaction.response.edit_message(embed=completed, view=None)
+        else:
+            if not interaction.response.is_done():
+                await interaction.response.edit_message(content="✅ 最終確認が完了しました。", view=None)
+            try:
+                if self.message is not None:
+                    await self.message.edit(embed=completed, view=None)
+            except (discord.HTTPException, discord.NotFound):
+                pass
         if self.session:
             await self.session.mark_done(self.image_id)
 
@@ -709,7 +764,7 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="手入力", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
     async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(PersonInputModal(self.review, self.session))
+        await interaction.response.send_modal(PersonInputModal(self))
 
     @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def skip_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -783,10 +838,15 @@ async def send_person_review(
         kwargs["file"] = file
     if isinstance(destination, discord.Interaction):
         if destination.response.is_done():
-            return await destination.followup.send(**kwargs, wait=True)
-        await destination.response.send_message(**kwargs)
-        return await destination.original_response()
-    return await destination.send(**kwargs)
+            message = await destination.followup.send(**kwargs, wait=True)
+        else:
+            await destination.response.send_message(**kwargs)
+            message = await destination.original_response()
+    else:
+        message = await destination.send(**kwargs)
+    view.message = message
+    view.source_message_id = int(getattr(message, "id", 0) or 0)
+    return message
 
 
 async def send_next_person_review(
@@ -812,6 +872,8 @@ async def send_person_review_batch(
     *,
     queue_status: str = "pending",
     group_name: str = "",
+    continuous: bool = False,
+    require_final_confirmation: bool = False,
 ) -> int:
     owner = getattr(destination, "author", None) or getattr(destination, "user", None)
     owner_id = int(getattr(owner, "id", 0) or 0)
@@ -821,6 +883,8 @@ async def send_person_review_batch(
         batch_size=max(1, min(int(limit), 10)),
         queue_status=queue_status,
         group_name=group_name,
+        continuous=continuous,
+        require_final_confirmation=require_final_confirmation,
     )
     return await session.start_batch()
 
