@@ -1321,6 +1321,56 @@ class DetailView(OwnedView):
         )
 
 
+def get_tag_category_summary() -> dict[str, list[tuple[str, int]]]:
+    """DBに存在するタグを、検索画面と同じカテゴリー規則で集計する。"""
+    index = _load_tag_index()
+    summary: dict[str, list[tuple[str, int]]] = {}
+    for category in CATEGORY_DEFS:
+        values = [
+            (tag, len(image_ids))
+            for tag, image_ids in index.get(category, {}).items()
+        ]
+        values.sort(key=lambda item: (-item[1], item[0]))
+        summary[category] = values
+    return summary
+
+
+def get_uncategorized_tag_summary() -> list[tuple[str, str, int]]:
+    """空欄・manual・未知カテゴリーのタグと使用画像数を返す。"""
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT raw_category, tag, COUNT(DISTINCT image_id) AS image_count
+            FROM (
+                SELECT image_id, TRIM(category) AS raw_category, TRIM(tag) AS tag
+                FROM photo_ai_tags
+                WHERE TRIM(tag) != ''
+                UNION ALL
+                SELECT image_id, TRIM(category) AS raw_category, TRIM(tag) AS tag
+                FROM photo_manual_tags
+                WHERE TRIM(tag) != ''
+            )
+            WHERE LOWER(raw_category) = 'manual'
+               OR raw_category = ''
+               OR (
+                    LOWER(raw_category) NOT IN ({known})
+                    AND LOWER(raw_category) NOT IN ({aliases})
+               )
+            GROUP BY raw_category, tag
+            ORDER BY image_count DESC, tag
+            """.format(
+                known=','.join('?' for _ in CATEGORY_DEFS),
+                aliases=','.join('?' for _ in CATEGORY_ALIASES if _),
+            ),
+            tuple(CATEGORY_DEFS) + tuple(key for key in CATEGORY_ALIASES if key),
+        ).fetchall()
+
+    return [
+        (str(row[0] or ''), str(row[1] or ''), int(row[2] or 0))
+        for row in rows
+    ]
+
+
 async def send_photo_tag_explorer(ctx) -> None:
     message = await ctx.send(
         "🔄 タグ情報を読み込んでいます…"
