@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 
 from photo_ai_analyzer import analyze_photo_image
+from archive_image_getter import get_images as get_article_images
 from photo_database import (
     add_review_item,
     complete_review_item,
@@ -106,7 +107,8 @@ def _get_redownload_record(image_id: int) -> dict[str, Any] | None:
             photo_images.image_index,
             photo_blogs.group_name,
             photo_blogs.member_name,
-            photo_blogs.published_at
+            photo_blogs.published_at,
+            photo_blogs.blog_url
         FROM photo_images
         JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
         WHERE photo_images.id = ?
@@ -115,23 +117,134 @@ def _get_redownload_record(image_id: int) -> dict[str, Any] | None:
     )
 
 
+def _update_redownload_image_url(image_id: int, image_url: str) -> None:
+    """再解析で見つけた現行URLを、同じ画像レコードへ反映する。"""
+
+    clean_url = str(image_url or "").strip()
+    if not clean_url:
+        return
+
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            UPDATE photo_images
+            SET image_url = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (clean_url, _now(), image_id),
+        )
+        connection.commit()
+
+
+def _looks_like_not_found(error_message: str) -> bool:
+    normalized = str(error_message or "").lower()
+    return (
+        "404" in normalized
+        or "not found" in normalized
+    )
+
+
 async def _redownload_one(session: aiohttp.ClientSession, image_id: int) -> dict[str, Any]:
+    """失敗画像を再取得する。404時は元記事を再解析してURLも更新する。"""
+
     record = await asyncio.to_thread(_get_redownload_record, image_id)
     if not record:
-        return {"success": False, "error": "画像IDが見つかりません。"}
+        return {
+            "success": False,
+            "image_id": image_id,
+            "error": "画像IDが見つかりません。",
+        }
 
     await asyncio.to_thread(reset_image_download_status, image_id)
 
-    return await download_photo_image(
-        session,
-        image_id=int(record["id"]),
-        blog_id=int(record["blog_id"]),
-        image_url=str(record["image_url"]),
-        image_index=int(record["image_index"]),
-        group_name=str(record["group_name"]),
-        member_name=str(record["member_name"]),
-        published_at=str(record["published_at"]),
+    async def attempt(image_url: str) -> dict[str, Any]:
+        return await download_photo_image(
+            session,
+            image_id=int(record["id"]),
+            blog_id=int(record["blog_id"]),
+            image_url=image_url,
+            image_index=int(record["image_index"]),
+            group_name=str(record["group_name"]),
+            member_name=str(record["member_name"]),
+            published_at=str(record["published_at"]),
+        )
+
+    original_url = str(record.get("image_url") or "").strip()
+    result = await attempt(original_url)
+    if result.get("success"):
+        result["recovered_by"] = "original_url"
+        return result
+
+    original_error = str(result.get("error") or "")
+    blog_url = str(record.get("blog_url") or "").strip()
+
+    if not blog_url or not _looks_like_not_found(original_error):
+        return result
+
+    try:
+        refreshed_urls = await get_article_images(blog_url)
+    except Exception as error:
+        error_message = (
+            f"元記事の再解析にも失敗: {type(error).__name__}: {error}"
+        )
+        print(
+            "写真再ダウンロード再解析エラー:",
+            f"image_id={image_id}",
+            error_message,
+        )
+        result["refresh_error"] = error_message
+        return result
+
+    image_index = int(record.get("image_index") or 0)
+    refreshed_url = (
+        refreshed_urls[image_index - 1]
+        if image_index >= 1 and image_index <= len(refreshed_urls)
+        else ""
     )
+
+    if not refreshed_url:
+        result["refresh_error"] = (
+            f"元記事には画像{image_index}枚目が見つかりません "
+            f"(現在の抽出数: {len(refreshed_urls)}件)"
+        )
+        return result
+
+    refreshed_url = str(refreshed_url).strip()
+    if refreshed_url == original_url:
+        result["refresh_error"] = "元記事を再解析しても画像URLが変わりませんでした。"
+        return result
+
+    print(
+        "写真再ダウンロードURL更新候補:",
+        f"image_id={image_id}",
+        f"old={original_url}",
+        f"new={refreshed_url}",
+    )
+
+    refreshed_result = await attempt(refreshed_url)
+    if refreshed_result.get("success"):
+        try:
+            await asyncio.to_thread(
+                _update_redownload_image_url,
+                image_id,
+                refreshed_url,
+            )
+        except sqlite3.IntegrityError as error:
+            # 同一ブログ内に同じURLの別レコードがある場合でも、
+            # Bucket保存自体は成功しているため成功扱いを維持する。
+            print(
+                "写真再ダウンロードURL更新をスキップ:",
+                f"image_id={image_id}",
+                f"{type(error).__name__}: {error}",
+            )
+        refreshed_result["recovered_by"] = "article_reparse"
+        refreshed_result["old_url"] = original_url
+        refreshed_result["new_url"] = refreshed_url
+        return refreshed_result
+
+    refreshed_result["original_error"] = original_error
+    refreshed_result["refreshed_url"] = refreshed_url
+    return refreshed_result
 
 
 def register_photo_commands(bot: commands.Bot) -> None:
@@ -908,7 +1021,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
             limit = max(1, min(int(limit), 50))
             targets = await asyncio.to_thread(
                 _rows,
-                "SELECT id FROM photo_images WHERE download_status = 'failed' ORDER BY id LIMIT ?",
+                "SELECT id FROM photo_images WHERE download_status = 'failed' ORDER BY updated_at ASC, id ASC LIMIT ?",
                 (limit,),
             )
         else:
@@ -920,13 +1033,44 @@ def register_photo_commands(bot: commands.Bot) -> None:
 
         await ctx.send(f"🔄 {len(targets)}件の再ダウンロードを開始します。")
         succeeded = 0
+        reparsed = 0
+        failures: list[str] = []
         timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for item in targets:
-                result = await _redownload_one(session, int(item["id"]))
+                target_id = int(item["id"])
+                result = await _redownload_one(session, target_id)
                 if result.get("success"):
                     succeeded += 1
-        await ctx.send(f"✅ 再ダウンロード終了: 成功 **{succeeded}件** / 対象 **{len(targets)}件**")
+                    if result.get("recovered_by") == "article_reparse":
+                        reparsed += 1
+                    continue
+
+                error_text = str(
+                    result.get("refresh_error")
+                    or result.get("error")
+                    or "不明なエラー"
+                ).replace("\n", " ")
+                failures.append(f"ID {target_id}: {error_text[:180]}")
+                print(
+                    "写真再ダウンロード失敗:",
+                    f"image_id={target_id}",
+                    error_text,
+                )
+
+        message = (
+            f"✅ 再ダウンロード終了: 成功 **{succeeded}件** "
+            f"/ 対象 **{len(targets)}件**"
+        )
+        if reparsed:
+            message += f"\n🔎 元記事の再解析で復旧: **{reparsed}件**"
+        if failures:
+            detail_lines = failures[:8]
+            if len(failures) > len(detail_lines):
+                detail_lines.append(f"ほか {len(failures) - len(detail_lines)}件")
+            message += "\n\n❌ **失敗理由**\n" + "\n".join(detail_lines)
+
+        await ctx.send(message[:1900])
 
     @bot.command(name="photo_stats")
     
