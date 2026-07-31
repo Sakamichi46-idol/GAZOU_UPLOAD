@@ -1501,6 +1501,17 @@ def register_photo_commands(bot: commands.Bot) -> None:
         """人物確認待ちを複数件表示する（最大10件）。"""
         await send_person_review_batch(ctx, limit=max(1, min(int(limit), 10)))
 
+    @bot.command(name="review_panel")
+    @commands.is_owner()
+    async def review_panel_command(ctx: commands.Context, limit: int = 5) -> None:
+        """管理者パネル向け。複数表示・自動継続・最終確認付き人物レビュー。"""
+        await send_person_review_batch(
+            ctx,
+            limit=max(1, min(int(limit), 10)),
+            continuous=True,
+            require_final_confirmation=True,
+        )
+
     @bot.command(name="review_list_ng")
     @commands.is_owner()
     async def review_list_ng_command(ctx: commands.Context, limit: int = 5) -> None:
