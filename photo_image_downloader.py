@@ -597,6 +597,20 @@ async def download_photo_image(
             "error": error_message,
         }
 
+    parsed_url = urlparse(image_url)
+    if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc:
+        error_message = (
+            "HTTP/HTTPS以外の画像URLは取得できません: "
+            f"{image_url[:300]}"
+        )
+        record_download_failure(image_id, error_message)
+        return {
+            "success": False,
+            "image_id": image_id,
+            "error": error_message,
+            "error_kind": "invalid_url",
+        }
+
     timeout = aiohttp.ClientTimeout(
         total=REQUEST_TIMEOUT
     )
