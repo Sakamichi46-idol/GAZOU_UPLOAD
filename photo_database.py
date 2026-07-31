@@ -2783,12 +2783,10 @@ def add_face_review(
             DO UPDATE SET
                 question = excluded.question,
                 candidates = excluded.candidates,
-                status = 'pending',
-                selected_person_id = NULL,
-                reviewed_by = '',
-                review_note = '',
-                reviewed_at = '',
                 updated_at = excluded.updated_at
+
+            -- 候補を再計算しただけで、完了済み・保留済みのレビューを
+            -- pendingへ戻さない。statusや確定人物、確認者などは保持する。
             """,
             (
                 face_id,
