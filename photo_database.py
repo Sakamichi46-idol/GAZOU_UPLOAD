@@ -4606,3 +4606,145 @@ def get_blog_image_ids(blog_id: int, *, only_unanalyzed: bool = False, only_unsc
             """, tuple(params)
         ).fetchall()
     return [int(row['id']) for row in rows]
+
+# =========================
+# ZIP44 ブログ単位人物確認ダッシュボード
+# =========================
+
+def _blog_admin_progress_select() -> str:
+    """ブログ記事ごとの人物確認進捗を集計する共通SELECT。"""
+    return """
+        SELECT
+            pb.id,
+            pb.group_name,
+            pb.member_name,
+            pb.title,
+            pb.published_at,
+            pb.blog_url,
+            COUNT(DISTINCT pi.id) AS image_count,
+            COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity' THEN prq.image_id
+            END) AS review_target_count,
+            COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'completed' THEN prq.image_id
+            END) AS review_completed_count,
+            COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'pending' THEN prq.image_id
+            END) AS review_pending_count,
+            COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'skipped' THEN prq.image_id
+            END) AS review_skipped_count,
+            COUNT(DISTINCT CASE
+                WHEN pi.download_status = 'failed'
+                  OR TRIM(COALESCE(pi.download_error, '')) <> ''
+                  OR pi.analysis_status = 'failed'
+                  OR TRIM(COALESCE(pi.analysis_error, '')) <> ''
+                  OR pfs.status = 'failed'
+                  OR TRIM(COALESCE(pfs.error_message, '')) <> ''
+                THEN pi.id
+            END) AS error_count,
+            MAX(COALESCE(NULLIF(prq.reviewed_at, ''), NULLIF(prq.updated_at, ''), pi.updated_at, pb.updated_at)) AS last_reviewed_at
+        FROM photo_blogs pb
+        LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+        LEFT JOIN photo_review_queue prq ON prq.image_id = pi.id
+        LEFT JOIN photo_face_scans pfs ON pfs.image_id = pi.id
+    """
+
+
+def _normalize_blog_admin_rows(rows: list[Any]) -> list[dict[str, Any]]:
+    result = rows_to_dicts(rows)
+    for item in result:
+        total = int(item.get("review_target_count") or 0)
+        completed = int(item.get("review_completed_count") or 0)
+        pending = int(item.get("review_pending_count") or 0)
+        skipped = int(item.get("review_skipped_count") or 0)
+        # レビュー行がまだ作られていない画像も未確認として扱う。
+        image_count = int(item.get("image_count") or 0)
+        effective_total = max(total, image_count)
+        effective_completed = min(completed, effective_total)
+        unreviewed_without_queue = max(0, image_count - total)
+        effective_pending = pending + skipped + unreviewed_without_queue
+        percent = 100 if effective_total == 0 else round(effective_completed * 100 / effective_total)
+        item["progress_total"] = effective_total
+        item["progress_completed"] = effective_completed
+        item["progress_pending"] = effective_pending
+        item["progress_percent"] = max(0, min(percent, 100))
+        item["is_completed"] = effective_total > 0 and effective_completed >= effective_total
+        item["is_unprocessed"] = effective_total > 0 and effective_completed < effective_total
+    return result
+
+
+def get_latest_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
+    """最新記事を人物確認進捗付きで返す。"""
+    safe_limit = max(1, min(int(limit), 25))
+    sql = _blog_admin_progress_select() + """
+        GROUP BY pb.id
+        ORDER BY
+            CASE WHEN pb.published_at = '' THEN 1 ELSE 0 END,
+            pb.published_at DESC,
+            pb.id DESC
+        LIMIT ?
+    """
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, (safe_limit,)).fetchall()
+    return _normalize_blog_admin_rows(rows)
+
+
+def get_unprocessed_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
+    """人物確認が未完了の記事を返す。"""
+    safe_limit = max(1, min(int(limit), 25))
+    sql = _blog_admin_progress_select() + """
+        GROUP BY pb.id
+        HAVING COUNT(DISTINCT pi.id) > 0
+           AND COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'completed' THEN prq.image_id
+           END) < COUNT(DISTINCT pi.id)
+        ORDER BY
+            CASE WHEN pb.published_at = '' THEN 1 ELSE 0 END,
+            pb.published_at DESC,
+            pb.id DESC
+        LIMIT ?
+    """
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, (safe_limit,)).fetchall()
+    return _normalize_blog_admin_rows(rows)
+
+
+def get_error_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
+    """画像取得・AI解析・顔認証にエラーがある記事を返す。"""
+    safe_limit = max(1, min(int(limit), 25))
+    sql = _blog_admin_progress_select() + """
+        GROUP BY pb.id
+        HAVING COUNT(DISTINCT CASE
+                WHEN pi.download_status = 'failed'
+                  OR TRIM(COALESCE(pi.download_error, '')) <> ''
+                  OR pi.analysis_status = 'failed'
+                  OR TRIM(COALESCE(pi.analysis_error, '')) <> ''
+                  OR pfs.status = 'failed'
+                  OR TRIM(COALESCE(pfs.error_message, '')) <> ''
+                THEN pi.id
+            END) > 0
+        ORDER BY error_count DESC, pb.published_at DESC, pb.id DESC
+        LIMIT ?
+    """
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, (safe_limit,)).fetchall()
+    return _normalize_blog_admin_rows(rows)
+
+
+def get_blog_progress_for_admin(blog_id: int) -> dict[str, Any] | None:
+    """1記事の人物確認進捗を返す。"""
+    sql = _blog_admin_progress_select() + """
+        WHERE pb.id = ?
+        GROUP BY pb.id
+        LIMIT 1
+    """
+    with closing(get_connection()) as connection:
+        row = connection.execute(sql, (int(blog_id),)).fetchone()
+    if row is None:
+        return None
+    return _normalize_blog_admin_rows([row])[0]
