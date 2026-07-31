@@ -88,11 +88,11 @@ class ReviewAdminView(discord.ui.View):
     @discord.ui.button(label="人物確認を開始", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, i, _):
         from control_panel import invoke_existing_command
-        await invoke_existing_command(i, "review_next", admin_required=True)
+        await invoke_existing_command(i, "review_panel", "5", admin_required=True)
     @discord.ui.button(label="顔確認を開始", emoji="🙂", style=discord.ButtonStyle.primary)
     async def face(self, i, _):
         from control_panel import invoke_existing_command
-        await invoke_existing_command(i, "face_review", admin_required=True)
+        await invoke_existing_command(i, "face_review", "5", admin_required=True)
     @discord.ui.button(label="AI推定人物で検索", emoji="🤖", style=discord.ButtonStyle.success)
     async def search(self, i, _):
         from control_panel import CommandArgumentsModal
