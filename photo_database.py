@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 
 # =========================
@@ -1153,6 +1154,17 @@ def get_registered_photo_blog_urls(
 # 画像登録
 # =========================
 
+def is_supported_remote_image_url(image_url: str) -> bool:
+    """HTTP/HTTPS の画像URLだけを保存対象として許可する。"""
+
+    clean_url = str(image_url or "").strip()
+    if not clean_url:
+        return False
+
+    parsed = urlparse(clean_url)
+    return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+
+
 def save_photo_image(
     blog_id: int,
     image_url: str,
@@ -1179,6 +1191,11 @@ def save_photo_image(
 
         raise ValueError(
             "画像URLが空です。"
+        )
+
+    if not is_supported_remote_image_url(image_url):
+        raise ValueError(
+            f"HTTP/HTTPS以外の画像URLは登録できません: {image_url[:200]}"
         )
 
     now = utc_now_text()
@@ -1353,6 +1370,13 @@ def save_photo_images(
 
         if not clean_url:
 
+            continue
+
+        if not is_supported_remote_image_url(clean_url):
+            print(
+                "不正な画像URLを登録対象から除外:",
+                clean_url[:300],
+            )
             continue
 
         image_id = save_photo_image(
@@ -1579,6 +1603,35 @@ def update_image_download_failure(
             ),
         )
 
+        connection.commit()
+
+
+def update_image_download_terminal_failure(
+    image_id: int,
+    status: str,
+    error_message: str,
+) -> None:
+    """再試行しても直らない失敗を、通常の failed から分離して保存する。"""
+
+    allowed_statuses = {"invalid_url", "permanent_failed"}
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in allowed_statuses:
+        raise ValueError(f"未対応の終了状態です: {status}")
+
+    error_text = str(error_message or "").strip()[:1000]
+
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            UPDATE photo_images
+            SET
+                download_status = ?,
+                download_error = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (normalized_status, error_text, utc_now_text(), image_id),
+        )
         connection.commit()
 
 
@@ -3730,6 +3783,22 @@ def get_photo_storage_stats() -> dict[str, int]:
 
                 SUM(
                     CASE
+                        WHEN download_status = 'invalid_url'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS invalid_url,
+
+                SUM(
+                    CASE
+                        WHEN download_status = 'permanent_failed'
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS permanent_failed,
+
+                SUM(
+                    CASE
                         WHEN download_status = 'completed'
                         THEN file_size
                         ELSE 0
@@ -3749,6 +3818,8 @@ def get_photo_storage_stats() -> dict[str, int]:
             "completed": 0,
             "pending": 0,
             "failed": 0,
+            "invalid_url": 0,
+            "permanent_failed": 0,
             "total_size": 0,
         }
 
@@ -3770,6 +3841,16 @@ def get_photo_storage_stats() -> dict[str, int]:
 
         "failed": int(
             row["failed"]
+            or 0
+        ),
+
+        "invalid_url": int(
+            row["invalid_url"]
+            or 0
+        ),
+
+        "permanent_failed": int(
+            row["permanent_failed"]
             or 0
         ),
 
