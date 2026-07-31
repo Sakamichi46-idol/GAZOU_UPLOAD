@@ -8,9 +8,12 @@ from __future__ import annotations
 import base64
 import tempfile
 import zlib
+
+import requests
 from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 from bucket_storage import bucket_is_configured, download_to_file
 from photo_database import (
@@ -69,16 +72,44 @@ def _local_image_path(image: dict[str, Any]) -> Iterator[str]:
         return
 
     bucket_key = str(image.get("bucket_key") or "").strip()
-    if not bucket_key:
-        raise FileNotFoundError("ローカル画像もBucketキーも見つかりません。")
-    if not bucket_is_configured():
-        raise RuntimeError("Bucket設定が不足しているため画像を取得できません。")
-
     suffix = Path(str(image.get("file_name") or "image.jpg")).suffix or ".jpg"
-    with tempfile.TemporaryDirectory(prefix="face-scan-") as directory:
-        path = str(Path(directory) / f"source{suffix}")
-        download_to_file(key=bucket_key, file_path=path)
-        yield path
+
+    if bucket_key:
+        if not bucket_is_configured():
+            raise RuntimeError("Bucket設定が不足しているため画像を取得できません。")
+        with tempfile.TemporaryDirectory(prefix="face-scan-") as directory:
+            path = str(Path(directory) / f"source{suffix}")
+            download_to_file(key=bucket_key, file_path=path)
+            yield path
+        return
+
+    # Bucket移行前などの古いレコードでは、local_pathとbucket_keyが空でも
+    # 元画像URLが残っている場合がある。顔レビュー時だけ一時取得して復旧する。
+    image_url = str(image.get("image_url") or "").strip()
+    parsed = urlparse(image_url)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        with tempfile.TemporaryDirectory(prefix="face-scan-url-") as directory:
+            path = str(Path(directory) / f"source{suffix}")
+            try:
+                response = requests.get(
+                    image_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=(10, 60),
+                )
+                response.raise_for_status()
+                Path(path).write_bytes(response.content)
+            except requests.RequestException as error:
+                raise FileNotFoundError(
+                    f"ローカル画像とBucketキーがなく、元画像URLからの取得にも失敗しました: {error}"
+                ) from error
+            if not Path(path).is_file() or Path(path).stat().st_size == 0:
+                raise FileNotFoundError("元画像URLから取得したファイルが空です。")
+            yield path
+        return
+
+    raise FileNotFoundError(
+        "ローカル画像・Bucketキー・利用可能なHTTP画像URLのいずれも見つかりません。"
+    )
 
 
 def _encode_embedding(vector: Any) -> str:
