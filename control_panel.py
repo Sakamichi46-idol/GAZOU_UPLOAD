@@ -316,11 +316,11 @@ class AdminQuickView(discord.ui.View):
 
     @discord.ui.button(label="顔レビュー", emoji="👤", style=discord.ButtonStyle.primary)
     async def face_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "face_review", admin_required=True)
+        await invoke_existing_command(interaction, "face_review", "5", admin_required=True)
 
     @discord.ui.button(label="確認待ちレビュー", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "review_next", admin_required=True)
+        await invoke_existing_command(interaction, "review_panel", "5", admin_required=True)
 
     @discord.ui.button(label="画像0件を再判定", emoji="🛠️", style=discord.ButtonStyle.success)
     async def repair_zero_images(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
