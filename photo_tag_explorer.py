@@ -17,7 +17,7 @@ from photo_search_tags import (
 )
 
 
-PAGE_SIZE = 1
+PAGE_SIZE = 5
 OPTIONS_PER_PAGE = 25
 
 CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
@@ -1082,7 +1082,7 @@ class ResultsView(OwnedView):
             1,
         ):
             button = discord.ui.Button(
-                label="詳細を見る",
+                label=f"{offset}枚目の詳細",
                 style=discord.ButtonStyle.primary,
                 row=0,
             )
@@ -1113,7 +1113,7 @@ class ResultsView(OwnedView):
             self.add_item(button)
 
     @discord.ui.button(
-        label="前の写真",
+        label="前の5枚",
         emoji="◀️",
         style=discord.ButtonStyle.secondary,
         row=1,
@@ -1135,7 +1135,7 @@ class ResultsView(OwnedView):
         )
 
     @discord.ui.button(
-        label="次の写真",
+        label="次の5枚",
         emoji="▶️",
         style=discord.ButtonStyle.secondary,
         row=1,
