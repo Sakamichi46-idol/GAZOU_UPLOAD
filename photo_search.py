@@ -13,6 +13,7 @@ from photo_database import (
     search_photo_images_by_person,
     search_photo_images_by_person_with_candidates,
     search_photo_images_by_tag,
+    add_photo_favorite,
 )
 
 
@@ -201,6 +202,50 @@ class PhotoSearchResultsView(discord.ui.View):
         self.index = min(len(self.results) - 1, self.index + 1)
         self._sync_buttons()
         await interaction.response.edit_message(embed=self.current_embed(), view=self)
+
+    @discord.ui.button(
+        label="お気に入り登録",
+        emoji="⭐",
+        style=discord.ButtonStyle.success,
+    )
+    async def favorite_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        result = self.results[self.index]
+        try:
+            image_id = int(result.get("id", 0))
+        except (TypeError, ValueError):
+            image_id = 0
+
+        if image_id <= 0:
+            await interaction.response.send_message(
+                "⚠️ この写真の画像IDを取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            added = await asyncio.to_thread(
+                add_photo_favorite,
+                image_id,
+                interaction.user.id,
+            )
+        except Exception as error:
+            print("お気に入り登録エラー:", error)
+            await interaction.response.send_message(
+                "⚠️ お気に入り登録中にエラーが発生しました。",
+                ephemeral=True,
+            )
+            return
+
+        if added:
+            text = f"⭐ 画像ID **{image_id}** をお気に入りに登録しました。"
+        else:
+            text = f"⭐ 画像ID **{image_id}** はすでにお気に入り登録済みです。"
+
+        await interaction.response.send_message(text, ephemeral=True)
 
     @discord.ui.button(label="終了", emoji="⏹️", style=discord.ButtonStyle.danger)
     async def close_button(
