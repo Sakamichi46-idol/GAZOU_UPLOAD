@@ -8,7 +8,7 @@ from typing import Any
 
 import discord
 
-from photo_database import get_connection
+from photo_database import add_photo_favorite, get_connection
 from photo_search import get_display_image_url
 from photo_search_tags import (
     SEARCH_CATEGORY_DEFS,
@@ -1363,6 +1363,55 @@ class DetailView(OwnedView):
         await interaction.response.edit_message(
             embeds=[view.build_embed()],
             view=view,
+        )
+
+    @discord.ui.button(
+        label="お気に入り登録",
+        emoji="⭐",
+        style=discord.ButtonStyle.success,
+        row=1,
+    )
+    async def favorite(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        result = self.results[self.index]
+
+        try:
+            image_id = int(result.get("id", 0))
+        except (TypeError, ValueError):
+            image_id = 0
+
+        if image_id <= 0:
+            await interaction.response.send_message(
+                "⚠️ この写真の画像IDを取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            added = await asyncio.to_thread(
+                add_photo_favorite,
+                image_id,
+                interaction.user.id,
+            )
+        except Exception as error:
+            print("タグ検索画面のお気に入り登録エラー:", error)
+            await interaction.response.send_message(
+                "⚠️ お気に入り登録中にエラーが発生しました。",
+                ephemeral=True,
+            )
+            return
+
+        if added:
+            message = f"⭐ 画像ID **{image_id}** をお気に入りに登録しました。"
+        else:
+            message = f"⭐ 画像ID **{image_id}** はすでにお気に入り登録済みです。"
+
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
         )
 
     @discord.ui.button(
