@@ -106,6 +106,35 @@ def get_connection() -> sqlite3.Connection:
     return connection
 
 
+
+
+def add_photo_favorite(
+    image_id: int,
+    discord_user_id: str | int,
+) -> bool:
+    """画像をユーザーのお気に入りへ追加する。
+
+    新規登録できた場合はTrue、すでに登録済みの場合はFalseを返す。
+    """
+    with closing(get_connection()) as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO photo_favorites (
+                image_id,
+                discord_user_id,
+                created_at
+            ) VALUES (?, ?, ?)
+            """,
+            (
+                int(image_id),
+                str(discord_user_id),
+                utc_now_text(),
+            ),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+
+
 def row_to_dict(
     row: sqlite3.Row | None,
 ) -> dict[str, Any] | None:
