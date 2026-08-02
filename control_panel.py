@@ -317,8 +317,7 @@ class UserPanelView(discord.ui.View):
 
     @discord.ui.button(label="お気に入り", emoji="⭐", style=discord.ButtonStyle.success, custom_id="photo:user:favorites")
     async def favorites(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await _reply(interaction, "⭐ お気に入り操作を選んでください。", ephemeral=True)
-        await interaction.followup.send("お気に入りメニュー", view=FavoriteView(), ephemeral=True)
+        await invoke_existing_command(interaction, "favorite_list", "100")
 
     @discord.ui.button(label="最近の写真", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="photo:user:recent")
     async def recent(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
