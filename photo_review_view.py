@@ -10,6 +10,12 @@ from typing import Any
 import discord
 from discord.ext import commands
 
+from person_labels import (
+    format_people_for_users,
+    make_unknown_other_label,
+    normalize_people_for_storage,
+    unknown_other_count,
+)
 from photo_database import (
     get_connection,
     get_pending_person_reviews,
@@ -30,6 +36,8 @@ SELECT_PAGE_SIZE = 25
 SUCCESS_NOTICE_SECONDS = 4.0
 QUICK_PEOPLE_CACHE_SECONDS = 300
 _QUICK_PEOPLE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+_SAKAMICHI_MEMBER_NAMES = {name for _group, _generation, name in iter_members()}
 
 
 def normalize_text(value: Any) -> str:
@@ -135,7 +143,7 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
         )
         if quick_text:
             embed.add_field(name="⚡ よく使う人物", value=truncate_text(quick_text, 1000), inline=False)
-    embed.add_field(name="現在の確定人物", value="、".join(confirmed) if confirmed else "未確定", inline=False)
+    embed.add_field(name="現在の確定人物", value=format_people_for_users("、".join(confirmed)) or "未確定", inline=False)
     if review.get("blog_url"):
         embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
     embed.set_footer(text="人物がいない写真は「人物なし」、写っているが判別できない場合は「人物不明」を押してください。")
@@ -145,7 +153,7 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
 def build_completed_embed(review: dict[str, Any], names: list[str], reviewer: discord.abc.User) -> discord.Embed:
     embed = discord.Embed(title="✅ 人物確認完了", description="写真に写っている人物を確定しました。", color=SUCCESS_EMBED_COLOR)
     embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
-    embed.add_field(name="確定人物", value="、".join(names) if names else "人物なし", inline=False)
+    embed.add_field(name="確定人物", value=format_people_for_users("、".join(names)) if names else "人物なし", inline=False)
     embed.add_field(name="確認者", value=discord.utils.escape_markdown(normalize_text(getattr(reviewer, "display_name", reviewer.name))), inline=False)
     return embed
 
@@ -456,14 +464,17 @@ class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
         self.parent_view = parent
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        names = split_person_names(self.person_names.value)
+        names = normalize_people_for_storage(split_person_names(self.person_names.value))
         if not names:
             await interaction.response.send_message("人物名を入力してください。", ephemeral=True)
             return
+        for name in names:
+            if name not in _SAKAMICHI_MEMBER_NAMES and not unknown_other_count(name):
+                await asyncio.to_thread(save_person, name, "その他", "その他", False)
         await self.parent_view.complete_review(
             interaction,
             names,
-            note=normalize_text(self.note.value) or "人物名を手入力",
+            note=normalize_text(self.note.value) or "その他の人物名を手入力",
         )
 
 
@@ -478,6 +489,7 @@ class SelectionState:
     generation_name: str = ""
     member_page: int = 0
     remove_page: int = 0
+    unknown_other_people: int = 0
 
     def add_names(self, names: list[str]) -> None:
         for name in names:
@@ -498,10 +510,38 @@ class OwnedView(discord.ui.View):
 
 
 def selection_text(state: SelectionState) -> str:
-    selected = "、".join(state.selected_names) if state.selected_names else "まだ選択されていません。"
+    display_names = list(state.selected_names)
+    if state.unknown_other_people:
+        display_names.append(f"その他（名前不明）{state.unknown_other_people}人")
+    selected = "、".join(display_names) if display_names else "まだ選択されていません。"
     selected = truncate_text(selected, 1700)
     path = " → ".join(v for v in (state.group_name, state.generation_name) if v) or "グループを選んでください。"
-    return f"**選択場所:** {path}\n**選択中（{len(state.selected_names)}人）:** {selected}"
+    total = len(state.selected_names) + state.unknown_other_people
+    return f"**選択場所:** {path}\n**選択中（合計{total}人）:** {selected}"
+
+
+class OtherPersonInputModal(discord.ui.Modal, title="その他の人物を追加"):
+    person_names = discord.ui.TextInput(
+        label="人物名",
+        placeholder="複数人は「、」で区切ってください。",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+    )
+
+    def __init__(self, state: SelectionState):
+        super().__init__(timeout=300)
+        self.state = state
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        names = [n for n in split_person_names(self.person_names.value) if n]
+        if not names:
+            await interaction.response.send_message("人物名を入力してください。", ephemeral=True)
+            return
+        self.state.add_names(names)
+        for name in names:
+            if name not in _SAKAMICHI_MEMBER_NAMES:
+                await asyncio.to_thread(save_person, name, "その他", "その他", False)
+        await interaction.response.edit_message(content=selection_text(self.state), view=GroupView(self.state))
 
 
 class GroupSelect(discord.ui.Select):
@@ -530,6 +570,20 @@ class GroupView(OwnedView):
     @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=1)
     async def selected(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
+
+    @discord.ui.button(label="その他の人物を追加", emoji="➕", style=discord.ButtonStyle.secondary, row=2)
+    async def other_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(OtherPersonInputModal(self.state))
+
+    @discord.ui.button(label="名前不明を1人追加", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
+    async def add_unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.unknown_other_people += 1
+        await interaction.response.edit_message(content=selection_text(self.state), view=GroupView(self.state))
+
+    @discord.ui.button(label="名前不明を1人減らす", emoji="➖", style=discord.ButtonStyle.secondary, row=2)
+    async def remove_unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.unknown_other_people = max(0, self.state.unknown_other_people - 1)
+        await interaction.response.edit_message(content=selection_text(self.state), view=GroupView(self.state))
 
 
 class GenerationSelect(discord.ui.Select):
@@ -654,7 +708,7 @@ class SelectedPeopleView(OwnedView):
             self.add_item(RemoveSelect(state))
         self.previous_page.disabled = not state.selected_names or state.remove_page <= 0
         self.next_page.disabled = not state.selected_names or state.remove_page >= page_count - 1
-        self.confirm.disabled = not bool(state.selected_names)
+        self.confirm.disabled = not bool(state.selected_names or state.unknown_other_people)
 
     @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -678,6 +732,9 @@ class SelectedPeopleView(OwnedView):
         reviewer = get_reviewer_name(interaction.user)
         image_id = int(self.state.review["image_id"])
         names = list(self.state.selected_names)
+        if self.state.unknown_other_people:
+            names.append(make_unknown_other_label(self.state.unknown_other_people))
+        names = normalize_people_for_storage(names)
         await asyncio.to_thread(
             set_confirmed_image_people,
             image_id,
@@ -693,7 +750,17 @@ class SelectedPeopleView(OwnedView):
         if self.state.session:
             await self.state.session.mark_done(image_id, interaction)
 
-    @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="名前不明を1人追加", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
+    async def add_unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.unknown_other_people += 1
+        await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
+
+    @discord.ui.button(label="名前不明を1人減らす", emoji="➖", style=discord.ButtonStyle.secondary, row=2)
+    async def remove_unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.unknown_other_people = max(0, self.state.unknown_other_people - 1)
+        await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
+
+    @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=3)
     async def nobody(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer()
         image_id = int(self.state.review["image_id"])
@@ -712,21 +779,21 @@ class SelectedPeopleView(OwnedView):
         if self.state.session:
             await self.state.session.mark_done(image_id, interaction)
 
-    @discord.ui.button(label="人物不明", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="その他（名前不明）1人", emoji="❓", style=discord.ButtonStyle.secondary, row=3)
     async def unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer()
         image_id = int(self.state.review["image_id"])
         await asyncio.to_thread(
             set_confirmed_image_people,
             image_id,
-            ["人物不明"],
+            [make_unknown_other_label(1)],
             confirmed_by=get_reviewer_name(interaction.user),
-            note="人物不明",
+            note="その他の人物（名前不明）1人",
         )
         await _finish_selection_message(
             interaction,
             self.state.source_message,
-            f"✅ 写真ID **{image_id}** を人物不明で確定しました。",
+            f"✅ 写真ID **{image_id}** をその他（名前不明）1人で確定しました。",
         )
         if self.state.session:
             await self.state.session.mark_done(image_id, interaction)
@@ -891,6 +958,7 @@ class PersonReviewView(discord.ui.View):
     ) -> None:
         if not interaction.response.is_done():
             await interaction.response.defer()
+        names = normalize_people_for_storage(names)
         await asyncio.to_thread(
             set_confirmed_image_people,
             self.image_id,
@@ -929,13 +997,16 @@ class PersonReviewView(discord.ui.View):
     async def select_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(seed_member_master)
-        initial = split_person_names(self.review.get("confirmed_people", ""))
+        initial_raw = split_person_names(self.review.get("confirmed_people", ""))
+        initial_unknown = sum(unknown_other_count(name) for name in initial_raw)
+        initial = [name for name in initial_raw if not unknown_other_count(name)]
         state = SelectionState(
             review=self.review,
             owner_id=interaction.user.id,
             source_message=interaction.message,
             session=self.session,
             selected_names=initial,
+            unknown_other_people=initial_unknown,
         )
         await interaction.followup.send(
             selection_text(state),
@@ -995,8 +1066,8 @@ class PersonReviewView(discord.ui.View):
     async def unknown_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self.complete_review(
             interaction,
-            ["人物不明"],
-            note="人物は写っているが判別できない",
+            [make_unknown_other_label(1)],
+            note="その他の人物が1人写っているが名前不明",
         )
 
 
