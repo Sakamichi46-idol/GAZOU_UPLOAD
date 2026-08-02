@@ -17,7 +17,7 @@ from photo_search_tags import (
 )
 
 
-PAGE_SIZE = 5
+PAGE_SIZE = 4
 OPTIONS_PER_PAGE = 25
 
 CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
@@ -995,7 +995,7 @@ class CategoryView(OwnedView):
 
 
 class ResultsView(OwnedView):
-    """タグ検索結果を1ページ5枚ずつ、写真ごとの個別メッセージで表示する。"""
+    """タグ検索結果を1ページ4枚ずつ、1つのメッセージにまとめて表示する。"""
 
     def __init__(
         self,
@@ -1038,7 +1038,7 @@ class ResultsView(OwnedView):
         return (
             "🔍 **タグ検索結果**\n"
             f"取得件数: **{len(self.results)}件**\n"
-            f"現在表示: **{start}〜{end}件目**（写真は1枚ずつ表示）"
+            f"現在表示: **{start}〜{end}件目**（4枚を1セットで表示）"
         )
 
     async def delete_page_messages(self) -> None:
@@ -1052,13 +1052,15 @@ class ResultsView(OwnedView):
     async def send_page_messages(self, interaction: discord.Interaction) -> None:
         is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
         self.page_messages = []
-        for embed in self.build_embeds():
-            message = await interaction.followup.send(
-                embed=embed,
-                ephemeral=is_ephemeral,
-                wait=True,
-            )
-            self.page_messages.append(message)
+        embeds = self.build_embeds()
+        if not embeds:
+            return
+        message = await interaction.followup.send(
+            embeds=embeds,
+            ephemeral=is_ephemeral,
+            wait=True,
+        )
+        self.page_messages.append(message)
 
     def _add_number_buttons(self) -> None:
         for offset, _result in enumerate(self.current_results(), 1):
@@ -1101,11 +1103,11 @@ class ResultsView(OwnedView):
         )
         await view.send_page_messages(interaction)
 
-    @discord.ui.button(label="前の5枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の4枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._change_page(interaction, self.page - 1)
 
-    @discord.ui.button(label="次の5枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="次の4枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._change_page(interaction, self.page + 1)
 
