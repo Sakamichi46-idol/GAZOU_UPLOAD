@@ -20,6 +20,7 @@ from photo_database import (
 DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 50
 VIEW_TIMEOUT_SECONDS = 300
+RESULTS_PER_PAGE = 5
 
 
 def shorten_text(value: Any, max_length: int) -> str:
@@ -135,7 +136,7 @@ def get_display_image_url(result: dict[str, Any]) -> str:
 
 
 class PhotoSearchResultsView(discord.ui.View):
-    """1メッセージを編集して検索結果を切り替え、通信量と投稿数を抑える。"""
+    """検索結果を1ページ5枚で表示し、ページ単位で切り替える。"""
 
     def __init__(
         self,
@@ -144,35 +145,114 @@ class PhotoSearchResultsView(discord.ui.View):
         results: list[dict[str, Any]],
         query: str,
         search_label: str,
+        page: int = 0,
     ) -> None:
         super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
         self.owner_id = int(owner_id)
         self.results = results
         self.query = query
         self.search_label = search_label
-        self.index = 0
+        self.max_page = max(0, (len(results) - 1) // RESULTS_PER_PAGE)
+        self.page = max(0, min(int(page), self.max_page))
         self.message: discord.Message | None = None
+        self._add_favorite_buttons()
         self._sync_buttons()
 
-    def _sync_buttons(self) -> None:
-        self.previous_button.disabled = self.index <= 0
-        self.next_button.disabled = self.index >= len(self.results) - 1
+    def current_results(self) -> list[dict[str, Any]]:
+        start = self.page * RESULTS_PER_PAGE
+        return self.results[start : start + RESULTS_PER_PAGE]
 
-    def current_embed(self) -> discord.Embed:
-        result = self.results[self.index]
-        embed = build_search_embed(
-            result,
-            query=self.query,
-            index=self.index + 1,
-            total=len(self.results),
-            search_label=self.search_label,
-        )
-        image_url = get_display_image_url(result)
-        if image_url:
-            embed.set_image(url=image_url)
-        else:
-            embed.description = (embed.description or "") + "\n\n⚠️ 表示用URLがありません。"
-        return embed
+    def _sync_buttons(self) -> None:
+        self.previous_button.disabled = self.page <= 0
+        self.next_button.disabled = self.page >= self.max_page
+
+    def current_embeds(self) -> list[discord.Embed]:
+        start = self.page * RESULTS_PER_PAGE
+        embeds: list[discord.Embed] = []
+
+        for offset, result in enumerate(self.current_results(), start=1):
+            absolute_index = start + offset
+            title = result.get("title") or "無題"
+            blog_url = str(result.get("blog_url") or "").strip()
+            people = (
+                str(result.get("confirmed_people") or "").strip()
+                or str(result.get("candidate_people") or "").strip()
+                or "未確定"
+            )
+
+            embed = discord.Embed(
+                title=f"写真 {absolute_index}/{len(self.results)}｜画像ID {result.get('id', 0)}",
+                url=blog_url or None,
+                description=(
+                    f"**ブログ:** {shorten_text(title, 180)}\n"
+                    f"**人物:** {shorten_text(people, 300)}\n"
+                    f"**投稿者:** {shorten_text(result.get('member_name') or '不明', 100)}\n"
+                    f"**日時:** {shorten_text(result.get('published_at') or '不明', 100)}"
+                ),
+                color=0x00AAFF,
+            )
+
+            image_url = get_display_image_url(result)
+            if image_url:
+                embed.set_image(url=image_url)
+            else:
+                embed.add_field(
+                    name="⚠️ 表示エラー",
+                    value="表示用URLがありません。",
+                    inline=False,
+                )
+
+            embed.set_footer(
+                text=(
+                    f"{self.search_label}: {shorten_text(self.query, 80)}"
+                    f" • ページ {self.page + 1}/{self.max_page + 1}"
+                )
+            )
+            embeds.append(embed)
+
+        return embeds
+
+    def _add_favorite_buttons(self) -> None:
+        for offset, result in enumerate(self.current_results(), start=1):
+            try:
+                image_id = int(result.get("id", 0))
+            except (TypeError, ValueError):
+                image_id = 0
+
+            button = discord.ui.Button(
+                label=f"{offset}枚目を登録",
+                emoji="⭐",
+                style=discord.ButtonStyle.success,
+                row=0,
+                disabled=image_id <= 0,
+            )
+
+            async def callback(
+                interaction: discord.Interaction,
+                target_image_id: int = image_id,
+            ) -> None:
+                try:
+                    added = await asyncio.to_thread(
+                        add_photo_favorite,
+                        target_image_id,
+                        interaction.user.id,
+                    )
+                except Exception as error:
+                    print("お気に入り登録エラー:", error)
+                    await interaction.response.send_message(
+                        "⚠️ お気に入り登録中にエラーが発生しました。",
+                        ephemeral=True,
+                    )
+                    return
+
+                if added:
+                    text = f"⭐ 画像ID **{target_image_id}** をお気に入りに登録しました。"
+                else:
+                    text = f"⭐ 画像ID **{target_image_id}** はすでにお気に入り登録済みです。"
+                await interaction.response.send_message(text, ephemeral=True)
+
+            button.callback = callback
+            self.add_item(button)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -183,71 +263,47 @@ class PhotoSearchResultsView(discord.ui.View):
         )
         return False
 
-    @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(
+        label="前の5枚",
+        emoji="◀️",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
     async def previous_button(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        self.index = max(0, self.index - 1)
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+        view = PhotoSearchResultsView(
+            owner_id=self.owner_id,
+            results=self.results,
+            query=self.query,
+            search_label=self.search_label,
+            page=self.page - 1,
+        )
+        await interaction.response.edit_message(embeds=view.current_embeds(), view=view)
 
-    @discord.ui.button(label="次へ", emoji="▶️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(
+        label="次の5枚",
+        emoji="▶️",
+        style=discord.ButtonStyle.primary,
+        row=1,
+    )
     async def next_button(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        self.index = min(len(self.results) - 1, self.index + 1)
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.current_embed(), view=self)
+        view = PhotoSearchResultsView(
+            owner_id=self.owner_id,
+            results=self.results,
+            query=self.query,
+            search_label=self.search_label,
+            page=self.page + 1,
+        )
+        await interaction.response.edit_message(embeds=view.current_embeds(), view=view)
 
-    @discord.ui.button(
-        label="お気に入り登録",
-        emoji="⭐",
-        style=discord.ButtonStyle.success,
-    )
-    async def favorite_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        result = self.results[self.index]
-        try:
-            image_id = int(result.get("id", 0))
-        except (TypeError, ValueError):
-            image_id = 0
-
-        if image_id <= 0:
-            await interaction.response.send_message(
-                "⚠️ この写真の画像IDを取得できませんでした。",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            added = await asyncio.to_thread(
-                add_photo_favorite,
-                image_id,
-                interaction.user.id,
-            )
-        except Exception as error:
-            print("お気に入り登録エラー:", error)
-            await interaction.response.send_message(
-                "⚠️ お気に入り登録中にエラーが発生しました。",
-                ephemeral=True,
-            )
-            return
-
-        if added:
-            text = f"⭐ 画像ID **{image_id}** をお気に入りに登録しました。"
-        else:
-            text = f"⭐ 画像ID **{image_id}** はすでにお気に入り登録済みです。"
-
-        await interaction.response.send_message(text, ephemeral=True)
-
-    @discord.ui.button(label="終了", emoji="⏹️", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="終了", emoji="⏹️", style=discord.ButtonStyle.danger, row=1)
     async def close_button(
         self,
         interaction: discord.Interaction,
@@ -314,9 +370,9 @@ async def _send_search(
         content=(
             f"🔍 **{search_label}結果**\n"
             f"検索語: `{shorten_text(clean_query, 1000)}`\n"
-            f"取得件数: **{len(results)}件**（ボタンで切り替え）"
+            f"取得件数: **{len(results)}件**（1ページ5枚）"
         ),
-        embed=view.current_embed(),
+        embeds=view.current_embeds(),
         view=view,
     )
     view.message = message
