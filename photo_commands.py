@@ -63,6 +63,7 @@ from photo_face_review_view import (
 )
 from photo_face_cluster_view import send_face_cluster_review
 from photo_id_view import send_photo_by_id
+from photo_favorites import send_favorite_gallery
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -1394,27 +1395,9 @@ def register_photo_commands(bot: commands.Bot) -> None:
 
     @bot.command(name="favorite_list")
     
-    async def favorite_list_command(ctx: commands.Context, limit: int = 20) -> None:
-        limit = max(1, min(int(limit), 50))
-        favorites = await asyncio.to_thread(
-            _rows,
-            """
-            SELECT photo_images.id, photo_blogs.group_name, photo_blogs.member_name,
-                   photo_blogs.published_at
-            FROM photo_favorites
-            JOIN photo_images ON photo_images.id = photo_favorites.image_id
-            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
-            WHERE photo_favorites.discord_user_id = ?
-            ORDER BY photo_favorites.id DESC
-            LIMIT ?
-            """,
-            (str(ctx.author.id), limit),
-        )
-        if not favorites:
-            await ctx.send("⭐ お気に入りはまだありません。")
-            return
-        lines = [f"`ID {x['id']}` {x['group_name']} / {x['member_name']} / {x['published_at']}" for x in favorites]
-        await ctx.send("⭐ **お気に入り一覧**\n" + "\n".join(lines))
+    async def favorite_list_command(ctx: commands.Context, limit: int = 100) -> None:
+        limit = max(1, min(int(limit), 100))
+        await send_favorite_gallery(ctx, limit=limit)
 
     @bot.command(name="photo_reset")
     @commands.is_owner()
