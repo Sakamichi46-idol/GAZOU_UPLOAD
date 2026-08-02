@@ -21,7 +21,7 @@ from photo_search_tags import (
 )
 
 
-PAGE_SIZE = 4
+PAGE_SIZE = 9
 OPTIONS_PER_PAGE = 25
 
 CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
@@ -998,8 +998,63 @@ class CategoryView(OwnedView):
         )
 
 
+class TagResultSelect(discord.ui.Select):
+    """現在ページの1〜9枚目から詳細表示する写真を選ぶ。"""
+
+    def __init__(self, parent_view: "ResultsView") -> None:
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=f"{offset + 1}枚目の詳細",
+                description=f"タグ検索結果の{parent_view.page * PAGE_SIZE + offset + 1}件目",
+                value=str(offset),
+                emoji="📷",
+            )
+            for offset, _result in enumerate(parent_view.current_results())
+        ]
+        super().__init__(
+            placeholder="詳細を見る写真を選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            item_offset = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "⚠️ 選択した写真を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        index = self.parent_view.page * PAGE_SIZE + item_offset
+        if index >= len(self.parent_view.results):
+            await interaction.response.send_message(
+                "⚠️ 選択した写真を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        await self.parent_view.delete_page_messages()
+        view = DetailView(
+            self.parent_view.state,
+            self.parent_view.results,
+            index=index,
+            return_page=self.parent_view.page,
+        )
+        await interaction.message.edit(
+            content=None,
+            embeds=[view.build_embed()],
+            view=view,
+        )
+
+
 class ResultsView(OwnedView):
-    """タグ検索結果を1ページ4枚ずつ、1つのメッセージにまとめて表示する。"""
+    """タグ検索結果を1ページ9枚ずつ、1つのメッセージにまとめて表示する。"""
 
     def __init__(
         self,
@@ -1014,7 +1069,7 @@ class ResultsView(OwnedView):
         max_page = max(0, math.ceil(len(results) / PAGE_SIZE) - 1)
         self.page = max(0, min(page, max_page))
 
-        self._add_number_buttons()
+        self.add_item(TagResultSelect(self))
         self.previous.disabled = self.page <= 0
         self.next.disabled = (self.page + 1) * PAGE_SIZE >= len(self.results)
 
@@ -1023,7 +1078,7 @@ class ResultsView(OwnedView):
         return self.results[start : start + PAGE_SIZE]
 
     async def build_files(self) -> list[discord.File]:
-        """現在ページの4枚を、Discordの同時添付用ファイルに変換する。"""
+        """現在ページの最大9枚を、Discordの同時添付用ファイルに変換する。"""
         return await build_photo_attachment_files(self.current_results())
 
     def control_content(self) -> str:
@@ -1032,7 +1087,7 @@ class ResultsView(OwnedView):
         return (
             "🔍 **タグ検索結果**\n"
             f"取得件数: **{len(self.results)}件**\n"
-            f"現在表示: **{start}〜{end}件目**（4枚を1セットで表示）"
+            f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
         )
 
     async def delete_page_messages(self) -> None:
@@ -1100,11 +1155,11 @@ class ResultsView(OwnedView):
         )
         await view.send_page_messages(interaction)
 
-    @discord.ui.button(label="前の4枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の9枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._change_page(interaction, self.page - 1)
 
-    @discord.ui.button(label="次の4枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="次の9枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._change_page(interaction, self.page + 1)
 
