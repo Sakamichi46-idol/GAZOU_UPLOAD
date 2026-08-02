@@ -327,6 +327,77 @@ class UserPanelView(discord.ui.View):
     async def people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "person_list")
 
+    @discord.ui.button(
+        label="使い方",
+        emoji="❓",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:help",
+    )
+    async def help(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        embed = discord.Embed(
+            title="❓ 一般ユーザーパネルの使い方",
+            description=(
+                "各ボタンの操作結果は、基本的に操作した本人だけに表示されます。\n"
+                "写真や検索内容が公開チャンネルへ流れることはありません。"
+            ),
+        )
+        embed.add_field(
+            name="🔍 写真検索",
+            value=(
+                "人物名・タグ・ブログタイトルなどを自由に入力して検索します。\n"
+                "結果画面では写真を前後に切り替え、そのままお気に入り登録できます。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="👤 人物で探す",
+            value=(
+                "人物名を入力し、その人物が写っている写真を検索します。\n"
+                "結果から気に入った写真を直接お気に入り登録できます。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🏷️ タグで探す",
+            value=(
+                "カテゴリーとタグを順番に選び、条件に合う写真を探します。\n"
+                "写真の詳細画面から、そのままお気に入り登録できます。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🖼️ 画像ID",
+            value=(
+                "画像IDを入力して、特定の写真を直接表示します。\n"
+                "`125`、`ID 125`、`画像ID：125` のように入力できます。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⭐ お気に入り",
+            value=(
+                "登録した写真を1枚ずつ表示します。\n"
+                "前へ・次へで移動でき、表示中の写真だけを個別に削除できます。"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🕒 最近の写真",
+            value="新しく保存された写真を、最近のものから順に表示します。",
+            inline=False,
+        )
+        embed.add_field(
+            name="📋 人物一覧",
+            value="写真データベースに登録されている人物名の一覧を表示します。",
+            inline=False,
+        )
+        embed.set_footer(text="この説明画面も、操作した本人にだけ表示されます。")
+
+        if interaction.response.is_done():
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
 
 class AdminQuickView(discord.ui.View):
     def __init__(self) -> None:
@@ -432,7 +503,7 @@ def _is_control_panel_message(message: discord.Message, bot_user: discord.Client
             return True
 
         # 旧版パネルにも対応し、初回更新時に重複を解消する。
-        if embed.title in {"📸 写真検索パネル", "👑 管理者パネル"}:
+        if embed.title in {"📸 写真アーカイブBot", "👑 管理者パネル"}:
             return True
 
     return False
