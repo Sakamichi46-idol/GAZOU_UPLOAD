@@ -17,7 +17,7 @@ from photo_search_tags import (
 )
 
 
-PAGE_SIZE = 5
+PAGE_SIZE = 1
 OPTIONS_PER_PAGE = 25
 
 CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
@@ -1041,12 +1041,12 @@ class ResultsView(OwnedView):
 
             embed = discord.Embed(
                 title=(
-                    f"{absolute_index}. "
-                    f"{_short(title, 220)}"
+                    f"写真 {absolute_index}/{len(self.results)}｜"
+                    f"画像ID {result.get('id')}"
                 ),
                 url=result.get("blog_url") or None,
                 description=(
-                    f"**画像ID:** {result.get('id')}\n"
+                    f"**ブログ:** {_short(title, 180)}\n"
                     f"**人物:** "
                     f"{result.get('confirmed_people') or result.get('candidate_people') or '未確定'}\n"
                     f"**確認状態:** {('✅ 確認済み' if result.get('confirmed_people') else '⚠️ AI候補・確認待ち')}\n"
@@ -1061,7 +1061,7 @@ class ResultsView(OwnedView):
             image_url = get_display_image_url(result)
 
             if image_url:
-                embed.set_thumbnail(
+                embed.set_image(
                     url=image_url
                 )
 
@@ -1082,7 +1082,7 @@ class ResultsView(OwnedView):
             1,
         ):
             button = discord.ui.Button(
-                label=str(offset),
+                label="詳細を見る",
                 style=discord.ButtonStyle.primary,
                 row=0,
             )
@@ -1113,7 +1113,7 @@ class ResultsView(OwnedView):
             self.add_item(button)
 
     @discord.ui.button(
-        label="前の5件",
+        label="前の写真",
         emoji="◀️",
         style=discord.ButtonStyle.secondary,
         row=1,
@@ -1135,7 +1135,7 @@ class ResultsView(OwnedView):
         )
 
     @discord.ui.button(
-        label="次の5件",
+        label="次の写真",
         emoji="▶️",
         style=discord.ButtonStyle.secondary,
         row=1,
