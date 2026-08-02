@@ -703,12 +703,24 @@ class ExplorerView(OwnedView):
             await interaction.response.defer()
             results = await asyncio.to_thread(_load_results, self.state.result_ids())
             view = ResultsView(self.state, results, page=0)
-            await interaction.edit_original_response(
-                content=view.control_content(),
-                embeds=[],
-                view=view,
-            )
-            await view.send_page_messages(interaction)
+            files = await view.build_files()
+            if not files:
+                await interaction.edit_original_response(
+                    content="⚠️ 検索結果の画像を取得できませんでした。",
+                    embeds=[],
+                    attachments=[],
+                    view=None,
+                )
+                return
+            try:
+                await interaction.edit_original_response(
+                    content=view.control_content(),
+                    embeds=[],
+                    attachments=files,
+                    view=view,
+                )
+            finally:
+                close_discord_files(files)
         search_button.callback = search_callback
         self.add_item(search_button)
 
@@ -1038,17 +1050,16 @@ class TagResultSelect(discord.ui.Select):
             )
             return
 
-        await interaction.response.defer()
-        await self.parent_view.delete_page_messages()
         view = DetailView(
             self.parent_view.state,
             self.parent_view.results,
             index=index,
             return_page=self.parent_view.page,
         )
-        await interaction.message.edit(
+        await interaction.response.edit_message(
             content=None,
             embeds=[view.build_embed()],
+            attachments=[],
             view=view,
         )
 
@@ -1064,7 +1075,6 @@ class ResultsView(OwnedView):
     ):
         super().__init__(state)
         self.results = results
-        self.page_messages: list[discord.Message] = []
 
         max_page = max(0, math.ceil(len(results) / PAGE_SIZE) - 1)
         self.page = max(0, min(page, max_page))
@@ -1090,70 +1100,24 @@ class ResultsView(OwnedView):
             f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
         )
 
-    async def delete_page_messages(self) -> None:
-        for message in self.page_messages:
-            try:
-                await message.delete()
-            except (discord.HTTPException, discord.NotFound):
-                pass
-        self.page_messages.clear()
-
-    async def send_page_messages(self, interaction: discord.Interaction) -> None:
-        is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
-        self.page_messages = []
-        files = await self.build_files()
+    async def _change_page(self, interaction: discord.Interaction, page: int) -> None:
+        view = ResultsView(self.state, self.results, page)
+        files = await view.build_files()
         if not files:
+            await interaction.response.send_message(
+                "⚠️ 次のページの画像を取得できませんでした。",
+                ephemeral=True,
+            )
             return
         try:
-            message = await interaction.followup.send(
-                files=files,
-                ephemeral=is_ephemeral,
-                wait=True,
+            await interaction.response.edit_message(
+                content=view.control_content(),
+                embeds=[],
+                attachments=files,
+                view=view,
             )
-            self.page_messages.append(message)
         finally:
             close_discord_files(files)
-
-    def _add_number_buttons(self) -> None:
-        for offset, _result in enumerate(self.current_results(), 1):
-            button = discord.ui.Button(
-                label=f"{offset}枚目の詳細",
-                style=discord.ButtonStyle.primary,
-                row=0,
-            )
-
-            async def callback(
-                interaction: discord.Interaction,
-                item_offset: int = offset,
-            ) -> None:
-                await interaction.response.defer()
-                await self.delete_page_messages()
-                index = self.page * PAGE_SIZE + item_offset - 1
-                view = DetailView(
-                    self.state,
-                    self.results,
-                    index=index,
-                    return_page=self.page,
-                )
-                await interaction.message.edit(
-                    content=None,
-                    embeds=[view.build_embed()],
-                    view=view,
-                )
-
-            button.callback = callback
-            self.add_item(button)
-
-    async def _change_page(self, interaction: discord.Interaction, page: int) -> None:
-        await interaction.response.defer()
-        await self.delete_page_messages()
-        view = ResultsView(self.state, self.results, page)
-        await interaction.message.edit(
-            content=view.control_content(),
-            embeds=[],
-            view=view,
-        )
-        await view.send_page_messages(interaction)
 
     @discord.ui.button(label="前の9枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1165,12 +1129,11 @@ class ResultsView(OwnedView):
 
     @discord.ui.button(label="条件変更", emoji="🔧", style=discord.ButtonStyle.success, row=1)
     async def explorer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        await self.delete_page_messages()
         view = ExplorerView(self.state)
-        await interaction.message.edit(
+        await interaction.response.edit_message(
             content=None,
             embeds=[build_explorer_embed(self.state)],
+            attachments=[],
             view=view,
         )
 
@@ -1434,13 +1397,22 @@ class DetailView(OwnedView):
             self.index // PAGE_SIZE,
         )
 
-        await interaction.response.defer()
-        await interaction.message.edit(
-            content=view.control_content(),
-            embeds=[],
-            view=view,
-        )
-        await view.send_page_messages(interaction)
+        files = await view.build_files()
+        if not files:
+            await interaction.response.send_message(
+                "⚠️ 一覧の画像を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+        try:
+            await interaction.response.edit_message(
+                content=view.control_content(),
+                embeds=[],
+                attachments=files,
+                view=view,
+            )
+        finally:
+            close_discord_files(files)
 
     @discord.ui.button(
         label="条件変更",
@@ -1456,7 +1428,9 @@ class DetailView(OwnedView):
         view = ExplorerView(self.state)
 
         await interaction.response.edit_message(
+            content=None,
             embeds=[build_explorer_embed(self.state)],
+            attachments=[],
             view=view,
         )
 
