@@ -699,7 +699,12 @@ class ExplorerView(OwnedView):
             await interaction.response.defer()
             results = await asyncio.to_thread(_load_results, self.state.result_ids())
             view = ResultsView(self.state, results, page=0)
-            await interaction.edit_original_response(embeds=view.build_embeds(), view=view)
+            await interaction.edit_original_response(
+                content=view.control_content(),
+                embeds=[],
+                view=view,
+            )
+            await view.send_page_messages(interaction)
         search_button.callback = search_callback
         self.add_item(search_button)
 
@@ -990,6 +995,8 @@ class CategoryView(OwnedView):
 
 
 class ResultsView(OwnedView):
+    """タグ検索結果を1ページ5枚ずつ、写真ごとの個別メッセージで表示する。"""
+
     def __init__(
         self,
         state: ExplorerState,
@@ -997,90 +1004,64 @@ class ResultsView(OwnedView):
         page: int = 0,
     ):
         super().__init__(state)
-
         self.results = results
+        self.page_messages: list[discord.Message] = []
 
-        max_page = max(
-            0,
-            math.ceil(
-                len(results) / PAGE_SIZE
-            ) - 1,
-        )
-
-        self.page = max(
-            0,
-            min(page, max_page),
-        )
+        max_page = max(0, math.ceil(len(results) / PAGE_SIZE) - 1)
+        self.page = max(0, min(page, max_page))
 
         self._add_number_buttons()
-
         self.previous.disabled = self.page <= 0
-
-        self.next.disabled = (
-            (self.page + 1) * PAGE_SIZE
-            >= len(self.results)
-        )
+        self.next.disabled = (self.page + 1) * PAGE_SIZE >= len(self.results)
 
     def current_results(self) -> list[dict[str, Any]]:
         start = self.page * PAGE_SIZE
-
-        return self.results[
-            start : start + PAGE_SIZE
-        ]
+        return self.results[start : start + PAGE_SIZE]
 
     def build_embeds(self) -> list[discord.Embed]:
-        start = self.page * PAGE_SIZE
+        """一覧では説明を付けず、写真だけを1枚ずつ表示する。"""
         embeds: list[discord.Embed] = []
 
-        for offset, result in enumerate(
-            self.current_results(),
-            1,
-        ):
-            absolute_index = start + offset
-            title = result.get("title") or "無題"
-
-            embed = discord.Embed(
-                title=(
-                    f"写真 {absolute_index}/{len(self.results)}｜"
-                    f"画像ID {result.get('id')}"
-                ),
-                url=result.get("blog_url") or None,
-                description=(
-                    f"**ブログ:** {_short(title, 180)}\n"
-                    f"**人物:** "
-                    f"{result.get('confirmed_people') or result.get('candidate_people') or '未確定'}\n"
-                    f"**確認状態:** {('✅ 確認済み' if result.get('confirmed_people') else '⚠️ AI候補・確認待ち')}\n"
-                    f"**投稿者:** "
-                    f"{result.get('member_name') or '不明'}\n"
-                    f"**日時:** "
-                    f"{result.get('published_at') or '不明'}"
-                ),
-                color=0x00AAFF,
-            )
-
+        for result in self.current_results():
             image_url = get_display_image_url(result)
-
-            if image_url:
-                embed.set_image(
-                    url=image_url
-                )
-
-            embed.set_footer(
-                text=(
-                    f"検索結果 "
-                    f"{absolute_index}/{len(self.results)}"
-                )
-            )
-
+            if not image_url:
+                continue
+            embed = discord.Embed(color=0x00AAFF)
+            embed.set_image(url=image_url)
             embeds.append(embed)
 
         return embeds
 
+    def control_content(self) -> str:
+        start = self.page * PAGE_SIZE + 1
+        end = min(len(self.results), start + PAGE_SIZE - 1)
+        return (
+            "🔍 **タグ検索結果**\n"
+            f"取得件数: **{len(self.results)}件**\n"
+            f"現在表示: **{start}〜{end}件目**（写真は1枚ずつ表示）"
+        )
+
+    async def delete_page_messages(self) -> None:
+        for message in self.page_messages:
+            try:
+                await message.delete()
+            except (discord.HTTPException, discord.NotFound):
+                pass
+        self.page_messages.clear()
+
+    async def send_page_messages(self, interaction: discord.Interaction) -> None:
+        is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
+        self.page_messages = []
+        for embed in self.build_embeds():
+            message = await interaction.followup.send(
+                embed=embed,
+                ephemeral=is_ephemeral,
+                wait=True,
+            )
+            self.page_messages.append(message)
+
     def _add_number_buttons(self) -> None:
-        for offset, _result in enumerate(
-            self.current_results(),
-            1,
-        ):
+        for offset, _result in enumerate(self.current_results(), 1):
             button = discord.ui.Button(
                 label=f"{offset}枚目の詳細",
                 style=discord.ButtonStyle.primary,
@@ -1091,20 +1072,17 @@ class ResultsView(OwnedView):
                 interaction: discord.Interaction,
                 item_offset: int = offset,
             ) -> None:
-                index = (
-                    self.page * PAGE_SIZE
-                    + item_offset
-                    - 1
-                )
-
+                await interaction.response.defer()
+                await self.delete_page_messages()
+                index = self.page * PAGE_SIZE + item_offset - 1
                 view = DetailView(
                     self.state,
                     self.results,
                     index=index,
                     return_page=self.page,
                 )
-
-                await interaction.response.edit_message(
+                await interaction.message.edit(
+                    content=None,
                     embeds=[view.build_embed()],
                     view=view,
                 )
@@ -1112,64 +1090,32 @@ class ResultsView(OwnedView):
             button.callback = callback
             self.add_item(button)
 
-    @discord.ui.button(
-        label="前の5枚",
-        emoji="◀️",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def previous(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        view = ResultsView(
-            self.state,
-            self.results,
-            self.page - 1,
-        )
-
-        await interaction.response.edit_message(
-            embeds=view.build_embeds(),
+    async def _change_page(self, interaction: discord.Interaction, page: int) -> None:
+        await interaction.response.defer()
+        await self.delete_page_messages()
+        view = ResultsView(self.state, self.results, page)
+        await interaction.message.edit(
+            content=view.control_content(),
+            embeds=[],
             view=view,
         )
+        await view.send_page_messages(interaction)
 
-    @discord.ui.button(
-        label="次の5枚",
-        emoji="▶️",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def next(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
-        view = ResultsView(
-            self.state,
-            self.results,
-            self.page + 1,
-        )
+    @discord.ui.button(label="前の5枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._change_page(interaction, self.page - 1)
 
-        await interaction.response.edit_message(
-            embeds=view.build_embeds(),
-            view=view,
-        )
+    @discord.ui.button(label="次の5枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._change_page(interaction, self.page + 1)
 
-    @discord.ui.button(
-        label="条件変更",
-        emoji="🔧",
-        style=discord.ButtonStyle.success,
-        row=1,
-    )
-    async def explorer(
-        self,
-        interaction: discord.Interaction,
-        _: discord.ui.Button,
-    ) -> None:
+    @discord.ui.button(label="条件変更", emoji="🔧", style=discord.ButtonStyle.success, row=1)
+    async def explorer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        await self.delete_page_messages()
         view = ExplorerView(self.state)
-
-        await interaction.response.edit_message(
+        await interaction.message.edit(
+            content=None,
             embeds=[build_explorer_embed(self.state)],
             view=view,
         )
@@ -1208,12 +1154,15 @@ class DetailView(OwnedView):
         result = self.results[self.index]
 
         embed = discord.Embed(
-            title=_short(
-                result.get("title") or "無題",
-                256,
-            ),
+            title="📷 写真の詳細",
             url=result.get("blog_url") or None,
             color=0xF1C40F,
+        )
+
+        embed.add_field(
+            name="📝 ブログタイトル",
+            value=_short(result.get("title") or "無題", 1024),
+            inline=False,
         )
 
         embed.add_field(
@@ -1431,10 +1380,13 @@ class DetailView(OwnedView):
             self.index // PAGE_SIZE,
         )
 
-        await interaction.response.edit_message(
-            embeds=view.build_embeds(),
+        await interaction.response.defer()
+        await interaction.message.edit(
+            content=view.control_content(),
+            embeds=[],
             view=view,
         )
+        await view.send_page_messages(interaction)
 
     @discord.ui.button(
         label="条件変更",
