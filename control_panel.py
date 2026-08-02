@@ -65,6 +65,44 @@ async def _reply(interaction: discord.Interaction, text: str, *, ephemeral: bool
         await interaction.response.send_message(text, ephemeral=ephemeral)
 
 
+class EphemeralPanelContext(commands.Context):
+    """パネル経由の ``ctx.send`` を本人だけに見える応答へ変換する。
+
+    既存のprefix command側を個別に書き換えず、検索結果・画像・Embed・Viewを
+    すべてInteractionのフォローアップとして送信する。これにより、一般ユーザーが
+    何人操作しても公開チャンネルに操作結果が積み重ならない。
+    """
+
+    async def send(self, content: str | None = None, **kwargs):  # type: ignore[override]
+        interaction = self.interaction
+        if interaction is None:
+            return await super().send(content, **kwargs)
+
+        # Webhookのfollowup.sendではprefix command向けの返信指定を使えないため除外する。
+        kwargs.pop("reference", None)
+        kwargs.pop("mention_author", None)
+        kwargs.pop("stickers", None)
+
+        # パネル経由では呼び出し側の指定にかかわらず、必ず本人だけに表示する。
+        kwargs["ephemeral"] = True
+        kwargs["wait"] = True
+
+        if not interaction.response.is_done():
+            response_kwargs = dict(kwargs)
+            response_kwargs.pop("wait", None)
+            await interaction.response.send_message(content, **response_kwargs)
+            message = await interaction.original_response()
+        else:
+            message = await interaction.followup.send(content, **kwargs)
+
+        delete_after = kwargs.get("delete_after")
+        if delete_after is not None and message is not None:
+            # followup.send側でもdelete_afterが処理されるが、戻り値互換を保つため
+            # Messageをそのまま返す。
+            return message
+        return message
+
+
 async def invoke_existing_command(
     interaction: discord.Interaction,
     command_name: str,
@@ -118,7 +156,7 @@ async def invoke_existing_command(
 
     message = _PanelMessage(interaction.message)
 
-    ctx = commands.Context(
+    ctx = EphemeralPanelContext(
         message=message,
         bot=bot,
         view=StringView(raw_arguments.strip()),
@@ -439,6 +477,7 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
         title="📸 写真アーカイブBot",
         description=(
             "下のボタンから写真を検索できます。\n"
+            "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
             "お気に入りはDiscordユーザーごとに保存されます。"
         ),
     )
