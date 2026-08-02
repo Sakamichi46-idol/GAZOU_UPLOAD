@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import discord
@@ -22,6 +23,7 @@ from photo_review_view import send_blog_person_review_batch
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
 PROGRESS_SEGMENTS = 10
+LOGGER = logging.getLogger(__name__)
 
 
 async def _admin(interaction: discord.Interaction) -> bool:
@@ -36,6 +38,36 @@ async def _deny(interaction: discord.Interaction) -> None:
         await interaction.followup.send("⚠️ 管理者専用です。", ephemeral=True)
     else:
         await interaction.response.send_message("⚠️ 管理者専用です。", ephemeral=True)
+
+
+class AdminWorkflowView(discord.ui.View):
+    """時間制限なしで使える管理者ワークフロー共通View。
+
+    これらは管理者パネルから生成されるため、Botが稼働している間は
+    時間経過だけでボタンや選択メニューが無効にならない。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if await _admin(interaction):
+            return True
+        await _deny(interaction)
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        LOGGER.exception("管理者ワークフローの操作でエラーが発生しました", exc_info=error)
+        text = "⚠️ 管理画面の操作中にエラーが発生しました。もう一度お試しください。"
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
 
 
 def _progress_bar(percent: int, *, has_error: bool = False) -> str:
@@ -97,15 +129,9 @@ class ImageIdModal(discord.ui.Modal):
         )
 
 
-class CategoryAdminView(discord.ui.View):
+class CategoryAdminView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=300)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if await _admin(interaction):
-            return True
-        await _deny(interaction)
-        return False
+        super().__init__()
 
     @discord.ui.button(label="写真管理", emoji="📷", style=discord.ButtonStyle.primary)
     async def photo(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -134,9 +160,9 @@ class CategoryAdminView(discord.ui.View):
         await interaction.response.send_message("🛠️ 状態・修復", view=StatusAdminView(), ephemeral=True)
 
 
-class PhotoAdminView(discord.ui.View):
+class PhotoAdminView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__()
 
     @discord.ui.button(label="写真IDを表示", emoji="🖼️", style=discord.ButtonStyle.primary)
     async def show(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -169,9 +195,9 @@ class PhotoAdminView(discord.ui.View):
         await interaction.response.send_modal(ImageIdModal("face_scan", "写真1枚を顔認証"))
 
 
-class ReviewAdminView(discord.ui.View):
+class ReviewAdminView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__()
 
     @discord.ui.button(label="人物確認を開始", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -202,9 +228,9 @@ class ReviewAdminView(discord.ui.View):
         ))
 
 
-class StatusAdminView(discord.ui.View):
+class StatusAdminView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__()
 
     @discord.ui.button(label="統合ステータス", emoji="📊", style=discord.ButtonStyle.primary)
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -230,9 +256,9 @@ class StatusAdminView(discord.ui.View):
         ))
 
 
-class BlogDashboardView(discord.ui.View):
+class BlogDashboardView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=600)
+        super().__init__()
 
     @discord.ui.button(label="最新記事", emoji="📅", style=discord.ButtonStyle.primary)
     async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -304,9 +330,9 @@ class ProgressBlogSelect(discord.ui.Select):
         )
 
 
-class ProgressBlogSelectView(discord.ui.View):
+class ProgressBlogSelectView(AdminWorkflowView):
     def __init__(self, blogs: list[dict[str, Any]], heading: str):
-        super().__init__(timeout=600)
+        super().__init__()
         self.add_item(ProgressBlogSelect(blogs, heading))
 
     @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
@@ -324,58 +350,93 @@ class GroupSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         group = self.values[0]
-        await interaction.response.edit_message(
-            content=f"📖 **{group}** のブログ投稿者を選択してください。",
+        await interaction.response.defer()
+        authors = await asyncio.to_thread(get_blog_authors_for_admin, group, 25)
+        await interaction.edit_original_response(
+            content=(
+                f"📖 **{group}** のブログ投稿者を選択してください。\n"
+                "各投稿者には、完了記事数・全記事数・未完了数を表示しています。"
+            ),
             embed=None,
-            view=AuthorSelectView(group),
+            view=AuthorSelectView(group, authors),
         )
 
 
-class GroupSelectView(discord.ui.View):
+class GroupSelectView(AdminWorkflowView):
     def __init__(self):
-        super().__init__(timeout=300)
+        super().__init__()
         self.add_item(GroupSelect())
 
 
 class AuthorSelect(discord.ui.Select):
-    def __init__(self, group: str):
+    def __init__(self, group: str, authors: list[dict[str, Any]]):
         self.group = group
-        authors = get_blog_authors_for_admin(group, 25)
-        options = [
-            discord.SelectOption(
+        self.authors = {str(author.get("member_name") or ""): author for author in authors}
+        options = []
+        for author in authors:
+            total = int(author.get("blog_count") or 0)
+            completed = int(author.get("completed_blog_count") or 0)
+            pending = max(0, int(author.get("pending_blog_count") or (total - completed)))
+            percent = int(author.get("completion_percent") or (round(completed * 100 / total) if total else 0))
+            options.append(discord.SelectOption(
                 label=str(author["member_name"])[:100],
-                description=f"記事 {author['blog_count']}件",
-            )
-            for author in authors
-        ]
+                value=str(author["member_name"])[:100],
+                description=(
+                    f"完了 {completed}/{total}件 ({percent}%) ・ 未完了 {pending}件"
+                )[:100],
+                emoji="✅" if total > 0 and completed >= total else "👤",
+            ))
         if not options:
             options = [discord.SelectOption(label="投稿者が見つかりません", value="__none__")]
-        super().__init__(placeholder="ブログ投稿者を選択", options=options)
+        super().__init__(placeholder="投稿者を選択（完了記事数 / 全記事数）", options=options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         author = self.values[0]
         if author == "__none__":
             await interaction.response.send_message("対象がありません。", ephemeral=True)
             return
+
+        await interaction.response.defer()
         blogs = await asyncio.to_thread(get_blogs_for_admin, self.group, author, 25)
-        # 既存取得結果へ進捗情報を付け直す。
-        detailed = []
-        for blog in blogs:
-            progress = await asyncio.to_thread(get_blog_progress_for_admin, int(blog["id"]))
-            if progress:
-                detailed.append(progress)
-        await _show_blog_list(interaction, f"👤 {self.group} / {author}", detailed)
+        progress_results = await asyncio.gather(*(
+            asyncio.to_thread(get_blog_progress_for_admin, int(blog["id"]))
+            for blog in blogs
+        ))
+        detailed = [progress for progress in progress_results if progress]
+
+        stats = self.authors.get(author, {})
+        total = int(stats.get("blog_count") or len(blogs))
+        completed = int(stats.get("completed_blog_count") or 0)
+        pending = max(0, int(stats.get("pending_blog_count") or (total - completed)))
+        percent = int(stats.get("completion_percent") or (round(completed * 100 / total) if total else 0))
+        heading = (
+            f"👤 {self.group} / {author}\n"
+            f"記事進捗: 完了 **{completed}/{total}件**（{percent}%）・未完了 **{pending}件**"
+        )
+
+        if not detailed:
+            await interaction.edit_original_response(
+                content=f"{heading}\n対象記事はありません。",
+                embed=None,
+                view=BlogDashboardView(),
+            )
+            return
+        await interaction.edit_original_response(
+            content=f"{heading}\n記事を選択してください。各項目には画像単位の人物確認進捗を表示しています。",
+            embed=None,
+            view=ProgressBlogSelectView(detailed, heading),
+        )
 
 
-class AuthorSelectView(discord.ui.View):
-    def __init__(self, group: str):
-        super().__init__(timeout=300)
-        self.add_item(AuthorSelect(group))
+class AuthorSelectView(AdminWorkflowView):
+    def __init__(self, group: str, authors: list[dict[str, Any]]):
+        super().__init__()
+        self.add_item(AuthorSelect(group, authors))
 
 
-class BlogArticleView(discord.ui.View):
+class BlogArticleView(AdminWorkflowView):
     def __init__(self, blog_id: int):
-        super().__init__(timeout=900)
+        super().__init__()
         self.blog_id = int(blog_id)
 
     @discord.ui.button(label="人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
