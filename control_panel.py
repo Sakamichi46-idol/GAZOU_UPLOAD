@@ -6,18 +6,38 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
 from typing import Iterable
 
+LOGGER = logging.getLogger(__name__)
 PANEL_MARKER = "photo-archive-control-panel-v2"
-PANEL_HISTORY_SCAN_LIMIT = 100
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int | None = None) -> int:
+    """整数の環境変数を安全に読み込む。誤設定でもBot起動を止めない。"""
+    raw = str(os.getenv(name, "") or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except ValueError:
+        LOGGER.warning("%s=%r は整数ではないため既定値 %s を使用します。", name, raw, default)
+        value = int(default)
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+PANEL_HISTORY_SCAN_LIMIT = _env_int("PHOTO_PANEL_HISTORY_SCAN_LIMIT", 200, minimum=1, maximum=1000)
+USER_PANEL_COOLDOWN_SECONDS = 1.5
 
 import discord
 from discord.ext import commands
 from discord.ext.commands.view import StringView
 
-ADMIN_ROLE_ID = int(os.getenv("PHOTO_BOT_ADMIN_ROLE_ID", "0") or 0)
+ADMIN_ROLE_ID = _env_int("PHOTO_BOT_ADMIN_ROLE_ID", 0, minimum=0)
 ADMIN_ROLE_NAME = os.getenv("PHOTO_BOT_ADMIN_ROLE_NAME", "PhotoBot Admin").strip() or "PhotoBot Admin"
 
 
@@ -86,6 +106,7 @@ class EphemeralPanelContext(commands.Context):
         # パネル経由では呼び出し側の指定にかかわらず、必ず本人だけに表示する。
         kwargs["ephemeral"] = True
         kwargs["wait"] = True
+        kwargs.setdefault("allowed_mentions", discord.AllowedMentions.none())
 
         if not interaction.response.is_done():
             response_kwargs = dict(kwargs)
@@ -180,9 +201,13 @@ async def invoke_existing_command(
     except commands.CommandError as error:
         ctx.command_failed = True
         await bot.on_command_error(ctx, error)
-    except Exception as error:
+    except Exception:
         ctx.command_failed = True
-        await _reply(interaction, f"⚠️ 操作中にエラーが発生しました。\n`{type(error).__name__}: {error}`")
+        LOGGER.exception("一般／管理パネルからのコマンド実行中に予期しないエラーが発生しました: %s", command_name)
+        await _reply(
+            interaction,
+            "⚠️ 操作中に予期しないエラーが発生しました。時間を置いてもう一度お試しください。",
+        )
 
 
 _IMAGE_ID_COMMANDS = {"photo_id", "favorite_add", "favorite_remove"}
@@ -237,6 +262,13 @@ class CommandArgumentsModal(discord.ui.Modal):
             admin_required=self.admin_required,
         )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        LOGGER.exception("入力フォーム処理中にエラーが発生しました", exc_info=error)
+        await _reply(
+            interaction,
+            "⚠️ 入力内容の処理中にエラーが発生しました。時間を置いてもう一度お試しください。",
+        )
+
 
 class AdminCommandModal(discord.ui.Modal, title="管理コマンドを実行"):
     command_text = discord.ui.TextInput(
@@ -260,6 +292,10 @@ class AdminCommandModal(discord.ui.Modal, title="管理コマンドを実行"):
             return
         name, _, arguments = text.partition(" ")
         await invoke_existing_command(interaction, name, arguments, admin_required=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        LOGGER.exception("管理コマンド入力フォームでエラーが発生しました", exc_info=error)
+        await _reply(interaction, "⚠️ 管理コマンドの処理中にエラーが発生しました。")
 
 
 class FavoriteView(discord.ui.View):
@@ -286,8 +322,40 @@ class FavoriteView(discord.ui.View):
 
 
 class UserPanelView(discord.ui.View):
+    _last_action_at: dict[int, float] = {}
+
     def __init__(self) -> None:
         super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # 連打で同じ重い検索が複数起動するのを防ぐ。
+        now = time.monotonic()
+        user_id = int(interaction.user.id)
+        previous = self._last_action_at.get(user_id, 0.0)
+        if now - previous < USER_PANEL_COOLDOWN_SECONDS:
+            await _reply(interaction, "⏳ 操作が早すぎます。少し待ってからもう一度押してください。")
+            return False
+        self._last_action_at[user_id] = now
+
+        # 古い利用履歴が無制限に残らないよう、ときどき掃除する。
+        if len(self._last_action_at) > 2000:
+            threshold = now - 300
+            self._last_action_at = {
+                key: value for key, value in self._last_action_at.items() if value >= threshold
+            }
+        return True
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        LOGGER.exception("一般ユーザーパネルの操作でエラーが発生しました", exc_info=error)
+        await _reply(
+            interaction,
+            "⚠️ パネル操作中にエラーが発生しました。時間を置いてもう一度お試しください。",
+        )
 
     @discord.ui.button(label="写真検索", emoji="🔍", style=discord.ButtonStyle.primary, custom_id="photo:user:search")
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -345,8 +413,8 @@ class UserPanelView(discord.ui.View):
             name="🔍 写真検索",
             value=(
                 "人物名・タグ・ブログタイトルなどを自由に入力して検索します。\n"
-                "検索結果は最大20件まで表示されます。\n"
-                "結果画面では写真を前後に切り替え、そのままお気に入り登録できます。"
+                "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
+                "一覧の選択メニューから写真の詳細を開き、お気に入り登録できます。"
             ),
             inline=False,
         )
@@ -354,8 +422,8 @@ class UserPanelView(discord.ui.View):
             name="👤 人物で探す",
             value=(
                 "人物名を入力し、その人物が写っている写真を検索します。\n"
-                "検索結果は最大20件まで表示されます。\n"
-                "結果から気に入った写真を直接お気に入り登録できます。"
+                "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
+                "一覧の選択メニューから詳細を開き、お気に入り登録できます。"
             ),
             inline=False,
         )
@@ -363,6 +431,7 @@ class UserPanelView(discord.ui.View):
             name="🏷️ タグで探す",
             value=(
                 "カテゴリーとタグを順番に選び、条件に合う写真を探します。\n"
+                "結果は1ページに最大9枚表示され、選択メニューから詳細を確認できます。\n"
                 "写真の詳細画面から、そのままお気に入り登録できます。"
             ),
             inline=False,
@@ -379,7 +448,8 @@ class UserPanelView(discord.ui.View):
             name="⭐ お気に入り",
             value=(
                 "登録した写真を1枚ずつ表示します。\n"
-                "前へ・次へで移動でき、表示中の写真だけを個別に削除できます。"
+                "前へ・次へで移動でき、表示中の写真だけを個別に削除できます。\n"
+                "お気に入りデータはユーザーごとに保存されます。"
             ),
             inline=False,
         )
@@ -544,28 +614,56 @@ async def remove_existing_control_panels(
 
 
 async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.Message]:
-    """一般用・管理者用パネルを送信し、送信したMessageを返す。"""
-    user_embed = discord.Embed(
-        title="📷 写真検索パネル",
-        description=(
-            "下のボタンから写真を検索できます。\n"
-            "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
-            "お気に入りはユーザーごとに保存されます。"
-        ),
-    )
-    user_message = await channel.send(embed=user_embed, view=UserPanelView())
+    """一般用・管理者用パネルを送信し、送信したMessageを返す。
 
-    admin_embed = discord.Embed(
-        title="👑 管理者パネル",
-        description=(
-            f"Bot所有者、または **{ADMIN_ROLE_NAME}** ロール専用です。\n"
-            "「選択式管理」では用途別に操作でき、\n"
-            "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。"
-        ),
-    )
-    admin_embed.set_footer(text=PANEL_MARKER)
-    admin_message = await channel.send(embed=admin_embed, view=AdminPanelView())
-    return [user_message, admin_message]
+    2枚目の送信だけ失敗した場合は、先に送信した1枚目を削除して
+    中途半端なパネル構成を残さない。
+    """
+    sent_messages: list[discord.Message] = []
+    try:
+        user_embed = discord.Embed(
+            title="📷 写真検索パネル",
+            description=(
+                "下のボタンから写真を検索できます。\n"
+                "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
+                "お気に入りはユーザーごとに保存されます。"
+            ),
+            color=0x3498DB,
+        )
+        user_embed.add_field(
+            name="表示について",
+            value="検索結果は公開チャンネルには投稿されません。各操作は本人専用画面で進みます。",
+            inline=False,
+        )
+        sent_messages.append(await channel.send(
+            embed=user_embed,
+            view=UserPanelView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        ))
+
+        admin_embed = discord.Embed(
+            title="👑 管理者パネル",
+            description=(
+                f"Bot所有者、または **{ADMIN_ROLE_NAME}** ロール専用です。\n"
+                "「選択式管理」では用途別に操作でき、\n"
+                "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。"
+            ),
+            color=0xE67E22,
+        )
+        admin_embed.set_footer(text=PANEL_MARKER)
+        sent_messages.append(await channel.send(
+            embed=admin_embed,
+            view=AdminPanelView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        ))
+        return sent_messages
+    except Exception:
+        for message in sent_messages:
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+                pass
+        raise
 
 
 def register_control_panel(bot: commands.Bot) -> None:
