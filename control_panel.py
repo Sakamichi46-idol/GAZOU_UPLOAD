@@ -10,6 +10,9 @@ import os
 import re
 from typing import Iterable
 
+PANEL_MARKER = "photo-archive-control-panel-v2"
+PANEL_HISTORY_SCAN_LIMIT = 100
+
 import discord
 from discord.ext import commands
 from discord.ext.commands.view import StringView
@@ -381,7 +384,57 @@ class AdminPanelView(discord.ui.View):
         await interaction.response.send_modal(AdminCommandModal())
 
 
-async def send_control_panels(channel: discord.abc.Messageable) -> None:
+def _is_control_panel_message(message: discord.Message, bot_user: discord.ClientUser | None) -> bool:
+    """このBotが送信した写真アーカイブ用パネルかを判定する。"""
+    if bot_user is None or message.author.id != bot_user.id:
+        return False
+
+    for embed in message.embeds:
+        footer_text = str(getattr(embed.footer, "text", "") or "")
+        if footer_text == PANEL_MARKER:
+            return True
+
+        # 旧版パネルにも対応し、初回更新時に重複を解消する。
+        if embed.title in {"📸 写真アーカイブBot", "👑 管理者パネル"}:
+            return True
+
+    return False
+
+
+async def remove_existing_control_panels(
+    channel: discord.abc.Messageable,
+    bot_user: discord.ClientUser | None,
+    *,
+    scan_limit: int = PANEL_HISTORY_SCAN_LIMIT,
+) -> tuple[int, int]:
+    """直近の履歴から既存パネルを削除する。
+
+    戻り値は ``(削除数, 削除失敗数)``。履歴取得に対応しないMessageableでは
+    何もせず ``(0, 0)`` を返す。
+    """
+    history = getattr(channel, "history", None)
+    if history is None:
+        return 0, 0
+
+    deleted = 0
+    failed = 0
+    try:
+        async for message in history(limit=max(1, int(scan_limit))):
+            if not _is_control_panel_message(message, bot_user):
+                continue
+            try:
+                await message.delete()
+                deleted += 1
+            except (discord.Forbidden, discord.HTTPException):
+                failed += 1
+    except (discord.Forbidden, discord.HTTPException):
+        failed += 1
+
+    return deleted, failed
+
+
+async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.Message]:
+    """一般用・管理者用パネルを送信し、送信したMessageを返す。"""
     user_embed = discord.Embed(
         title="📸 写真アーカイブBot",
         description=(
@@ -389,27 +442,72 @@ async def send_control_panels(channel: discord.abc.Messageable) -> None:
             "お気に入りはDiscordユーザーごとに保存されます。"
         ),
     )
-    await channel.send(embed=user_embed, view=UserPanelView())
+    user_embed.set_footer(text=PANEL_MARKER)
+    user_message = await channel.send(embed=user_embed, view=UserPanelView())
 
     admin_embed = discord.Embed(
         title="👑 管理者パネル",
         description=(
             f"Bot所有者、または **{ADMIN_ROLE_NAME}** ロール専用です。\n"
-            "「全コマンド」では、既存コマンドを先頭の `!` なしで実行できます。"
+            "「選択式管理」では用途別に操作でき、\n"
+            "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。"
         ),
     )
-    await channel.send(embed=admin_embed, view=AdminPanelView())
+    admin_embed.set_footer(text=PANEL_MARKER)
+    admin_message = await channel.send(embed=admin_embed, view=AdminPanelView())
+    return [user_message, admin_message]
 
 
 def register_control_panel(bot: commands.Bot) -> None:
     install_admin_role_owner_bridge(bot)
 
-    @bot.command(name="panel_setup")
+    @bot.command(name="panel_setup", aliases=["panel_refresh"])
     @commands.is_owner()
+    @commands.guild_only()
     async def panel_setup_command(ctx: commands.Context) -> None:
-        """現在のチャンネルに一般用・管理者用の常設パネルを設置する。"""
-        await send_control_panels(ctx.channel)
-        await ctx.send("✅ 常設パネルを設置しました。古いパネルがある場合は手動で削除してください。")
+        """現在のチャンネルの旧パネルを整理し、常設パネルを再設置する。"""
+        if bot.user is None:
+            await ctx.send("⚠️ Bot情報を取得できないため、パネルを設置できませんでした。")
+            return
+
+        deleted, failed = await remove_existing_control_panels(ctx.channel, bot.user)
+
+        try:
+            messages = await send_control_panels(ctx.channel)
+        except discord.Forbidden:
+            await ctx.send(
+                "⚠️ パネルを設置できませんでした。\n"
+                "このチャンネルで `メッセージを送信`・`埋め込みリンク`・"
+                "`メッセージ履歴を読む` の権限を確認してください。"
+            )
+            return
+        except discord.HTTPException as error:
+            await ctx.send(f"⚠️ Discordへの送信に失敗しました。\n`{type(error).__name__}: {error}`")
+            return
+
+        status_lines = [
+            "✅ 常設パネルを再設置しました。",
+            f"🧹 旧パネル削除: {deleted}件",
+            f"📌 新規パネル: {len(messages)}件",
+        ]
+        if failed:
+            status_lines.append(f"⚠️ 削除できなかったパネル: {failed}件")
+        await ctx.send("\n".join(status_lines), delete_after=20)
+
+    @bot.command(name="panel_remove")
+    @commands.is_owner()
+    @commands.guild_only()
+    async def panel_remove_command(ctx: commands.Context) -> None:
+        """現在のチャンネルから、このBotの常設パネルを削除する。"""
+        deleted, failed = await remove_existing_control_panels(ctx.channel, bot.user)
+        if deleted == 0 and failed == 0:
+            await ctx.send("ℹ️ 直近の履歴に削除対象の常設パネルはありませんでした。", delete_after=15)
+            return
+
+        text = f"🧹 常設パネルを {deleted}件削除しました。"
+        if failed:
+            text += f"\n⚠️ 削除できなかったパネル: {failed}件"
+        await ctx.send(text, delete_after=15)
 
     @bot.command(name="panel_admin_info")
     @commands.is_owner()
