@@ -4575,26 +4575,67 @@ def search_photo_images_by_person_with_candidates(person_name: str, limit: int =
 
 
 def get_blog_authors_for_admin(group_name: str = '', limit: int = 25) -> list[dict[str, Any]]:
+    """投稿者ごとの記事数と人物確認完了記事数を返す。
+
+    記事内の全画像について人物確認が完了している場合のみ、その記事を
+    「完了」として数える。画像0件の記事は未完了扱いにする。
+    """
     group_name = str(group_name or '').strip()
     params: list[Any] = []
-    where = "WHERE member_name <> ''"
+    where = "WHERE pb.member_name <> ''"
     if group_name:
-        where += " AND group_name = ?"
+        where += " AND pb.group_name = ?"
         params.append(group_name)
     params.append(max(1, min(int(limit), 25)))
+
     with closing(get_connection()) as connection:
         rows = connection.execute(
             f"""
-            SELECT member_name, group_name, COUNT(*) AS blog_count,
-                   MAX(published_at) AS latest_published_at
-            FROM photo_blogs
-            {where}
+            WITH blog_progress AS (
+                SELECT
+                    pb.id,
+                    pb.group_name,
+                    pb.member_name,
+                    pb.published_at,
+                    COUNT(DISTINCT pi.id) AS image_count,
+                    COUNT(DISTINCT CASE
+                        WHEN prq.review_type = 'person_identity'
+                         AND prq.status = 'completed' THEN pi.id
+                    END) AS completed_image_count
+                FROM photo_blogs pb
+                LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+                LEFT JOIN photo_review_queue prq ON prq.image_id = pi.id
+                {where}
+                GROUP BY pb.id
+            )
+            SELECT
+                member_name,
+                group_name,
+                COUNT(*) AS blog_count,
+                SUM(CASE
+                    WHEN image_count > 0 AND completed_image_count >= image_count THEN 1
+                    ELSE 0
+                END) AS completed_blog_count,
+                SUM(CASE
+                    WHEN image_count = 0 OR completed_image_count < image_count THEN 1
+                    ELSE 0
+                END) AS pending_blog_count,
+                MAX(published_at) AS latest_published_at
+            FROM blog_progress
             GROUP BY group_name, member_name
             ORDER BY latest_published_at DESC, member_name ASC
             LIMIT ?
-            """, tuple(params)
+            """,
+            tuple(params),
         ).fetchall()
-    return rows_to_dicts(rows)
+
+    result = rows_to_dicts(rows)
+    for item in result:
+        total = int(item.get('blog_count') or 0)
+        completed = int(item.get('completed_blog_count') or 0)
+        item['pending_blog_count'] = max(0, int(item.get('pending_blog_count') or (total - completed)))
+        item['completion_percent'] = 0 if total == 0 else round(completed * 100 / total)
+    return result
 
 
 def get_blogs_for_admin(group_name: str, member_name: str, limit: int = 25) -> list[dict[str, Any]]:
