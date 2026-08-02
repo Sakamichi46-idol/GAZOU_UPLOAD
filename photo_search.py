@@ -398,6 +398,8 @@ class PhotoSearchDetailView(discord.ui.View):
 
     @discord.ui.button(label="検索結果へ戻る", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
     async def back_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        # 最大9枚の準備には3秒以上かかることがあるため、先に応答を確定する。
+        await interaction.response.defer()
         view = PhotoSearchResultsView(
             owner_id=self.owner_id,
             results=self.results,
@@ -407,8 +409,14 @@ class PhotoSearchDetailView(discord.ui.View):
         )
         view.message = interaction.message
         files = await view.current_files()
+        if not files:
+            await interaction.followup.send(
+                "⚠️ 検索結果の画像を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
         try:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=view.control_content(),
                 embeds=[],
                 attachments=files,
@@ -417,6 +425,24 @@ class PhotoSearchDetailView(discord.ui.View):
         finally:
             close_discord_files(files)
         self.stop()
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        print(f"写真検索結果Viewエラー: {type(error).__name__}: {error}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "⚠️ 検索結果の操作中にエラーが発生しました。もう一度検索してください。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠️ 検索結果の操作中にエラーが発生しました。もう一度検索してください。",
+                ephemeral=True,
+            )
 
     async def on_timeout(self) -> None:
         for child in self.children:
@@ -540,6 +566,8 @@ class PhotoSearchResultsView(discord.ui.View):
         return False
 
     async def _change_page(self, interaction: discord.Interaction, new_page: int) -> None:
+        # 画像のダウンロード中にInteractionの3秒制限を超えないよう、先にdeferする。
+        await interaction.response.defer()
         view = PhotoSearchResultsView(
             owner_id=self.owner_id,
             results=self.results,
@@ -550,13 +578,13 @@ class PhotoSearchResultsView(discord.ui.View):
         view.message = interaction.message
         files = await view.current_files()
         if not files:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ 次のページの画像を取得できませんでした。",
                 ephemeral=True,
             )
             return
         try:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=view.control_content(),
                 embeds=[],
                 attachments=files,
@@ -592,6 +620,24 @@ class PhotoSearchResultsView(discord.ui.View):
             child.disabled = True
         await interaction.response.edit_message(view=self)
         self.stop()
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        print(f"写真検索結果Viewエラー: {type(error).__name__}: {error}")
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                "⚠️ 検索結果の操作中にエラーが発生しました。もう一度検索してください。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "⚠️ 検索結果の操作中にエラーが発生しました。もう一度検索してください。",
+                ephemeral=True,
+            )
 
     async def on_timeout(self) -> None:
         for child in self.children:
