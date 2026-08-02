@@ -3,6 +3,12 @@ from __future__ import annotations
 from typing import Any, Callable
 
 import asyncio
+import io
+import mimetypes
+import os
+from urllib.parse import urlparse
+
+import aiohttp
 import discord
 
 from bucket_storage import bucket_is_configured, create_presigned_get_url
@@ -133,6 +139,73 @@ def get_display_image_url(result: dict[str, Any]) -> str:
 
     image_url = str(result.get("image_url") or "").strip()
     return image_url if image_url.startswith(("http://", "https://")) else ""
+
+
+async def build_photo_attachment_files(
+    results: list[dict[str, Any]],
+) -> list[discord.File]:
+    """写真をDiscord添付用ファイルへ変換する。
+
+    4ファイルを同じメッセージで送ることで、Discord標準の2×2レイアウトを使う。
+    一覧の順番と添付順を必ず一致させる。ローカル保存済み画像を優先し、
+    存在しない場合はBucket／元URLから取得する。
+    """
+    files: list[discord.File] = []
+    timeout = aiohttp.ClientTimeout(total=60)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; PhotoArchiveBot/1.0)"}
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for position, result in enumerate(results, 1):
+            image_id = int(result.get("id") or 0)
+            local_path = str(result.get("local_path") or "").strip()
+            filename_base = f"photo_{image_id or position}"
+
+            if local_path and os.path.isfile(local_path):
+                extension = os.path.splitext(local_path)[1] or ".jpg"
+                files.append(
+                    discord.File(
+                        local_path,
+                        filename=f"{filename_base}{extension}",
+                    )
+                )
+                continue
+
+            image_url = get_display_image_url(result)
+            if not image_url:
+                continue
+
+            try:
+                async with session.get(image_url) as response:
+                    response.raise_for_status()
+                    data = await response.read()
+                    if not data:
+                        continue
+
+                    content_type = str(response.headers.get("Content-Type") or "").split(";", 1)[0]
+                    extension = mimetypes.guess_extension(content_type) or ""
+                    if extension == ".jpe":
+                        extension = ".jpg"
+                    if not extension:
+                        extension = os.path.splitext(urlparse(image_url).path)[1] or ".jpg"
+
+                    files.append(
+                        discord.File(
+                            io.BytesIO(data),
+                            filename=f"{filename_base}{extension}",
+                        )
+                    )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+                print(f"検索結果画像の添付準備エラー: {image_url} / {error}")
+
+    return files
+
+
+def close_discord_files(files: list[discord.File]) -> None:
+    for file in files:
+        try:
+            file.close()
+        except Exception:
+            pass
 
 
 class DetailResultButton(discord.ui.Button):
@@ -386,19 +459,9 @@ class PhotoSearchResultsView(discord.ui.View):
         start = self.page * RESULTS_PER_PAGE
         return self.results[start : start + RESULTS_PER_PAGE]
 
-    def current_embeds(self) -> list[discord.Embed]:
-        """一覧では説明を付けず、写真だけを1枚ずつ表示する。"""
-        embeds: list[discord.Embed] = []
-
-        for result in self.current_results():
-            image_url = get_display_image_url(result)
-            if not image_url:
-                continue
-            embed = discord.Embed(color=0x00AAFF)
-            embed.set_image(url=image_url)
-            embeds.append(embed)
-
-        return embeds
+    async def current_files(self) -> list[discord.File]:
+        """現在ページの4枚を、Discordの同時添付用ファイルに変換する。"""
+        return await build_photo_attachment_files(self.current_results())
 
     def control_content(self) -> str:
         start = self.page * RESULTS_PER_PAGE + 1
@@ -420,25 +483,31 @@ class PhotoSearchResultsView(discord.ui.View):
 
     async def send_page_with_context(self, ctx) -> None:
         self.page_messages = []
-        embeds = self.current_embeds()
-        if not embeds:
+        files = await self.current_files()
+        if not files:
             return
-        message = await ctx.send(embeds=embeds)
-        if message is not None:
-            self.page_messages.append(message)
+        try:
+            message = await ctx.send(files=files)
+            if message is not None:
+                self.page_messages.append(message)
+        finally:
+            close_discord_files(files)
 
     async def send_page_with_interaction(self, interaction: discord.Interaction) -> None:
         is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
         self.page_messages = []
-        embeds = self.current_embeds()
-        if not embeds:
+        files = await self.current_files()
+        if not files:
             return
-        message = await interaction.followup.send(
-            embeds=embeds,
-            ephemeral=is_ephemeral,
-            wait=True,
-        )
-        self.page_messages.append(message)
+        try:
+            message = await interaction.followup.send(
+                files=files,
+                ephemeral=is_ephemeral,
+                wait=True,
+            )
+            self.page_messages.append(message)
+        finally:
+            close_discord_files(files)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
