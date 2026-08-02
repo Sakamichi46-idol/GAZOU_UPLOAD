@@ -20,7 +20,7 @@ from photo_database import (
 DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 50
 VIEW_TIMEOUT_SECONDS = 300
-RESULTS_PER_PAGE = 5
+RESULTS_PER_PAGE = 4
 
 
 def shorten_text(value: Any, max_length: int) -> str:
@@ -355,7 +355,7 @@ class PhotoSearchDetailView(discord.ui.View):
 
 
 class PhotoSearchResultsView(discord.ui.View):
-    """検索結果を1ページ5枚ずつ、写真ごとの個別メッセージで表示する。"""
+    """検索結果を1ページ4枚ずつ、1つのメッセージにまとめて表示する。"""
 
     def __init__(
         self,
@@ -407,7 +407,7 @@ class PhotoSearchResultsView(discord.ui.View):
             f"🔍 **{self.search_label}結果**\n"
             f"検索語: `{shorten_text(self.query, 1000)}`\n"
             f"取得件数: **{len(self.results)}件**\n"
-            f"現在表示: **{start}〜{end}件目**（写真は1枚ずつ表示）"
+            f"現在表示: **{start}〜{end}件目**（4枚を1セットで表示）"
         )
 
     async def delete_page_messages(self) -> None:
@@ -420,21 +420,25 @@ class PhotoSearchResultsView(discord.ui.View):
 
     async def send_page_with_context(self, ctx) -> None:
         self.page_messages = []
-        for embed in self.current_embeds():
-            message = await ctx.send(embed=embed)
-            if message is not None:
-                self.page_messages.append(message)
+        embeds = self.current_embeds()
+        if not embeds:
+            return
+        message = await ctx.send(embeds=embeds)
+        if message is not None:
+            self.page_messages.append(message)
 
     async def send_page_with_interaction(self, interaction: discord.Interaction) -> None:
         is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
         self.page_messages = []
-        for embed in self.current_embeds():
-            message = await interaction.followup.send(
-                embed=embed,
-                ephemeral=is_ephemeral,
-                wait=True,
-            )
-            self.page_messages.append(message)
+        embeds = self.current_embeds()
+        if not embeds:
+            return
+        message = await interaction.followup.send(
+            embeds=embeds,
+            ephemeral=is_ephemeral,
+            wait=True,
+        )
+        self.page_messages.append(message)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -466,7 +470,7 @@ class PhotoSearchResultsView(discord.ui.View):
         await view.send_page_with_interaction(interaction)
         self.stop()
 
-    @discord.ui.button(label="前の5枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の4枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(
         self,
         interaction: discord.Interaction,
@@ -474,7 +478,7 @@ class PhotoSearchResultsView(discord.ui.View):
     ) -> None:
         await self._change_page(interaction, self.page - 1)
 
-    @discord.ui.button(label="次の5枚", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="次の4枚", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
     async def next_button(
         self,
         interaction: discord.Interaction,
