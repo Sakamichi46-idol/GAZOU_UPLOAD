@@ -26,7 +26,7 @@ from photo_database import (
 DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 50
 VIEW_TIMEOUT_SECONDS = 300
-RESULTS_PER_PAGE = 4
+RESULTS_PER_PAGE = 9
 
 
 def shorten_text(value: Any, max_length: int) -> str:
@@ -146,7 +146,7 @@ async def build_photo_attachment_files(
 ) -> list[discord.File]:
     """写真をDiscord添付用ファイルへ変換する。
 
-    4ファイルを同じメッセージで送ることで、Discord標準の2×2レイアウトを使う。
+    最大9ファイルを同じメッセージで送り、Discord標準のグリッド表示を使う。
     一覧の順番と添付順を必ず一致させる。ローカル保存済み画像を優先し、
     存在しない場合はBucket／元URLから取得する。
     """
@@ -427,8 +427,68 @@ class PhotoSearchDetailView(discord.ui.View):
                 pass
 
 
+class PhotoSearchResultSelect(discord.ui.Select):
+    """現在ページの1〜9枚目から詳細表示する写真を選ぶ。"""
+
+    def __init__(self, parent_view: "PhotoSearchResultsView") -> None:
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=f"{offset + 1}枚目の詳細",
+                description=f"検索結果の{parent_view.page * RESULTS_PER_PAGE + offset + 1}件目",
+                value=str(offset),
+                emoji="📷",
+            )
+            for offset, _result in enumerate(parent_view.current_results())
+        ]
+        super().__init__(
+            placeholder="詳細を見る写真を選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        try:
+            item_offset = int(self.values[0])
+        except (ValueError, IndexError):
+            await interaction.response.send_message(
+                "⚠️ 選択した写真を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        result_index = self.parent_view.page * RESULTS_PER_PAGE + item_offset
+        if result_index >= len(self.parent_view.results):
+            await interaction.response.send_message(
+                "⚠️ 選択した写真を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        await self.parent_view.delete_page_messages()
+
+        view = PhotoSearchDetailView(
+            owner_id=self.parent_view.owner_id,
+            results=self.parent_view.results,
+            query=self.parent_view.query,
+            search_label=self.parent_view.search_label,
+            index=result_index,
+            return_page=self.parent_view.page,
+        )
+        view.message = interaction.message
+        await interaction.message.edit(
+            content=None,
+            embeds=[view.build_embed()],
+            view=view,
+        )
+        self.parent_view.stop()
+
+
 class PhotoSearchResultsView(discord.ui.View):
-    """検索結果を1ページ4枚ずつ、1つのメッセージにまとめて表示する。"""
+    """検索結果を1ページ9枚ずつ、1つのメッセージにまとめて表示する。"""
 
     def __init__(
         self,
@@ -449,8 +509,7 @@ class PhotoSearchResultsView(discord.ui.View):
         self.message: discord.Message | None = None
         self.page_messages: list[discord.Message] = []
 
-        for item_offset, _result in enumerate(self.current_results()):
-            self.add_item(DetailResultButton(self, item_offset))
+        self.add_item(PhotoSearchResultSelect(self))
 
         self.previous_button.disabled = self.page <= 0
         self.next_button.disabled = self.page >= self.max_page
@@ -460,7 +519,7 @@ class PhotoSearchResultsView(discord.ui.View):
         return self.results[start : start + RESULTS_PER_PAGE]
 
     async def current_files(self) -> list[discord.File]:
-        """現在ページの4枚を、Discordの同時添付用ファイルに変換する。"""
+        """現在ページの最大9枚を、Discordの同時添付用ファイルに変換する。"""
         return await build_photo_attachment_files(self.current_results())
 
     def control_content(self) -> str:
@@ -470,7 +529,7 @@ class PhotoSearchResultsView(discord.ui.View):
             f"🔍 **{self.search_label}結果**\n"
             f"検索語: `{shorten_text(self.query, 1000)}`\n"
             f"取得件数: **{len(self.results)}件**\n"
-            f"現在表示: **{start}〜{end}件目**（4枚を1セットで表示）"
+            f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
         )
 
     async def delete_page_messages(self) -> None:
@@ -539,7 +598,7 @@ class PhotoSearchResultsView(discord.ui.View):
         await view.send_page_with_interaction(interaction)
         self.stop()
 
-    @discord.ui.button(label="前の4枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の9枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous_button(
         self,
         interaction: discord.Interaction,
@@ -547,7 +606,7 @@ class PhotoSearchResultsView(discord.ui.View):
     ) -> None:
         await self._change_page(interaction, self.page - 1)
 
-    @discord.ui.button(label="次の4枚", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="次の9枚", emoji="▶️", style=discord.ButtonStyle.primary, row=1)
     async def next_button(
         self,
         interaction: discord.Interaction,
