@@ -1101,16 +1101,18 @@ class ResultsView(OwnedView):
         )
 
     async def _change_page(self, interaction: discord.Interaction, page: int) -> None:
+        # 最大9枚の取得に時間がかかってもInteractionを失効させない。
+        await interaction.response.defer()
         view = ResultsView(self.state, self.results, page)
         files = await view.build_files()
         if not files:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ 次のページの画像を取得できませんでした。",
                 ephemeral=True,
             )
             return
         try:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=view.control_content(),
                 embeds=[],
                 attachments=files,
@@ -1391,6 +1393,7 @@ class DetailView(OwnedView):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
+        await interaction.response.defer()
         view = ResultsView(
             self.state,
             self.results,
@@ -1399,13 +1402,13 @@ class DetailView(OwnedView):
 
         files = await view.build_files()
         if not files:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "⚠️ 一覧の画像を取得できませんでした。",
                 ephemeral=True,
             )
             return
         try:
-            await interaction.response.edit_message(
+            await interaction.edit_original_response(
                 content=view.control_content(),
                 embeds=[],
                 attachments=files,
