@@ -14,6 +14,8 @@ from photo_search import (
     close_discord_files,
     get_display_image_url,
 )
+from person_labels import format_people_for_users, is_unknown_other_label
+from sakamichi_members import SAKAMICHI_MEMBERS
 from photo_search_tags import (
     SEARCH_CATEGORY_DEFS,
     build_curated_index,
@@ -97,6 +99,9 @@ def _load_tag_index() -> dict[str, dict[str, set[int]]]:
 
     for image_id, person_name in people:
         tag = str(person_name).strip()
+        # 名前不明の内部ラベルは一般ユーザーの検索候補には出さない。
+        if not tag or is_unknown_other_label(tag):
+            continue
         index["person"].setdefault(tag, set()).add(int(image_id))
 
     raw_tag_ids: dict[str, set[int]] = {}
@@ -644,6 +649,233 @@ class ConditionRemoveView(OwnedView):
         await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
 
 
+
+
+def _master_member_names() -> set[str]:
+    return {
+        name
+        for generations in SAKAMICHI_MEMBERS.values()
+        for names in generations.values()
+        for name in names
+    }
+
+
+def _available_generation_people(state: ExplorerState, group_name: str, generation_name: str) -> list[str]:
+    available = state.index.get("person", {})
+    return [
+        name for name in SAKAMICHI_MEMBERS.get(group_name, {}).get(generation_name, [])
+        if name in available
+    ]
+
+
+def _other_people(state: ExplorerState) -> list[str]:
+    master = _master_member_names()
+    return sorted(
+        name for name in state.index.get("person", {})
+        if name not in master and not is_unknown_other_label(name)
+    )
+
+
+class PersonGroupSelect(discord.ui.Select):
+    def __init__(self, parent: "PersonGroupView"):
+        self.parent_view = parent
+        options: list[discord.SelectOption] = []
+        available = parent.state.index.get("person", {})
+        for group_name, generations in SAKAMICHI_MEMBERS.items():
+            count = sum(
+                1 for names in generations.values() for name in names
+                if name in available
+            )
+            if count:
+                options.append(discord.SelectOption(
+                    label=group_name,
+                    value=f"group:{group_name}",
+                    description=f"検索可能な人物 {count}人",
+                    emoji="🌳",
+                ))
+        other_count = len(_other_people(parent.state))
+        if other_count:
+            options.append(discord.SelectOption(
+                label="その他の人物",
+                value="other",
+                description=f"坂道メンバー以外 {other_count}人",
+                emoji="👤",
+            ))
+        super().__init__(
+            placeholder="グループを選択",
+            min_values=1,
+            max_values=1,
+            options=options or [discord.SelectOption(label="選択可能な人物がありません", value="none")],
+            disabled=not bool(options),
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        if value == "other":
+            view = PersonMemberView(self.parent_view.state, "その他の人物", "", page=0, other=True)
+        else:
+            view = PersonGenerationView(self.parent_view.state, value.split(":", 1)[1])
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class PersonGroupView(OwnedView):
+    def __init__(self, state: ExplorerState):
+        super().__init__(state)
+        self.add_item(PersonGroupSelect(self))
+
+    def build_embed(self) -> discord.Embed:
+        selected = sorted(self.state.selections["person"])
+        embed = discord.Embed(
+            title="👤 人物を選択",
+            description="坂道メンバーは **グループ → 期 → 人物** の順で選択します。\n坂道メンバー以外は「その他の人物」から選べます。",
+            color=0x5865F2,
+        )
+        embed.add_field(name="選択中", value="・".join(selected) if selected else "未選択", inline=False)
+        embed.add_field(name="現在の候補画像", value=f"**{len(self.state.result_ids()):,}枚**", inline=False)
+        return embed
+
+    @discord.ui.button(label="人物名を入力", emoji="🔤", style=discord.ButtonStyle.secondary, row=1)
+    async def input_name(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonNameModal(self.state))
+
+    @discord.ui.button(label="人物条件を解除", emoji="🧹", style=discord.ButtonStyle.danger, row=1)
+    async def clear_people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.selections["person"].clear()
+        view = PersonGroupView(self.state)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="検索画面へ戻る", emoji="↩️", style=discord.ButtonStyle.success, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ExplorerView(self.state)
+        await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
+
+
+class PersonGenerationSelect(discord.ui.Select):
+    def __init__(self, parent: "PersonGenerationView"):
+        self.parent_view = parent
+        options = []
+        for generation_name in SAKAMICHI_MEMBERS.get(parent.group_name, {}):
+            count = len(_available_generation_people(parent.state, parent.group_name, generation_name))
+            if count:
+                options.append(discord.SelectOption(
+                    label=generation_name,
+                    value=generation_name,
+                    description=f"検索可能な人物 {count}人",
+                    emoji="🎓",
+                ))
+        super().__init__(placeholder="期・区分を選択", min_values=1, max_values=1, options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        view = PersonMemberView(self.parent_view.state, self.parent_view.group_name, self.values[0], page=0)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class PersonGenerationView(OwnedView):
+    def __init__(self, state: ExplorerState, group_name: str):
+        super().__init__(state)
+        self.group_name = group_name
+        self.add_item(PersonGenerationSelect(self))
+
+    def build_embed(self) -> discord.Embed:
+        return discord.Embed(
+            title=f"👤 {self.group_name}",
+            description="期・卒業区分を選択してください。画像に登録されている人物だけが候補に表示されます。",
+            color=0x5865F2,
+        )
+
+    @discord.ui.button(label="グループへ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = PersonGroupView(self.state)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class PersonMemberSelect(discord.ui.Select):
+    def __init__(self, parent: "PersonMemberView", visible_names: list[str]):
+        self.parent_view = parent
+        selected = parent.state.selections["person"]
+        super().__init__(
+            placeholder="人物を選択（選択済みは✅）",
+            min_values=1,
+            max_values=len(visible_names),
+            options=[
+                discord.SelectOption(
+                    label=_short(name, 100),
+                    value=name,
+                    emoji="✅" if name in selected else None,
+                ) for name in visible_names
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        selected = self.parent_view.state.selections["person"]
+        for name in self.values:
+            if name in selected:
+                selected.remove(name)
+            else:
+                selected.add(name)
+        view = PersonMemberView(
+            self.parent_view.state,
+            self.parent_view.group_name,
+            self.parent_view.generation_name,
+            page=self.parent_view.page,
+            other=self.parent_view.other,
+        )
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class PersonMemberView(OwnedView):
+    def __init__(self, state: ExplorerState, group_name: str, generation_name: str, *, page: int = 0, other: bool = False):
+        super().__init__(state)
+        self.group_name = group_name
+        self.generation_name = generation_name
+        self.other = other
+        self.all_names = _other_people(state) if other else _available_generation_people(state, group_name, generation_name)
+        self.max_page = max(0, math.ceil(len(self.all_names) / OPTIONS_PER_PAGE) - 1)
+        self.page = max(0, min(page, self.max_page))
+        start = self.page * OPTIONS_PER_PAGE
+        visible = self.all_names[start:start + OPTIONS_PER_PAGE]
+        if visible:
+            self.add_item(PersonMemberSelect(self, visible))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.max_page
+
+    def build_embed(self) -> discord.Embed:
+        title = "その他の人物" if self.other else f"{self.group_name} → {self.generation_name}"
+        selected = sorted(self.state.selections["person"])
+        return discord.Embed(
+            title=f"👤 {title}",
+            description=(
+                "人物を選ぶと条件へ追加され、もう一度選ぶと解除されます。\n"
+                f"ページ **{self.page + 1}/{self.max_page + 1}**・候補 **{len(self.all_names)}人**\n"
+                f"選択中：{'・'.join(selected) if selected else '未選択'}"
+            ),
+            color=0x5865F2,
+        )
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = PersonMemberView(self.state, self.group_name, self.generation_name, page=self.page - 1, other=self.other)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = PersonMemberView(self.state, self.group_name, self.generation_name, page=self.page + 1, other=self.other)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="別の分類を選ぶ", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.other:
+            view = PersonGroupView(self.state)
+        else:
+            view = PersonGenerationView(self.state, self.group_name)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="検索画面へ戻る", emoji="🔍", style=discord.ButtonStyle.success, row=1)
+    async def explorer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ExplorerView(self.state)
+        await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
+
+
 class ExplorerView(OwnedView):
     def __init__(self, state: ExplorerState):
         super().__init__(state)
@@ -660,7 +892,10 @@ class ExplorerView(OwnedView):
                 custom_id=f"tag_category:{category}", row=index_no // 5,
             )
             async def callback(interaction: discord.Interaction, key: str = category) -> None:
-                view = CategoryView(self.state, key, page=0)
+                if key == "person":
+                    view = PersonGroupView(self.state)
+                else:
+                    view = CategoryView(self.state, key, page=0)
                 await interaction.response.edit_message(embed=view.build_embed(), view=view)
             button.callback = callback
             self.add_item(button)
@@ -1204,9 +1439,10 @@ class DetailView(OwnedView):
 
         confirmed = str(result.get("confirmed_people") or "").strip()
         candidates = str(result.get("candidate_people") or "").strip()
+        display_people = format_people_for_users(confirmed or candidates)
         embed.add_field(
             name="👤 写っている人物",
-            value=confirmed or candidates or "未確定",
+            value=display_people or "未確定",
             inline=False,
         )
         embed.add_field(
