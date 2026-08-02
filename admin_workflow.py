@@ -13,6 +13,10 @@ from local_face_recognition import detect_faces_for_image
 from photo_database import (
     get_blog_authors_for_admin,
     get_blogs_for_admin,
+    get_blogs_for_admin_filtered,
+    get_blog_years_for_admin,
+    get_admin_blog_browser_state,
+    save_admin_blog_browser_state,
     get_blog_image_ids,
     get_blog_progress_for_admin,
     get_error_blogs_for_admin,
@@ -405,9 +409,7 @@ class AuthorSelect(discord.ui.Select):
             options.append(discord.SelectOption(
                 label=str(author["member_name"])[:100],
                 value=str(author["member_name"])[:100],
-                description=(
-                    f"完了 {completed}/{total}件 ({percent}%) ・ 未完了 {pending}件"
-                )[:100],
+                description=(f"完了 {completed}/{total}件 ({percent}%) ・ 未完了 {pending}件")[:100],
                 emoji="✅" if total > 0 and completed >= total else "👤",
             ))
         if not options:
@@ -419,36 +421,24 @@ class AuthorSelect(discord.ui.Select):
         if author == "__none__":
             await interaction.response.send_message("対象がありません。", ephemeral=True)
             return
-
         await interaction.response.defer()
-        blogs = await asyncio.to_thread(get_blogs_for_admin, self.group, author, 25)
-        progress_results = await asyncio.gather(*(
-            asyncio.to_thread(get_blog_progress_for_admin, int(blog["id"]))
-            for blog in blogs
-        ))
-        detailed = [progress for progress in progress_results if progress]
-
-        stats = self.authors.get(author, {})
-        total = int(stats.get("blog_count") or len(blogs))
-        completed = int(stats.get("completed_blog_count") or 0)
-        pending = max(0, int(stats.get("pending_blog_count") or (total - completed)))
-        percent = int(stats.get("completion_percent") or (round(completed * 100 / total) if total else 0))
-        heading = (
-            f"👤 {self.group} / {author}\n"
-            f"記事進捗: 完了 **{completed}/{total}件**（{percent}%）・未完了 **{pending}件**"
-        )
-
-        if not detailed:
-            await interaction.edit_original_response(
-                content=f"{heading}\n対象記事はありません。",
-                embed=None,
-                view=BlogDashboardView(),
-            )
-            return
-        await interaction.edit_original_response(
-            content=f"{heading}\n記事を選択してください。各項目には画像単位の人物確認進捗を表示しています。",
-            embed=None,
-            view=ProgressBlogSelectView(detailed, heading),
+        state = await asyncio.to_thread(
+            get_admin_blog_browser_state,
+            interaction.user.id,
+            self.group,
+            author,
+        ) or {}
+        await _open_author_blog_browser(
+            interaction,
+            self.group,
+            author,
+            self.authors.get(author, {}),
+            user_id=interaction.user.id,
+            page=int(state.get("page") or 0),
+            selected_year=int(state.get("selected_year") or 0),
+            selected_month=int(state.get("selected_month") or 0),
+            title_query=str(state.get("title_query") or ""),
+            only_unprocessed=bool(state.get("only_unprocessed") or 0),
         )
 
 
@@ -458,10 +448,357 @@ class AuthorSelectView(AdminWorkflowView):
         self.add_item(AuthorSelect(group, authors))
 
 
+class BlogTitleSearchModal(discord.ui.Modal):
+    def __init__(self, view: "AuthorBlogBrowserView"):
+        super().__init__(title="ブログ記事タイトル検索", timeout=300)
+        self.browser_view = view
+        self.query = discord.ui.TextInput(
+            label="タイトルに含まれる文字",
+            placeholder="例：ツアー（空欄で検索解除）",
+            required=False,
+            max_length=100,
+            default=view.title_query[:100],
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not await _admin(interaction):
+            await _deny(interaction)
+            return
+        await interaction.response.defer()
+        await _open_author_blog_browser(
+            interaction,
+            self.browser_view.group,
+            self.browser_view.author,
+            self.browser_view.author_stats,
+            user_id=interaction.user.id,
+            page=0,
+            selected_year=self.browser_view.selected_year,
+            selected_month=self.browser_view.selected_month,
+            title_query=str(self.query.value or "").strip(),
+            only_unprocessed=self.browser_view.only_unprocessed,
+        )
+
+
+class BlogArticleSelect(discord.ui.Select):
+    def __init__(self, browser: "AuthorBlogBrowserView", blogs: list[dict[str, Any]]):
+        self.browser = browser
+        options: list[discord.SelectOption] = []
+        for blog in blogs:
+            percent = int(blog.get("progress_percent") or 0)
+            total = int(blog.get("progress_total") or blog.get("image_count") or 0)
+            completed = int(blog.get("progress_completed") or 0)
+            skipped = int(blog.get("review_skipped_count") or 0)
+            errors = int(blog.get("error_count") or 0)
+            published = str(blog.get("published_at") or "日付不明")
+            description = f"{published} / 確認 {completed}/{total} ({percent}%)"
+            if skipped:
+                description += f" / スキップ{skipped}"
+            if errors:
+                description += f" / エラー{errors}"
+            options.append(discord.SelectOption(
+                label=str(blog.get("title") or "無題")[:100],
+                value=str(blog["id"]),
+                description=description[:100],
+                emoji="⚠️" if errors else ("✅" if percent == 100 and total > 0 else "📖"),
+            ))
+        if not options:
+            options = [discord.SelectOption(label="条件に一致する記事はありません", value="__none__")]
+        super().__init__(placeholder="記事を選択", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        if value == "__none__":
+            await interaction.response.send_message("条件に一致する記事はありません。", ephemeral=True)
+            return
+        blog_id = int(value)
+        await interaction.response.defer()
+        blog = await asyncio.to_thread(get_blog_progress_for_admin, blog_id)
+        if not blog:
+            await interaction.followup.send("記事情報を取得できませんでした。", ephemeral=True)
+            return
+        await asyncio.to_thread(
+            save_admin_blog_browser_state,
+            interaction.user.id,
+            self.browser.group,
+            self.browser.author,
+            page=self.browser.page,
+            selected_year=self.browser.selected_year,
+            selected_month=self.browser.selected_month,
+            title_query=self.browser.title_query,
+            only_unprocessed=self.browser.only_unprocessed,
+            last_blog_id=blog_id,
+        )
+        await interaction.edit_original_response(
+            content=None,
+            embed=_article_embed(blog),
+            view=BlogArticleView(blog_id, browser_state=self.browser.state_dict()),
+        )
+
+
+class BlogYearSelect(discord.ui.Select):
+    def __init__(self, browser: "AuthorBlogBrowserView", years: list[int]):
+        self.browser = browser
+        options = [discord.SelectOption(label="すべての年", value="0", default=browser.selected_year == 0)]
+        for year in years[:24]:
+            options.append(discord.SelectOption(
+                label=f"{year}年",
+                value=str(year),
+                default=browser.selected_year == year,
+            ))
+        super().__init__(placeholder="年で絞り込み", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        year = int(self.values[0])
+        await interaction.response.defer()
+        await _open_author_blog_browser(
+            interaction, self.browser.group, self.browser.author, self.browser.author_stats,
+            user_id=interaction.user.id, page=0, selected_year=year,
+            selected_month=self.browser.selected_month, title_query=self.browser.title_query,
+            only_unprocessed=self.browser.only_unprocessed,
+        )
+
+
+class BlogMonthSelect(discord.ui.Select):
+    def __init__(self, browser: "AuthorBlogBrowserView"):
+        self.browser = browser
+        options = [discord.SelectOption(label="すべての月", value="0", default=browser.selected_month == 0)]
+        for month in range(1, 13):
+            options.append(discord.SelectOption(
+                label=f"{month}月", value=str(month), default=browser.selected_month == month,
+            ))
+        super().__init__(placeholder="月で絞り込み", options=options, row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        month = int(self.values[0])
+        await interaction.response.defer()
+        await _open_author_blog_browser(
+            interaction, self.browser.group, self.browser.author, self.browser.author_stats,
+            user_id=interaction.user.id, page=0, selected_year=self.browser.selected_year,
+            selected_month=month, title_query=self.browser.title_query,
+            only_unprocessed=self.browser.only_unprocessed,
+        )
+
+
+class AuthorBlogBrowserView(AdminWorkflowView):
+    PAGE_SIZE = 25
+
+    def __init__(
+        self,
+        group: str,
+        author: str,
+        author_stats: dict[str, Any],
+        blogs: list[dict[str, Any]],
+        years: list[int],
+        *,
+        total_filtered: int,
+        page: int,
+        selected_year: int,
+        selected_month: int,
+        title_query: str,
+        only_unprocessed: bool,
+        last_blog_id: int = 0,
+    ):
+        super().__init__()
+        self.group = group
+        self.author = author
+        self.author_stats = author_stats
+        self.total_filtered = max(0, int(total_filtered))
+        self.page = max(0, int(page))
+        self.selected_year = max(0, int(selected_year))
+        self.selected_month = max(0, int(selected_month))
+        self.title_query = str(title_query or "")
+        self.only_unprocessed = bool(only_unprocessed)
+        self.last_blog_id = max(0, int(last_blog_id))
+
+        self.add_item(BlogArticleSelect(self, blogs))
+        self.add_item(BlogYearSelect(self, years))
+        self.add_item(BlogMonthSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = (self.page + 1) * self.PAGE_SIZE >= self.total_filtered
+        self.pending.label = "全記事を表示" if self.only_unprocessed else "未完了のみ"
+        self.resume.disabled = self.last_blog_id <= 0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "group": self.group,
+            "author": self.author,
+            "author_stats": self.author_stats,
+            "page": self.page,
+            "selected_year": self.selected_year,
+            "selected_month": self.selected_month,
+            "title_query": self.title_query,
+            "only_unprocessed": self.only_unprocessed,
+        }
+
+    async def _reload(self, interaction: discord.Interaction, *, page: int | None = None, **changes: Any) -> None:
+        await interaction.response.defer()
+        await _open_author_blog_browser(
+            interaction,
+            self.group,
+            self.author,
+            self.author_stats,
+            user_id=interaction.user.id,
+            page=self.page if page is None else page,
+            selected_year=int(changes.get("selected_year", self.selected_year)),
+            selected_month=int(changes.get("selected_month", self.selected_month)),
+            title_query=str(changes.get("title_query", self.title_query)),
+            only_unprocessed=bool(changes.get("only_unprocessed", self.only_unprocessed)),
+        )
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=3)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._reload(interaction, page=max(0, self.page - 1))
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=3)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._reload(interaction, page=self.page + 1)
+
+    @discord.ui.button(label="未完了のみ", emoji="🆕", style=discord.ButtonStyle.success, row=3)
+    async def pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._reload(interaction, page=0, only_unprocessed=not self.only_unprocessed)
+
+    @discord.ui.button(label="タイトル検索", emoji="🔍", style=discord.ButtonStyle.primary, row=3)
+    async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlogTitleSearchModal(self))
+
+    @discord.ui.button(label="前回の記事", emoji="⏯️", style=discord.ButtonStyle.primary, row=4)
+    async def resume(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.last_blog_id <= 0:
+            await interaction.response.send_message("前回開いた記事は記録されていません。", ephemeral=True)
+            return
+        await interaction.response.defer()
+        blog = await asyncio.to_thread(get_blog_progress_for_admin, self.last_blog_id)
+        if not blog:
+            await interaction.followup.send("前回の記事が見つかりませんでした。", ephemeral=True)
+            return
+        await interaction.edit_original_response(
+            content=None,
+            embed=_article_embed(blog, title_prefix="⏯️ 前回の記事"),
+            view=BlogArticleView(self.last_blog_id, browser_state=self.state_dict()),
+        )
+
+    @discord.ui.button(label="絞り込み解除", emoji="🧹", style=discord.ButtonStyle.secondary, row=4)
+    async def clear(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._reload(
+            interaction, page=0, selected_year=0, selected_month=0,
+            title_query="", only_unprocessed=False,
+        )
+
+    @discord.ui.button(label="投稿者選択へ", emoji="↩️", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="👤 **投稿者から選ぶ**\nグループを選択してください。",
+            embed=None,
+            view=GroupSelectView(),
+        )
+
+
+async def _open_author_blog_browser(
+    interaction: discord.Interaction,
+    group: str,
+    author: str,
+    author_stats: dict[str, Any],
+    *,
+    user_id: int,
+    page: int = 0,
+    selected_year: int = 0,
+    selected_month: int = 0,
+    title_query: str = "",
+    only_unprocessed: bool = False,
+) -> None:
+    page = max(0, int(page))
+    years_task = asyncio.to_thread(get_blog_years_for_admin, group, author)
+    blogs_task = asyncio.to_thread(
+        get_blogs_for_admin_filtered,
+        group,
+        author,
+        limit=AuthorBlogBrowserView.PAGE_SIZE,
+        offset=page * AuthorBlogBrowserView.PAGE_SIZE,
+        year=selected_year or None,
+        month=selected_month or None,
+        title_query=title_query,
+        only_unprocessed=only_unprocessed,
+    )
+    state_task = asyncio.to_thread(get_admin_blog_browser_state, user_id, group, author)
+    years, (blogs, total_filtered), saved_state = await asyncio.gather(years_task, blogs_task, state_task)
+
+    max_page = max(0, (total_filtered - 1) // AuthorBlogBrowserView.PAGE_SIZE) if total_filtered else 0
+    if page > max_page:
+        page = max_page
+        blogs, total_filtered = await asyncio.to_thread(
+            get_blogs_for_admin_filtered,
+            group,
+            author,
+            limit=AuthorBlogBrowserView.PAGE_SIZE,
+            offset=page * AuthorBlogBrowserView.PAGE_SIZE,
+            year=selected_year or None,
+            month=selected_month or None,
+            title_query=title_query,
+            only_unprocessed=only_unprocessed,
+        )
+
+    await asyncio.to_thread(
+        save_admin_blog_browser_state,
+        user_id,
+        group,
+        author,
+        page=page,
+        selected_year=selected_year,
+        selected_month=selected_month,
+        title_query=title_query,
+        only_unprocessed=only_unprocessed,
+    )
+
+    total = int(author_stats.get("blog_count") or 0)
+    completed = int(author_stats.get("completed_blog_count") or 0)
+    pending_count = max(0, int(author_stats.get("pending_blog_count") or (total - completed)))
+    percent = int(author_stats.get("completion_percent") or (round(completed * 100 / total) if total else 0))
+    skipped_on_page = sum(int(blog.get("review_skipped_count") or 0) for blog in blogs)
+    page_count = max(1, (total_filtered + AuthorBlogBrowserView.PAGE_SIZE - 1) // AuthorBlogBrowserView.PAGE_SIZE)
+    start_no = page * AuthorBlogBrowserView.PAGE_SIZE + 1 if total_filtered else 0
+    end_no = min((page + 1) * AuthorBlogBrowserView.PAGE_SIZE, total_filtered)
+
+    filters = []
+    if selected_year:
+        filters.append(f"{selected_year}年")
+    if selected_month:
+        filters.append(f"{selected_month}月")
+    if title_query:
+        filters.append(f"タイトル「{title_query}」")
+    if only_unprocessed:
+        filters.append("未完了のみ")
+    filter_text = " / ".join(filters) if filters else "なし"
+
+    heading = (
+        f"👤 **{group} / {author}**\n"
+        f"記事進捗: 完了 **{completed}/{total}件**（{percent}%）・未完了 **{pending_count}件**\n"
+        f"表示: **{start_no}〜{end_no}/{total_filtered}件**（{page + 1}/{page_count}ページ）\n"
+        f"絞り込み: **{filter_text}** / このページのスキップ写真 **{skipped_on_page}枚**\n"
+        "記事を選択してください。25件を超える場合はページ送りできます。"
+    )
+    view = AuthorBlogBrowserView(
+        group,
+        author,
+        author_stats,
+        blogs,
+        years,
+        total_filtered=total_filtered,
+        page=page,
+        selected_year=selected_year,
+        selected_month=selected_month,
+        title_query=title_query,
+        only_unprocessed=only_unprocessed,
+        last_blog_id=int((saved_state or {}).get("last_blog_id") or 0),
+    )
+    await interaction.edit_original_response(content=heading, embed=None, view=view)
+
+
 class BlogArticleView(AdminWorkflowView):
-    def __init__(self, blog_id: int):
+    def __init__(self, blog_id: int, browser_state: dict[str, Any] | None = None):
         super().__init__()
         self.blog_id = int(blog_id)
+        self.browser_state = dict(browser_state or {})
 
     @discord.ui.button(label="人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -485,7 +822,7 @@ class BlogArticleView(AdminWorkflowView):
         if not blog:
             await interaction.response.send_message("記事情報を取得できませんでした。", ephemeral=True)
             return
-        await interaction.response.edit_message(content=None, embed=_article_embed(blog), view=BlogArticleView(self.blog_id))
+        await interaction.response.edit_message(content=None, embed=_article_embed(blog), view=BlogArticleView(self.blog_id, browser_state=self.browser_state))
 
     @discord.ui.button(label="未解析だけAI人物判定", emoji="🤖", style=discord.ButtonStyle.secondary)
     async def ai_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -497,6 +834,21 @@ class BlogArticleView(AdminWorkflowView):
 
     @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.browser_state.get("group") and self.browser_state.get("author"):
+            await interaction.response.defer()
+            await _open_author_blog_browser(
+                interaction,
+                str(self.browser_state["group"]),
+                str(self.browser_state["author"]),
+                dict(self.browser_state.get("author_stats") or {}),
+                user_id=interaction.user.id,
+                page=int(self.browser_state.get("page") or 0),
+                selected_year=int(self.browser_state.get("selected_year") or 0),
+                selected_month=int(self.browser_state.get("selected_month") or 0),
+                title_query=str(self.browser_state.get("title_query") or ""),
+                only_unprocessed=bool(self.browser_state.get("only_unprocessed") or False),
+            )
+            return
         await interaction.response.edit_message(
             content="📖 **ブログ単位解析**\n記事の探し方を選択してください。",
             embed=None,
