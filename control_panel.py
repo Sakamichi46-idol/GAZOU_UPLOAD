@@ -345,6 +345,7 @@ class UserPanelView(discord.ui.View):
             name="🔍 写真検索",
             value=(
                 "人物名・タグ・ブログタイトルなどを自由に入力して検索します。\n"
+                "検索結果は最大20件まで表示されます。\n"
                 "結果画面では写真を前後に切り替え、そのままお気に入り登録できます。"
             ),
             inline=False,
@@ -353,6 +354,7 @@ class UserPanelView(discord.ui.View):
             name="👤 人物で探す",
             value=(
                 "人物名を入力し、その人物が写っている写真を検索します。\n"
+                "検索結果は最大20件まで表示されます。\n"
                 "結果から気に入った写真を直接お気に入り登録できます。"
             ),
             inline=False,
@@ -503,7 +505,7 @@ def _is_control_panel_message(message: discord.Message, bot_user: discord.Client
             return True
 
         # 旧版パネルにも対応し、初回更新時に重複を解消する。
-        if embed.title in {"📸 写真アーカイブBot", "👑 管理者パネル"}:
+        if embed.title in {"📸 写真アーカイブBot", "📷 写真検索パネル", "👑 管理者パネル"}:
             return True
 
     return False
@@ -544,14 +546,13 @@ async def remove_existing_control_panels(
 async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.Message]:
     """一般用・管理者用パネルを送信し、送信したMessageを返す。"""
     user_embed = discord.Embed(
-        title="📸 写真アーカイブBot",
+        title="📷 写真検索パネル",
         description=(
             "下のボタンから写真を検索できます。\n"
             "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
-            "お気に入りはDiscordユーザーごとに保存されます。"
+            "お気に入りはユーザーごとに保存されます。"
         ),
     )
-    user_embed.set_footer(text=PANEL_MARKER)
     user_message = await channel.send(embed=user_embed, view=UserPanelView())
 
     admin_embed = discord.Embed(
