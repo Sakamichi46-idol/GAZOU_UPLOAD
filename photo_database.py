@@ -4639,23 +4639,188 @@ def get_blog_authors_for_admin(group_name: str = '', limit: int = 25) -> list[di
 
 
 def get_blogs_for_admin(group_name: str, member_name: str, limit: int = 25) -> list[dict[str, Any]]:
+    """互換用: 投稿者の記事を新しい順に返す。"""
+    blogs, _ = get_blogs_for_admin_filtered(
+        group_name,
+        member_name,
+        limit=limit,
+        offset=0,
+    )
+    return blogs
+
+
+def get_blogs_for_admin_filtered(
+    group_name: str,
+    member_name: str,
+    *,
+    limit: int = 25,
+    offset: int = 0,
+    year: int | None = None,
+    month: int | None = None,
+    title_query: str = "",
+    only_unprocessed: bool = False,
+) -> tuple[list[dict[str, Any]], int]:
+    """投稿者の記事を人物確認進捗付きで絞り込み・ページ取得する。
+
+    Discordのセレクトメニュー上限（25件）を超える記事は、offsetを使って
+    ページ送りできる。戻り値は ``(記事一覧, 絞り込み後の総件数)``。
+    """
+    safe_limit = max(1, min(int(limit), 25))
+    safe_offset = max(0, int(offset))
+    filters = ["pb.group_name = ?", "pb.member_name = ?"]
+    params: list[Any] = [str(group_name), str(member_name)]
+
+    if year:
+        filters.append("substr(pb.published_at, 1, 4) = ?")
+        params.append(f"{int(year):04d}")
+    if month:
+        # 2026.7 / 2026/07 / 2026-07 のいずれにも対応する。
+        month_value = int(month)
+        filters.append(
+            "(" 
+            "pb.published_at LIKE ? OR pb.published_at LIKE ? OR "
+            "pb.published_at LIKE ? OR pb.published_at LIKE ? OR "
+            "pb.published_at LIKE ? OR pb.published_at LIKE ?"
+            ")"
+        )
+        params.extend([
+            f"____.{month_value}.%", f"____.{month_value:02d}.%",
+            f"____/{month_value}/%", f"____/{month_value:02d}/%",
+            f"____-{month_value}-%", f"____-{month_value:02d}-%",
+        ])
+    clean_query = str(title_query or "").strip()
+    if clean_query:
+        filters.append("pb.title LIKE ?")
+        params.append(f"%{clean_query}%")
+
+    where_sql = " WHERE " + " AND ".join(filters)
+    having_sql = ""
+    if only_unprocessed:
+        having_sql = """
+        HAVING COUNT(DISTINCT pi.id) > 0
+           AND COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'completed' THEN prq.image_id
+           END) < COUNT(DISTINCT pi.id)
+        """
+
+    grouped_sql = _blog_admin_progress_select() + where_sql + " GROUP BY pb.id " + having_sql
+    page_sql = grouped_sql + """
+        ORDER BY
+            CASE WHEN pb.published_at = '' THEN 1 ELSE 0 END,
+            pb.published_at DESC,
+            pb.id DESC
+        LIMIT ? OFFSET ?
+    """
+    count_sql = "SELECT COUNT(*) AS total FROM (" + grouped_sql + ") AS filtered_blogs"
+
+    with closing(get_connection()) as connection:
+        total_row = connection.execute(count_sql, tuple(params)).fetchone()
+        rows = connection.execute(
+            page_sql,
+            tuple(params + [safe_limit, safe_offset]),
+        ).fetchall()
+
+    total = int(total_row["total"] if total_row else 0)
+    return _normalize_blog_admin_rows(rows), total
+
+
+def get_blog_years_for_admin(group_name: str, member_name: str) -> list[int]:
+    """投稿者の記事に存在する年を新しい順で返す。"""
     with closing(get_connection()) as connection:
         rows = connection.execute(
             """
-            SELECT pb.id, pb.group_name, pb.member_name, pb.title, pb.published_at,
-                   pb.blog_url, COUNT(pi.id) AS image_count,
-                   SUM(CASE WHEN pi.analysis_status IN ('completed','review') THEN 1 ELSE 0 END) AS analyzed_count,
-                   SUM(CASE WHEN pfs.status = 'completed' THEN 1 ELSE 0 END) AS face_scanned_count
-            FROM photo_blogs pb
-            LEFT JOIN photo_images pi ON pi.blog_id = pb.id
-            LEFT JOIN photo_face_scans pfs ON pfs.image_id = pi.id
-            WHERE pb.group_name = ? AND pb.member_name = ?
-            GROUP BY pb.id
-            ORDER BY pb.published_at DESC, pb.id DESC
-            LIMIT ?
-            """, (str(group_name), str(member_name), max(1, min(int(limit), 25)))
+            SELECT DISTINCT CAST(substr(published_at, 1, 4) AS INTEGER) AS year
+            FROM photo_blogs
+            WHERE group_name = ?
+              AND member_name = ?
+              AND length(published_at) >= 4
+              AND substr(published_at, 1, 4) GLOB '[0-9][0-9][0-9][0-9]'
+            ORDER BY year DESC
+            """,
+            (str(group_name), str(member_name)),
         ).fetchall()
-    return rows_to_dicts(rows)
+    return [int(row["year"]) for row in rows if int(row["year"] or 0) > 0]
+
+
+def _ensure_admin_blog_browser_state(connection: Any) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS photo_admin_blog_browser_state (
+            user_id INTEGER NOT NULL,
+            group_name TEXT NOT NULL,
+            member_name TEXT NOT NULL,
+            page INTEGER NOT NULL DEFAULT 0,
+            selected_year INTEGER NOT NULL DEFAULT 0,
+            selected_month INTEGER NOT NULL DEFAULT 0,
+            title_query TEXT NOT NULL DEFAULT '',
+            only_unprocessed INTEGER NOT NULL DEFAULT 0,
+            last_blog_id INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (user_id, group_name, member_name)
+        )
+        """
+    )
+
+
+def save_admin_blog_browser_state(
+    user_id: int,
+    group_name: str,
+    member_name: str,
+    *,
+    page: int = 0,
+    selected_year: int = 0,
+    selected_month: int = 0,
+    title_query: str = "",
+    only_unprocessed: bool = False,
+    last_blog_id: int = 0,
+) -> None:
+    """管理者ごとの記事ブラウザー位置を保存する。"""
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        _ensure_admin_blog_browser_state(connection)
+        connection.execute(
+            """
+            INSERT INTO photo_admin_blog_browser_state (
+                user_id, group_name, member_name, page,
+                selected_year, selected_month, title_query,
+                only_unprocessed, last_blog_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, group_name, member_name) DO UPDATE SET
+                page = excluded.page,
+                selected_year = excluded.selected_year,
+                selected_month = excluded.selected_month,
+                title_query = excluded.title_query,
+                only_unprocessed = excluded.only_unprocessed,
+                last_blog_id = CASE
+                    WHEN excluded.last_blog_id > 0 THEN excluded.last_blog_id
+                    ELSE photo_admin_blog_browser_state.last_blog_id
+                END,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(user_id), str(group_name), str(member_name), max(0, int(page)),
+                max(0, int(selected_year)), max(0, int(selected_month)),
+                str(title_query or "")[:200], 1 if only_unprocessed else 0,
+                max(0, int(last_blog_id)), now,
+            ),
+        )
+        connection.commit()
+
+
+def get_admin_blog_browser_state(user_id: int, group_name: str, member_name: str) -> dict[str, Any] | None:
+    """管理者ごとの前回の記事ブラウザー位置を返す。"""
+    with closing(get_connection()) as connection:
+        _ensure_admin_blog_browser_state(connection)
+        row = connection.execute(
+            """
+            SELECT * FROM photo_admin_blog_browser_state
+            WHERE user_id = ? AND group_name = ? AND member_name = ?
+            """,
+            (int(user_id), str(group_name), str(member_name)),
+        ).fetchone()
+        connection.commit()
+    return dict(row) if row else None
 
 
 def get_blog_image_ids(blog_id: int, *, only_unanalyzed: bool = False, only_unscanned: bool = False) -> list[int]:
