@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import aiohttp
 import discord
 
+from person_labels import format_people_for_users
 from bucket_storage import bucket_is_configured, create_presigned_get_url
 from photo_database import (
     search_photo_images,
@@ -74,13 +75,13 @@ def build_search_embed(
     if confirmed_people:
         embed.add_field(
             name="✅ 写っている人物（確定）",
-            value=shorten_text(confirmed_people, 1024),
+            value=shorten_text(format_people_for_users(confirmed_people), 1024),
             inline=False,
         )
     elif candidate_people:
         embed.add_field(
             name="🧐 人物候補（未確認）",
-            value=shorten_text(candidate_people, 1024),
+            value=shorten_text(format_people_for_users(candidate_people), 1024),
             inline=False,
         )
 
@@ -299,7 +300,7 @@ class PhotoSearchDetailView(discord.ui.View):
         )
         embed.add_field(
             name="👤 写っている人物",
-            value=shorten_text(confirmed or candidates or "未確定", 1024),
+            value=shorten_text(format_people_for_users(confirmed or candidates) or "未確定", 1024),
             inline=False,
         )
         embed.add_field(
