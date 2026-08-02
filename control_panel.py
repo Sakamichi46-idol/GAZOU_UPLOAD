@@ -472,8 +472,10 @@ class UserPanelView(discord.ui.View):
 
 
 class AdminQuickView(discord.ui.View):
+    """管理者クイックメニュー。Bot稼働中は時間制限なく操作できる。"""
+
     def __init__(self) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         bot = interaction.client
@@ -481,6 +483,15 @@ class AdminQuickView(discord.ui.View):
             return True
         await _reply(interaction, "⚠️ このメニューは管理者専用です。")
         return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        LOGGER.exception("管理者クイックメニューの操作でエラーが発生しました", exc_info=error)
+        await _reply(interaction, "⚠️ 管理操作中にエラーが発生しました。もう一度お試しください。")
 
     @discord.ui.button(label="写真巡回を1回", emoji="📷", style=discord.ButtonStyle.primary)
     async def photo_run(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -531,6 +542,15 @@ class AdminPanelView(discord.ui.View):
             return True
         await _reply(interaction, "⚠️ このパネルは管理者専用です。")
         return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        LOGGER.exception("管理者パネルの操作でエラーが発生しました", exc_info=error)
+        await _reply(interaction, "⚠️ 管理者パネルの操作中にエラーが発生しました。もう一度お試しください。")
 
     @discord.ui.button(label="統合ステータス", emoji="📊", style=discord.ButtonStyle.primary, custom_id="photo:admin:status")
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -646,7 +666,8 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
             description=(
                 f"Bot所有者、または **{ADMIN_ROLE_NAME}** ロール専用です。\n"
                 "「選択式管理」では用途別に操作でき、\n"
-                "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。"
+                "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。\n"
+                "この常設パネルは時間が経過しても操作できます。"
             ),
             color=0xE67E22,
         )
