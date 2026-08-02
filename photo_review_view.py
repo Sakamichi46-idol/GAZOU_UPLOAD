@@ -26,6 +26,8 @@ REVIEW_EMBED_COLOR = discord.Color.blue()
 SUCCESS_EMBED_COLOR = discord.Color.green()
 SKIP_EMBED_COLOR = discord.Color.orange()
 MAX_CANDIDATE_DISPLAY = 10
+SELECT_PAGE_SIZE = 25
+SUCCESS_NOTICE_SECONDS = 4.0
 QUICK_PEOPLE_CACHE_SECONDS = 300
 _QUICK_PEOPLE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
@@ -155,6 +157,67 @@ def build_skipped_embed(review: dict[str, Any], reviewer: discord.abc.User) -> d
     return embed
 
 
+async def _delete_message_safely(message: discord.Message | None) -> None:
+    if message is None:
+        return
+    try:
+        await message.delete()
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+        pass
+
+
+async def _delete_message_later(
+    message: discord.Message | None,
+    delay: float = SUCCESS_NOTICE_SECONDS,
+) -> None:
+    await asyncio.sleep(max(0.0, delay))
+    await _delete_message_safely(message)
+
+
+async def _delete_original_response_later(
+    interaction: discord.Interaction,
+    delay: float = SUCCESS_NOTICE_SECONDS,
+) -> None:
+    await asyncio.sleep(max(0.0, delay))
+    try:
+        await interaction.delete_original_response()
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+        pass
+
+
+async def _finish_selection_message(
+    interaction: discord.Interaction,
+    source_message: discord.Message | None,
+    text: str,
+) -> None:
+    """選択画面を成功表示へ変え、元写真と成功表示を自動で片付ける。"""
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    await _delete_message_safely(source_message)
+    await interaction.edit_original_response(content=text, view=None)
+    asyncio.create_task(_delete_original_response_later(interaction))
+
+
+async def _finish_review_message(
+    interaction: discord.Interaction,
+    source_message: discord.Message | None,
+    text: str,
+) -> None:
+    """人物確認メッセージを消し、本人だけに短時間の完了通知を出す。"""
+    if not interaction.response.is_done():
+        await interaction.response.defer()
+    await _delete_message_safely(source_message)
+    try:
+        notice = await interaction.followup.send(
+            text,
+            ephemeral=True,
+            wait=True,
+        )
+        asyncio.create_task(_delete_message_later(notice))
+    except discord.HTTPException:
+        pass
+
+
 class ReviewSession:
     def __init__(
         self,
@@ -198,6 +261,7 @@ class ReviewSession:
     async def send_message(self, *args: Any, **kwargs: Any) -> discord.Message | None:
         destination = self.destination
         if isinstance(destination, discord.Interaction):
+            kwargs.setdefault("ephemeral", True)
             if destination.response.is_done():
                 return await destination.followup.send(*args, wait=True, **kwargs)
             await destination.response.send_message(*args, **kwargs)
@@ -244,7 +308,15 @@ class ReviewSession:
                 self.message_by_image_id[int(review["image_id"])] = message
         return len(reviews)
 
-    async def mark_done(self, image_id: int) -> None:
+    async def mark_done(
+        self,
+        image_id: int,
+        destination: discord.Interaction | None = None,
+    ) -> None:
+        # 次の写真は直近の操作Interactionから送信する。
+        # 古いInteractionトークンの有効期限に依存せず、長時間の確認作業を続けられる。
+        if destination is not None:
+            self.destination = destination
         async with self.lock:
             if self.stopped or image_id not in self.active_image_ids:
                 return
@@ -267,9 +339,6 @@ class ReviewSession:
             self.current_blog_id = None
 
         if self.continuous:
-            await self.send_message(
-                f"✅ {finished_count}件のレビューが完了しました。次の{self.batch_size}件を自動で読み込みます…"
-            )
             await self.start_batch()
             return
 
@@ -343,7 +412,7 @@ class ReviewSession:
 
 class ReviewContinueView(discord.ui.View):
     def __init__(self, session: ReviewSession):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.session = session
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -407,6 +476,8 @@ class SelectionState:
     selected_names: list[str] = field(default_factory=list)
     group_name: str = ""
     generation_name: str = ""
+    member_page: int = 0
+    remove_page: int = 0
 
     def add_names(self, names: list[str]) -> None:
         for name in names:
@@ -415,7 +486,7 @@ class SelectionState:
 
 
 class OwnedView(discord.ui.View):
-    def __init__(self, state: SelectionState, timeout: float = 300):
+    def __init__(self, state: SelectionState, timeout: float | None = None):
         super().__init__(timeout=timeout)
         self.state = state
 
@@ -428,6 +499,7 @@ class OwnedView(discord.ui.View):
 
 def selection_text(state: SelectionState) -> str:
     selected = "、".join(state.selected_names) if state.selected_names else "まだ選択されていません。"
+    selected = truncate_text(selected, 1700)
     path = " → ".join(v for v in (state.group_name, state.generation_name) if v) or "グループを選んでください。"
     return f"**選択場所:** {path}\n**選択中（{len(state.selected_names)}人）:** {selected}"
 
@@ -440,6 +512,7 @@ class GroupSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         self.state.group_name = self.values[0]
         self.state.generation_name = ""
+        self.state.member_page = 0
         view = GenerationView(self.state)
         await interaction.response.edit_message(content=selection_text(self.state), view=view)
 
@@ -467,6 +540,7 @@ class GenerationSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.state.generation_name = self.values[0]
+        self.state.member_page = 0
         await interaction.response.edit_message(content=selection_text(self.state), view=MemberView(self.state))
 
 
@@ -488,8 +562,21 @@ class GenerationView(OwnedView):
 
 class MemberSelect(discord.ui.Select):
     def __init__(self, state: SelectionState):
-        names = SAKAMICHI_MEMBERS[state.group_name][state.generation_name]
-        super().__init__(placeholder="写っているメンバーを複数選択", min_values=1, max_values=len(names), options=[discord.SelectOption(label=n, value=n, default=n in state.selected_names) for n in names])
+        all_names = SAKAMICHI_MEMBERS[state.group_name][state.generation_name]
+        page_count = max(1, (len(all_names) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        state.member_page = max(0, min(state.member_page, page_count - 1))
+        start = state.member_page * SELECT_PAGE_SIZE
+        names = all_names[start:start + SELECT_PAGE_SIZE]
+        options = [
+            discord.SelectOption(label=n, value=n, default=n in state.selected_names)
+            for n in names
+        ]
+        super().__init__(
+            placeholder=f"写っているメンバーを選択（{state.member_page + 1}/{page_count}ページ）",
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
         self.state = state
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -500,40 +587,84 @@ class MemberSelect(discord.ui.Select):
 class MemberView(OwnedView):
     def __init__(self, state: SelectionState):
         super().__init__(state)
+        all_names = SAKAMICHI_MEMBERS[state.group_name][state.generation_name]
+        page_count = max(1, (len(all_names) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        state.member_page = max(0, min(state.member_page, page_count - 1))
         self.add_item(MemberSelect(state))
+        self.previous_page.disabled = state.member_page <= 0
+        self.next_page.disabled = state.member_page >= page_count - 1
 
-    @discord.ui.button(label="別の期生から追加", emoji="➕", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page = max(0, self.state.member_page - 1)
+        await interaction.response.edit_message(content=selection_text(self.state), view=MemberView(self.state))
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page += 1
+        await interaction.response.edit_message(content=selection_text(self.state), view=MemberView(self.state))
+
+    @discord.ui.button(label="別の期生から追加", emoji="➕", style=discord.ButtonStyle.secondary, row=2)
     async def generation(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.state.generation_name = ""
+        self.state.member_page = 0
         await interaction.response.edit_message(content=selection_text(self.state), view=GenerationView(self.state))
 
-    @discord.ui.button(label="別グループから追加", emoji="🌳", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="別グループから追加", emoji="🌳", style=discord.ButtonStyle.secondary, row=2)
     async def group(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.state.group_name = ""
         self.state.generation_name = ""
+        self.state.member_page = 0
         await interaction.response.edit_message(content=selection_text(self.state), view=GroupView(self.state))
 
-    @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=1)
+    @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=2)
     async def selected(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = 0
         await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
 
 
 class RemoveSelect(discord.ui.Select):
     def __init__(self, state: SelectionState):
-        super().__init__(placeholder="解除する人物を選択", min_values=1, max_values=len(state.selected_names), options=[discord.SelectOption(label=n, value=n) for n in state.selected_names])
+        page_count = max(1, (len(state.selected_names) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        state.remove_page = max(0, min(state.remove_page, page_count - 1))
+        start = state.remove_page * SELECT_PAGE_SIZE
+        names = state.selected_names[start:start + SELECT_PAGE_SIZE]
+        options = [discord.SelectOption(label=n, value=n) for n in names]
+        super().__init__(
+            placeholder=f"解除する人物を選択（{state.remove_page + 1}/{page_count}ページ）",
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
         self.state = state
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.state.selected_names = [n for n in self.state.selected_names if n not in self.values]
+        page_count = max(1, (len(self.state.selected_names) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        self.state.remove_page = min(self.state.remove_page, page_count - 1)
         await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
 
 
 class SelectedPeopleView(OwnedView):
     def __init__(self, state: SelectionState):
         super().__init__(state)
+        page_count = max(1, (len(state.selected_names) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        state.remove_page = max(0, min(state.remove_page, page_count - 1))
         if state.selected_names:
             self.add_item(RemoveSelect(state))
+        self.previous_page.disabled = not state.selected_names or state.remove_page <= 0
+        self.next_page.disabled = not state.selected_names or state.remove_page >= page_count - 1
         self.confirm.disabled = not bool(state.selected_names)
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = max(0, self.state.remove_page - 1)
+        await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page += 1
+        await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
 
     @discord.ui.button(label="人物を追加", emoji="➕", style=discord.ButtonStyle.primary, row=1)
     async def add(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -543,36 +674,67 @@ class SelectedPeopleView(OwnedView):
 
     @discord.ui.button(label="この内容で確定", emoji="✅", style=discord.ButtonStyle.success, row=1)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
         reviewer = get_reviewer_name(interaction.user)
-        await asyncio.to_thread(set_confirmed_image_people, int(self.state.review["image_id"]), self.state.selected_names, confirmed_by=reviewer, note="階層式レビュー画面から複数人を確定")
-        completed = build_completed_embed(self.state.review, self.state.selected_names, interaction.user)
-        await self.state.source_message.edit(embed=completed, view=None)
-        await interaction.response.edit_message(content="✅ 元のレビュー画面を更新しました。", view=None)
+        image_id = int(self.state.review["image_id"])
+        names = list(self.state.selected_names)
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            image_id,
+            names,
+            confirmed_by=reviewer,
+            note="階層式レビュー画面から複数人を確定",
+        )
+        await _finish_selection_message(
+            interaction,
+            self.state.source_message,
+            f"✅ 写真ID **{image_id}** に **{len(names)}人**を設定しました。",
+        )
         if self.state.session:
-            await self.state.session.mark_done(int(self.state.review["image_id"]))
+            await self.state.session.mark_done(image_id, interaction)
 
     @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=2)
     async def nobody(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await asyncio.to_thread(set_confirmed_image_people, int(self.state.review["image_id"]), [], confirmed_by=get_reviewer_name(interaction.user), note="人物なし")
-        completed = build_completed_embed(self.state.review, [], interaction.user)
-        await self.state.source_message.edit(embed=completed, view=None)
-        await interaction.response.edit_message(content="✅ 人物なしで確定しました。", view=None)
+        await interaction.response.defer()
+        image_id = int(self.state.review["image_id"])
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            image_id,
+            [],
+            confirmed_by=get_reviewer_name(interaction.user),
+            note="人物なし",
+        )
+        await _finish_selection_message(
+            interaction,
+            self.state.source_message,
+            f"✅ 写真ID **{image_id}** を人物なしで確定しました。",
+        )
         if self.state.session:
-            await self.state.session.mark_done(int(self.state.review["image_id"]))
+            await self.state.session.mark_done(image_id, interaction)
 
     @discord.ui.button(label="人物不明", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
     async def unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await asyncio.to_thread(set_confirmed_image_people, int(self.state.review["image_id"]), ["人物不明"], confirmed_by=get_reviewer_name(interaction.user), note="人物不明")
-        completed = build_completed_embed(self.state.review, ["人物不明"], interaction.user)
-        await self.state.source_message.edit(embed=completed, view=None)
-        await interaction.response.edit_message(content="✅ 人物不明で確定しました。", view=None)
+        await interaction.response.defer()
+        image_id = int(self.state.review["image_id"])
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            image_id,
+            ["人物不明"],
+            confirmed_by=get_reviewer_name(interaction.user),
+            note="人物不明",
+        )
+        await _finish_selection_message(
+            interaction,
+            self.state.source_message,
+            f"✅ 写真ID **{image_id}** を人物不明で確定しました。",
+        )
         if self.state.session:
-            await self.state.session.mark_done(int(self.state.review["image_id"]))
+            await self.state.session.mark_done(image_id, interaction)
 
 
 class BlogBulkConfirmView(discord.ui.View):
     def __init__(self, session: ReviewSession, author_name: str):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
         self.session = session
         self.author_name = author_name
 
@@ -631,7 +793,7 @@ class FinalPersonConfirmView(discord.ui.View):
     """人物候補をDBへ保存する直前の最終確認。"""
 
     def __init__(self, parent: "PersonReviewView", names: list[str], note: str):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.parent = parent
         self.names = list(names)
         self.note = note
@@ -655,7 +817,7 @@ class FinalPersonConfirmView(discord.ui.View):
 
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.review = review
         self.session = session
         self.image_id = int(review["image_id"])
@@ -727,6 +889,8 @@ class PersonReviewView(discord.ui.View):
         *,
         note: str,
     ) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer()
         await asyncio.to_thread(
             set_confirmed_image_people,
             self.image_id,
@@ -734,19 +898,24 @@ class PersonReviewView(discord.ui.View):
             confirmed_by=get_reviewer_name(interaction.user),
             note=note,
         )
-        completed = build_completed_embed(self.review, names, interaction.user)
-        if interaction.message and interaction.message.id == getattr(self, "source_message_id", 0):
-            await interaction.response.edit_message(embed=completed, view=None)
+        label = "人物なし" if not names else f"{len(names)}人"
+        source_message = self.message
+        if interaction.message and interaction.message.id == self.source_message_id:
+            source_message = interaction.message
+            await _finish_review_message(
+                interaction,
+                source_message,
+                f"✅ 写真ID **{self.image_id}** を **{label}**で確定しました。",
+            )
         else:
-            if not interaction.response.is_done():
-                await interaction.response.edit_message(content="✅ 最終確認が完了しました。", view=None)
-            try:
-                if self.message is not None:
-                    await self.message.edit(embed=completed, view=None)
-            except (discord.HTTPException, discord.NotFound):
-                pass
+            await _delete_message_safely(source_message)
+            await interaction.edit_original_response(
+                content=f"✅ 写真ID **{self.image_id}** を **{label}**で確定しました。",
+                view=None,
+            )
+            asyncio.create_task(_delete_original_response_later(interaction))
         if self.session:
-            await self.session.mark_done(self.image_id)
+            await self.session.mark_done(self.image_id, interaction)
 
     @discord.ui.button(label="候補をすべて採用", emoji="✅", style=discord.ButtonStyle.success, row=0)
     async def accept_candidate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -758,6 +927,7 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="人物を選ぶ", emoji="👥", style=discord.ButtonStyle.primary, row=0)
     async def select_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(seed_member_master)
         initial = split_person_names(self.review.get("confirmed_people", ""))
         state = SelectionState(
@@ -767,7 +937,12 @@ class PersonReviewView(discord.ui.View):
             session=self.session,
             selected_names=initial,
         )
-        await interaction.response.send_message(selection_text(state), view=GroupView(state), ephemeral=True)
+        await interaction.followup.send(
+            selection_text(state),
+            view=GroupView(state),
+            ephemeral=True,
+            wait=True,
+        )
 
     @discord.ui.button(label="手入力", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
     async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -775,18 +950,20 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.secondary, row=0)
     async def skip_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
         await asyncio.to_thread(
             mark_person_review_skipped,
             self.image_id,
             get_reviewer_name(interaction.user),
             "Discordレビュー画面でスキップ",
         )
-        await interaction.response.edit_message(
-            embed=build_skipped_embed(self.review, interaction.user),
-            view=None,
+        await _finish_review_message(
+            interaction,
+            self.message or interaction.message,
+            f"⏭️ 写真ID **{self.image_id}** をスキップ一覧へ移しました。",
         )
         if self.session:
-            await self.session.mark_done(self.image_id)
+            await self.session.mark_done(self.image_id, interaction)
 
     @discord.ui.button(label="このブログを投稿者で一括確定", emoji="📚", style=discord.ButtonStyle.success, row=1)
     async def confirm_blog_author(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -844,6 +1021,7 @@ async def send_person_review(
     if file:
         kwargs["file"] = file
     if isinstance(destination, discord.Interaction):
+        kwargs.setdefault("ephemeral", True)
         if destination.response.is_done():
             message = await destination.followup.send(**kwargs, wait=True)
         else:
