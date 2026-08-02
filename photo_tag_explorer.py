@@ -9,7 +9,11 @@ from typing import Any
 import discord
 
 from photo_database import add_photo_favorite, get_connection
-from photo_search import get_display_image_url
+from photo_search import (
+    build_photo_attachment_files,
+    close_discord_files,
+    get_display_image_url,
+)
 from photo_search_tags import (
     SEARCH_CATEGORY_DEFS,
     build_curated_index,
@@ -1018,19 +1022,9 @@ class ResultsView(OwnedView):
         start = self.page * PAGE_SIZE
         return self.results[start : start + PAGE_SIZE]
 
-    def build_embeds(self) -> list[discord.Embed]:
-        """一覧では説明を付けず、写真だけを1枚ずつ表示する。"""
-        embeds: list[discord.Embed] = []
-
-        for result in self.current_results():
-            image_url = get_display_image_url(result)
-            if not image_url:
-                continue
-            embed = discord.Embed(color=0x00AAFF)
-            embed.set_image(url=image_url)
-            embeds.append(embed)
-
-        return embeds
+    async def build_files(self) -> list[discord.File]:
+        """現在ページの4枚を、Discordの同時添付用ファイルに変換する。"""
+        return await build_photo_attachment_files(self.current_results())
 
     def control_content(self) -> str:
         start = self.page * PAGE_SIZE + 1
@@ -1052,15 +1046,18 @@ class ResultsView(OwnedView):
     async def send_page_messages(self, interaction: discord.Interaction) -> None:
         is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
         self.page_messages = []
-        embeds = self.build_embeds()
-        if not embeds:
+        files = await self.build_files()
+        if not files:
             return
-        message = await interaction.followup.send(
-            embeds=embeds,
-            ephemeral=is_ephemeral,
-            wait=True,
-        )
-        self.page_messages.append(message)
+        try:
+            message = await interaction.followup.send(
+                files=files,
+                ephemeral=is_ephemeral,
+                wait=True,
+            )
+            self.page_messages.append(message)
+        finally:
+            close_discord_files(files)
 
     def _add_number_buttons(self) -> None:
         for offset, _result in enumerate(self.current_results(), 1):
