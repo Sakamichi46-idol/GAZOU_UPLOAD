@@ -229,9 +229,6 @@ class DetailResultButton(discord.ui.Button):
             )
             return
 
-        await interaction.response.defer()
-        await self.parent_view.delete_page_messages()
-
         view = PhotoSearchDetailView(
             owner_id=self.parent_view.owner_id,
             results=self.parent_view.results,
@@ -241,9 +238,10 @@ class DetailResultButton(discord.ui.Button):
             return_page=self.parent_view.page,
         )
         view.message = interaction.message
-        await interaction.message.edit(
+        await interaction.response.edit_message(
             content=None,
             embeds=[view.build_embed()],
+            attachments=[],
             view=view,
         )
         self.parent_view.stop()
@@ -400,7 +398,6 @@ class PhotoSearchDetailView(discord.ui.View):
 
     @discord.ui.button(label="検索結果へ戻る", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
     async def back_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer()
         view = PhotoSearchResultsView(
             owner_id=self.owner_id,
             results=self.results,
@@ -409,12 +406,16 @@ class PhotoSearchDetailView(discord.ui.View):
             page=self.return_page,
         )
         view.message = interaction.message
-        await interaction.message.edit(
-            content=view.control_content(),
-            embeds=[],
-            view=view,
-        )
-        await view.send_page_with_interaction(interaction)
+        files = await view.current_files()
+        try:
+            await interaction.response.edit_message(
+                content=view.control_content(),
+                embeds=[],
+                attachments=files,
+                view=view,
+            )
+        finally:
+            close_discord_files(files)
         self.stop()
 
     async def on_timeout(self) -> None:
@@ -467,9 +468,6 @@ class PhotoSearchResultSelect(discord.ui.Select):
             )
             return
 
-        await interaction.response.defer()
-        await self.parent_view.delete_page_messages()
-
         view = PhotoSearchDetailView(
             owner_id=self.parent_view.owner_id,
             results=self.parent_view.results,
@@ -479,16 +477,17 @@ class PhotoSearchResultSelect(discord.ui.Select):
             return_page=self.parent_view.page,
         )
         view.message = interaction.message
-        await interaction.message.edit(
+        await interaction.response.edit_message(
             content=None,
             embeds=[view.build_embed()],
+            attachments=[],
             view=view,
         )
         self.parent_view.stop()
 
 
 class PhotoSearchResultsView(discord.ui.View):
-    """検索結果を1ページ9枚ずつ、1つのメッセージにまとめて表示する。"""
+    """検索結果を1ページ9枚ずつ、操作メッセージ本体の添付として表示する。"""
 
     def __init__(
         self,
@@ -507,7 +506,6 @@ class PhotoSearchResultsView(discord.ui.View):
         self.max_page = max(0, (len(results) - 1) // RESULTS_PER_PAGE)
         self.page = max(0, min(page, self.max_page))
         self.message: discord.Message | None = None
-        self.page_messages: list[discord.Message] = []
 
         self.add_item(PhotoSearchResultSelect(self))
 
@@ -532,42 +530,6 @@ class PhotoSearchResultsView(discord.ui.View):
             f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
         )
 
-    async def delete_page_messages(self) -> None:
-        for message in self.page_messages:
-            try:
-                await message.delete()
-            except (discord.HTTPException, discord.NotFound):
-                pass
-        self.page_messages.clear()
-
-    async def send_page_with_context(self, ctx) -> None:
-        self.page_messages = []
-        files = await self.current_files()
-        if not files:
-            return
-        try:
-            message = await ctx.send(files=files)
-            if message is not None:
-                self.page_messages.append(message)
-        finally:
-            close_discord_files(files)
-
-    async def send_page_with_interaction(self, interaction: discord.Interaction) -> None:
-        is_ephemeral = bool(getattr(getattr(interaction.message, "flags", None), "ephemeral", False))
-        self.page_messages = []
-        files = await self.current_files()
-        if not files:
-            return
-        try:
-            message = await interaction.followup.send(
-                files=files,
-                ephemeral=is_ephemeral,
-                wait=True,
-            )
-            self.page_messages.append(message)
-        finally:
-            close_discord_files(files)
-
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
             return True
@@ -578,9 +540,6 @@ class PhotoSearchResultsView(discord.ui.View):
         return False
 
     async def _change_page(self, interaction: discord.Interaction, new_page: int) -> None:
-        await interaction.response.defer()
-        await self.delete_page_messages()
-
         view = PhotoSearchResultsView(
             owner_id=self.owner_id,
             results=self.results,
@@ -589,13 +548,22 @@ class PhotoSearchResultsView(discord.ui.View):
             page=new_page,
         )
         view.message = interaction.message
-
-        await interaction.message.edit(
-            content=view.control_content(),
-            embeds=[],
-            view=view,
-        )
-        await view.send_page_with_interaction(interaction)
+        files = await view.current_files()
+        if not files:
+            await interaction.response.send_message(
+                "⚠️ 次のページの画像を取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+        try:
+            await interaction.response.edit_message(
+                content=view.control_content(),
+                embeds=[],
+                attachments=files,
+                view=view,
+            )
+        finally:
+            close_discord_files(files)
         self.stop()
 
     @discord.ui.button(label="前の9枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
@@ -620,11 +588,9 @@ class PhotoSearchResultsView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        await interaction.response.defer()
-        await self.delete_page_messages()
         for child in self.children:
             child.disabled = True
-        await interaction.message.edit(view=self)
+        await interaction.response.edit_message(view=self)
         self.stop()
 
     async def on_timeout(self) -> None:
@@ -679,12 +645,19 @@ async def _send_search(
         query=clean_query,
         search_label=search_label,
     )
-    message = await ctx.send(
-        content=view.control_content(),
-        view=view,
-    )
+    files = await view.current_files()
+    if not files:
+        await ctx.send("⚠️ 検索結果の画像を取得できませんでした。")
+        return
+    try:
+        message = await ctx.send(
+            content=view.control_content(),
+            files=files,
+            view=view,
+        )
+    finally:
+        close_discord_files(files)
     view.message = message
-    await view.send_page_with_context(ctx)
 
 
 async def send_photo_search_results(ctx, query: str, limit: int = DEFAULT_SEARCH_LIMIT) -> None:
