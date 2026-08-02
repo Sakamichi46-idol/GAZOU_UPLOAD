@@ -432,7 +432,7 @@ def _is_control_panel_message(message: discord.Message, bot_user: discord.Client
             return True
 
         # 旧版パネルにも対応し、初回更新時に重複を解消する。
-        if embed.title in {"📸 写真アーカイブBot", "👑 管理者パネル"}:
+        if embed.title in {"📸 写真検索パネル", "👑 管理者パネル"}:
             return True
 
     return False
