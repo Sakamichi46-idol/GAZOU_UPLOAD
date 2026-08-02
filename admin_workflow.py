@@ -19,7 +19,7 @@ from photo_database import (
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
 )
-from photo_review_view import send_blog_person_review_batch
+from photo_review_view import send_blog_person_review_batch, send_person_review_batch
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
 PROGRESS_SEGMENTS = 10
@@ -201,9 +201,18 @@ class ReviewAdminView(AdminWorkflowView):
 
     @discord.ui.button(label="人物確認を開始", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        from control_panel import invoke_existing_command
-
-        await invoke_existing_command(interaction, "review_panel", "5", admin_required=True)
+        await interaction.response.defer(ephemeral=True)
+        count = await send_person_review_batch(
+            interaction,
+            limit=1,
+            queue_status="pending",
+            continuous=True,
+        )
+        if count:
+            await interaction.followup.send(
+                "✅ 人物確認を1枚ずつ開始しました。確定・スキップすると画面が消え、自動で次へ進みます。",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="顔確認を開始", emoji="🙂", style=discord.ButtonStyle.primary)
     async def face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -217,6 +226,21 @@ class ReviewAdminView(AdminWorkflowView):
             content="📖 **ブログ単位人物確認**\n記事の探し方を選択してください。",
             view=BlogDashboardView(),
         )
+
+    @discord.ui.button(label="スキップ済みを表示", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    async def skipped(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        count = await send_person_review_batch(
+            interaction,
+            limit=1,
+            queue_status="skipped",
+            continuous=True,
+        )
+        if count:
+            await interaction.followup.send(
+                "⏭️ スキップ済み写真を1枚ずつ表示します。人物設定が終わると自動で次へ進みます。",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="AI推定人物で検索", emoji="🤖", style=discord.ButtonStyle.success)
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -445,13 +469,13 @@ class BlogArticleView(AdminWorkflowView):
         count = await send_blog_person_review_batch(
             interaction,
             self.blog_id,
-            5,
+            1,
             continuous=True,
             require_final_confirmation=True,
         )
         if count:
             await interaction.followup.send(
-                f"✅ このブログの人物確認を **{count}件ずつ** 開始しました。確定すると自動で次へ進みます。",
+                "✅ このブログの人物確認を1枚ずつ開始しました。確定・スキップすると画面が消え、自動で次へ進みます。",
                 ephemeral=True,
             )
 
