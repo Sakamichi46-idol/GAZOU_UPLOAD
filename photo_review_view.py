@@ -126,14 +126,22 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
     candidates = build_candidate_names(review)
     confirmed = split_person_names(review.get("confirmed_people", ""))
     is_skipped = normalize_text(review.get("review_status")) == "skipped"
+    if confirmed:
+        title = "✏️ 登録人物の確認・編集"
+        description = (
+            "この写真には人物が登録済みです。現在の内容を確認し、"
+            "「登録人物を編集」または「名前・不明人数を再入力」から修正できます。"
+        )
+    elif is_skipped:
+        title = "⏭️ スキップ済み写真の再確認"
+        description = "以前スキップした写真です。今回、人物情報を確定してください。"
+    else:
+        title = "🖼️ 写真の人物確認"
+        description = "写真に写っている人物を確認してください。複数人の選択にも対応しています。"
     embed = discord.Embed(
-        title="⏭️ スキップ済み写真の再確認" if is_skipped else "🖼️ 写真の人物確認",
-        description=(
-            "以前スキップした写真です。今回、人物情報を確定してください。"
-            if is_skipped
-            else "写真に写っている人物を確認してください。複数人の選択にも対応しています。"
-        ),
-        color=SKIP_EMBED_COLOR if is_skipped else REVIEW_EMBED_COLOR,
+        title=title,
+        description=description,
+        color=SUCCESS_EMBED_COLOR if confirmed else (SKIP_EMBED_COLOR if is_skipped else REVIEW_EMBED_COLOR),
     )
     embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
     image_index = int(review.get("image_index") or 0)
@@ -497,6 +505,14 @@ class PersonInputModal(discord.ui.Modal, title="人物名・名前不明人数�
     def __init__(self, parent: "PersonReviewView"):
         super().__init__(timeout=300)
         self.parent_view = parent
+        # 再編集時は現在の登録内容を初期値として表示し、差分だけ直せるようにする。
+        current_raw = split_person_names(parent.review.get("confirmed_people", ""))
+        current_unknown = sum(unknown_other_count(name) for name in current_raw)
+        current_names = [name for name in current_raw if not unknown_other_count(name)]
+        if current_names:
+            self.person_names.default = "、".join(current_names)[:500]
+        if current_unknown:
+            self.unknown_count.default = str(current_unknown)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         names = normalize_people_for_storage(split_person_names(self.person_names.value))
@@ -957,10 +973,10 @@ class PersonReviewView(discord.ui.View):
         if has_confirmed_people:
             self.select_person.label = "登録人物を編集"
             self.select_person.emoji = "✏️"
-            self.manual_input.label = "名前・不明人数を再入力"
+            self.manual_input.label = "名前・不明人数を直接編集"
         elif is_skipped_review:
             self.select_person.label = "人物を再設定"
-            self.manual_input.label = "名前・不明人数を再入力"
+            self.manual_input.label = "名前・不明人数を直接編集"
         else:
             self.manual_input.label = "名前・不明人数を入力"
         if self.quick_people:
