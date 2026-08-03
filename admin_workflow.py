@@ -803,7 +803,14 @@ class BlogPhotoSelect(discord.ui.Select):
             status = str(item.get("review_status") or "pending")
             icon = "✅" if status == "completed" else ("⏭️" if status == "skipped" else "⏳")
             people = str(item.get("confirmed_people") or "").strip()
-            desc = people or ("スキップ済み" if status == "skipped" else "未確認")
+            if people:
+                try:
+                    from person_labels import format_people_for_users
+                    desc = format_people_for_users(people) or "登録済み"
+                except Exception:
+                    desc = people
+            else:
+                desc = "スキップ済み" if status == "skipped" else "未確認"
             options.append(discord.SelectOption(label=f"{icon} {idx}枚目", value=str(item["image_id"]), description=desc[:100]))
         super().__init__(placeholder="確認する写真を選択", min_values=1, max_values=1, options=options, row=0)
         self.parent_view = parent
