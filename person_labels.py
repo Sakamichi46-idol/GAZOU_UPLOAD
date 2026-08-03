@@ -48,6 +48,31 @@ def normalize_people_for_storage(names: Iterable[object]) -> list[str]:
     return result
 
 
+
+def count_people_for_users(names: Iterable[object]) -> int:
+    """保存用人物ラベルから、実際に写っている人数を数える。"""
+    normalized = normalize_people_for_storage(names)
+    total = 0
+    for value in normalized:
+        unknown_count = unknown_other_count(value)
+        total += unknown_count if unknown_count else 1
+    return total
+
+
+def people_items_for_users(names: Iterable[object]) -> list[str]:
+    """保存用人物ラベルを一般向けの人物名一覧へ変換する。"""
+    normalized = normalize_people_for_storage(names)
+    result: list[str] = []
+    for value in normalized:
+        unknown_count = unknown_other_count(value)
+        if unknown_count:
+            result.append(f"その他{unknown_count}名")
+        else:
+            text = str(value or "").strip()
+            if text and text not in result:
+                result.append(text)
+    return result
+
 def format_people_for_users(value: object) -> str:
     """DBの人物文字列を一般利用者向けの自然な表記へ変換する。"""
     text = str(value or "").strip()
