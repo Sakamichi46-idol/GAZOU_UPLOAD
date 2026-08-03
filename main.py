@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+from urllib.parse import urlparse
 
 import discord
 from discord.ext import commands
@@ -31,8 +32,38 @@ bot = commands.Bot(
     intents=intents,
 )
 
+
 url_pattern = re.compile(r"https?://[^\s<>]+")
 blog_task: asyncio.Task | None = None
+
+
+# 写真ブログBotが処理するサイト
+SUPPORTED_BLOG_DOMAINS = {
+    "www.nogizaka46.com",
+    "nogizaka46.com",
+    "www.sakurazaka46.com",
+    "sakurazaka46.com",
+    "www.hinatazaka46.com",
+    "hinatazaka46.com",
+}
+
+
+def is_supported_blog_url(url: str) -> bool:
+    """
+    写真ブログBotが対応しているブログURLか判定する。
+
+    Instagram、X、YouTubeなど、対応していないURLは
+    エラーにせず無視する。
+    """
+
+    try:
+        parsed_url = urlparse(url)
+        hostname = (parsed_url.hostname or "").lower()
+
+    except (TypeError, ValueError):
+        return False
+
+    return hostname in SUPPORTED_BLOG_DOMAINS
 
 
 @bot.event
@@ -45,6 +76,7 @@ async def on_ready():
     if blog_task is None or blog_task.done():
         blog_task = asyncio.create_task(check_blog(bot))
         print("[SUCCESS] ブログ監視を開始しました")
+
     else:
         print("[INFO] ブログ監視タスクはすでに動作中です")
 
@@ -59,29 +91,51 @@ async def status(ctx):
     """Bot、監視タスク、DBの状態を表示する。"""
 
     status_data = get_monitor_status()
+
     task_running = (
         blog_task is not None
         and not blog_task.done()
     )
 
-    running_text = "稼働中" if task_running else "停止中"
-    monitor_text = "稼働中" if status_data.get("running") else "停止中"
-    last_error = str(status_data.get("last_error") or "なし")
+    running_text = (
+        "稼働中"
+        if task_running
+        else "停止中"
+    )
+
+    monitor_text = (
+        "稼働中"
+        if status_data.get("running")
+        else "停止中"
+    )
+
+    last_error = str(
+        status_data.get("last_error")
+        or "なし"
+    )
 
     text = (
         "🤖 Botステータス\n"
         f"接続状態: {running_text}\n"
         f"ブログ監視: {monitor_text}\n"
         f"DB登録件数: {get_blog_count()}件\n"
-        f"前回取得件数: {status_data.get('last_blog_count', 0)}件\n"
-        f"前回新着件数: {status_data.get('last_new_blog_count', 0)}件\n"
-        f"前回確認開始: {status_data.get('last_check_started_at_text')}\n"
-        f"前回確認完了: {status_data.get('last_check_completed_at_text')}\n"
-        f"前回結果: {status_data.get('last_result', '未実行')}\n"
+        f"前回取得件数: "
+        f"{status_data.get('last_blog_count', 0)}件\n"
+        f"前回新着件数: "
+        f"{status_data.get('last_new_blog_count', 0)}件\n"
+        f"前回確認開始: "
+        f"{status_data.get('last_check_started_at_text')}\n"
+        f"前回確認完了: "
+        f"{status_data.get('last_check_completed_at_text')}\n"
+        f"前回結果: "
+        f"{status_data.get('last_result', '未実行')}\n"
         f"前回エラー: {last_error}"
     )
 
-    await ctx.send(text, suppress_embeds=True)
+    await ctx.send(
+        text,
+        suppress_embeds=True,
+    )
 
 
 @bot.command()
@@ -93,7 +147,9 @@ async def latest(ctx):
         )
 
         if not blogs:
-            await ctx.send("ブログを取得できませんでした。")
+            await ctx.send(
+                "ブログを取得できませんでした。"
+            )
             return
 
         for blog in blogs:
@@ -109,8 +165,14 @@ async def latest(ctx):
             )
 
     except Exception as error:
-        print(f"[ERROR] !latest取得エラー: {error!r}")
-        await ctx.send("ブログ取得中にエラーが発生しました。")
+        print(
+            f"[ERROR] !latest取得エラー: "
+            f"{error!r}"
+        )
+
+        await ctx.send(
+            "ブログ取得中にエラーが発生しました。"
+        )
 
 
 @bot.event
@@ -118,16 +180,30 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    urls = url_pattern.findall(message.content)
+    urls = url_pattern.findall(
+        message.content
+    )
 
     for raw_url in urls:
-        url = raw_url.rstrip(".,!?、。！？)]}〉》」』")
+        url = raw_url.rstrip(
+            ".,!?、。！？)]}〉》」』"
+        )
+
+        # 坂道ブログ以外のURLは処理しない
+        if not is_supported_blog_url(url):
+            print(
+                "[INFO] 対応外URLを無視しました: "
+                f"{url}"
+            )
+            continue
 
         try:
             blog = await run_with_retry(
                 get_images,
                 url,
-                operation_name=f"URL画像取得 {url}",
+                operation_name=(
+                    f"URL画像取得 {url}"
+                ),
             )
 
             if not isinstance(blog, dict):
@@ -137,7 +213,10 @@ async def on_message(message):
                 )
                 continue
 
-            images = blog.get("images", [])
+            images = blog.get(
+                "images",
+                [],
+            )
 
             if not images:
                 await message.channel.send(
@@ -146,7 +225,10 @@ async def on_message(message):
                 )
                 continue
 
-            blog["url"] = str(blog.get("url") or url).strip()
+            blog["url"] = str(
+                blog.get("url")
+                or url
+            ).strip()
 
             text = build_notification_text(
                 blog,
@@ -159,12 +241,23 @@ async def on_message(message):
                 embed=None,
                 image_urls=images,
                 send_delay=1.0,
-                article_url=blog.get("url", url),
-                group=blog.get("group", ""),
+                article_url=blog.get(
+                    "url",
+                    url,
+                ),
+                group=blog.get(
+                    "group",
+                    "",
+                ),
             )
 
         except Exception as error:
-            print(f"[ERROR] URL画像処理エラー: url={url} error={error!r}")
+            print(
+                "[ERROR] URL画像処理エラー: "
+                f"url={url} "
+                f"error={error!r}"
+            )
+
             await message.channel.send(
                 "画像処理中にエラーが発生しました。",
                 suppress_embeds=True,
