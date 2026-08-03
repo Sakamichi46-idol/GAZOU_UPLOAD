@@ -11,9 +11,11 @@ import discord
 from discord.ext import commands
 
 from person_labels import (
+    count_people_for_users,
     format_people_for_users,
     make_unknown_other_label,
     normalize_people_for_storage,
+    people_items_for_users,
     unknown_other_count,
 )
 from photo_database import (
@@ -62,6 +64,22 @@ def split_person_names(value: Any) -> list[str]:
 def get_reviewer_name(user: discord.abc.User) -> str:
     name = normalize_text(getattr(user, "display_name", "")) or normalize_text(getattr(user, "name", ""))
     return f"{name} ({user.id})".strip()
+
+
+def build_people_confirmation_text(image_id: int, names: list[str]) -> str:
+    """人物確定後に、人数と確定名を漏れなく表示する。"""
+    normalized = normalize_people_for_storage(names)
+    if not normalized:
+        return f"✅ 写真ID **{image_id}** を人物なしで確定しました。"
+
+    people_count = count_people_for_users(normalized)
+    display_items = people_items_for_users(normalized)
+    escaped_items = [discord.utils.escape_markdown(item) for item in display_items]
+    people_lines = "\n".join(f"・{item}" for item in escaped_items)
+    return (
+        f"✅ 写真ID **{image_id}** に **{people_count}人**を設定しました。\n\n"
+        f"👤 **設定した人物**\n{people_lines}"
+    )
 
 
 def get_quick_people_cached(group_name: str, limit: int = 25) -> list[dict[str, Any]]:
@@ -388,11 +406,11 @@ class ReviewSession:
             try:
                 embed = discord.Embed(
                     title="✅ ブログ単位で一括確定",
-                    description=f"このブログの対象画像を **{'、'.join(names)}** で確定しました。",
+                    description=f"このブログの対象画像を **{format_people_for_users('、'.join(names))}** で確定しました。",
                     color=SUCCESS_EMBED_COLOR,
                 )
                 embed.add_field(name="画像ID", value=str(image_id), inline=True)
-                embed.add_field(name="確定人物", value="、".join(names), inline=False)
+                embed.add_field(name="確定人物", value=format_people_for_users("、".join(names)), inline=False)
                 await message.edit(embed=embed, view=None, attachments=[])
             except (discord.HTTPException, discord.NotFound):
                 pass
@@ -402,7 +420,7 @@ class ReviewSession:
         self.message_by_image_id.clear()
         self.current_blog_id = None
         await interaction.followup.send(
-            f"✅ このブログの **{count}件** を **{'、'.join(names)}** で一括確定しました。",
+            f"✅ このブログの **{count}件** を **{format_people_for_users('、'.join(names))}** で一括確定しました。",
             ephemeral=True,
         )
 
@@ -745,7 +763,7 @@ class SelectedPeopleView(OwnedView):
         await _finish_selection_message(
             interaction,
             self.state.source_message,
-            f"✅ 写真ID **{image_id}** に **{len(names)}人**を設定しました。",
+            build_people_confirmation_text(image_id, names),
         )
         if self.state.session:
             await self.state.session.mark_done(image_id, interaction)
@@ -940,7 +958,8 @@ class PersonReviewView(discord.ui.View):
         note: str,
     ) -> None:
         if self.session and self.session.require_final_confirmation:
-            label = "人物なし" if not names else "、".join(names)
+            normalized_names = normalize_people_for_storage(names)
+            label = "人物なし" if not normalized_names else format_people_for_users("、".join(normalized_names))
             await interaction.response.send_message(
                 f"🔎 **最終確認**\n写真ID **{self.image_id}** を **{discord.utils.escape_markdown(label)}** で確定しますか？",
                 view=FinalPersonConfirmView(self, names, note),
@@ -966,19 +985,19 @@ class PersonReviewView(discord.ui.View):
             confirmed_by=get_reviewer_name(interaction.user),
             note=note,
         )
-        label = "人物なし" if not names else f"{len(names)}人"
+        confirmation_text = build_people_confirmation_text(self.image_id, names)
         source_message = self.message
         if interaction.message and interaction.message.id == self.source_message_id:
             source_message = interaction.message
             await _finish_review_message(
                 interaction,
                 source_message,
-                f"✅ 写真ID **{self.image_id}** を **{label}**で確定しました。",
+                confirmation_text,
             )
         else:
             await _delete_message_safely(source_message)
             await interaction.edit_original_response(
-                content=f"✅ 写真ID **{self.image_id}** を **{label}**で確定しました。",
+                content=confirmation_text,
                 view=None,
             )
             asyncio.create_task(_delete_original_response_later(interaction))
