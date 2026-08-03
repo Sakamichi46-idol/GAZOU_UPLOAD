@@ -179,7 +179,7 @@ def _face_selection_text(state: FaceMemberSelectionState) -> str:
 
 class FaceMemberOwnedView(discord.ui.View):
     def __init__(self, state: FaceMemberSelectionState) -> None:
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.state = state
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -298,6 +298,107 @@ class FaceMemberView(FaceMemberOwnedView):
         )
 
 
+class ConfirmedFaceEditView(discord.ui.View):
+    """確定済みの顔人物を、同じ確認メッセージから再編集するView。"""
+
+    def __init__(
+        self,
+        review: dict[str, Any],
+        *,
+        owner_id: int,
+        person_id: int,
+        person_name: str,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.review = review
+        self.owner_id = int(owner_id)
+        self.current_person_id = int(person_id)
+        self.current_person_name = _text(person_name) or "不明"
+        self.message: discord.Message | None = None
+        self.finished = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "この人物編集は顔レビューを行った本人だけが操作できます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def complete(
+        self,
+        interaction: discord.Interaction,
+        person_id: int,
+        person_name: str,
+        note: str,
+    ) -> None:
+        await asyncio.to_thread(
+            complete_face_review,
+            int(self.review["face_id"]),
+            int(person_id),
+            _reviewer(interaction.user),
+            f"再編集: {note}",
+        )
+        self.current_person_id = int(person_id)
+        self.current_person_name = _text(person_name) or "不明"
+        embed = build_completed_embed(self.review, self.current_person_name, interaction.user)
+        embed.description = "登録済みの人物を更新しました。必要なら、下のボタンから再編集できます。"
+
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
+
+        escaped = discord.utils.escape_markdown(self.current_person_name)
+        if interaction.message is not None and self.message is not None and interaction.message.id == self.message.id:
+            await interaction.response.edit_message(embed=embed, view=self)
+        elif interaction.message is not None:
+            await interaction.response.edit_message(
+                content=f"✅ 顔ID **{self.review.get('face_id', '不明')}** の登録人物を **{escaped}** に更新しました。",
+                view=None,
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ 顔ID **{self.review.get('face_id', '不明')}** の登録人物を **{escaped}** に更新しました。",
+                ephemeral=True,
+            )
+
+    async def complete_from_member_select(
+        self,
+        interaction: discord.Interaction,
+        person_name: str,
+    ) -> None:
+        person = await asyncio.to_thread(get_person_by_name, person_name)
+        if not person:
+            await interaction.response.send_message(
+                f"⚠️ 人物マスターに **{discord.utils.escape_markdown(person_name)}** が見つかりません。",
+                ephemeral=True,
+            )
+            return
+        await self.complete(
+            interaction,
+            int(person["id"]),
+            _text(person["person_name"]),
+            "階層式メンバー選択メニュー",
+        )
+
+    @discord.ui.button(label="登録人物を編集", emoji="✏️", style=discord.ButtonStyle.primary, row=0)
+    async def edit_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        state = FaceMemberSelectionState(self)
+        await interaction.response.send_message(
+            _face_selection_text(state)
+            + f"\n現在の登録人物: **{discord.utils.escape_markdown(self.current_person_name)}**",
+            view=FaceGroupView(state),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="名前を入力して編集", emoji="⌨️", style=discord.ButtonStyle.secondary, row=0)
+    async def edit_by_name(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FacePersonModal(self))
+
+
 class FaceReviewView(discord.ui.View):
     def __init__(
         self,
@@ -306,7 +407,7 @@ class FaceReviewView(discord.ui.View):
         *,
         owner_id: int,
     ) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.review = review
         self.owner_id = int(owner_id)
         self.message: discord.Message | None = None
@@ -345,7 +446,15 @@ class FaceReviewView(discord.ui.View):
         self.finished = True
         self.stop()
         embed = build_completed_embed(self.review, person_name, interaction.user)
-        await interaction.response.edit_message(embed=embed, view=None)
+        embed.description = "人物を確定しました。必要なら、下のボタンから登録人物を再編集できます。"
+        edit_view = ConfirmedFaceEditView(
+            self.review,
+            owner_id=self.owner_id,
+            person_id=int(person_id),
+            person_name=person_name,
+        )
+        edit_view.message = interaction.message
+        await interaction.response.edit_message(embed=embed, view=edit_view)
 
 
     async def complete_from_member_select(
@@ -371,14 +480,23 @@ class FaceReviewView(discord.ui.View):
         )
         self.finished = True
         self.stop()
-        embed = build_completed_embed(self.review, _text(person["person_name"]), interaction.user)
+        person_name_text = _text(person["person_name"])
+        embed = build_completed_embed(self.review, person_name_text, interaction.user)
+        embed.description = "人物を確定しました。必要なら、元の顔レビュー画面から登録人物を再編集できます。"
+        edit_view = ConfirmedFaceEditView(
+            self.review,
+            owner_id=self.owner_id,
+            person_id=int(person["id"]),
+            person_name=person_name_text,
+        )
+        edit_view.message = self.message
         if self.message is not None:
             try:
-                await self.message.edit(embed=embed, view=None)
+                await self.message.edit(embed=embed, view=edit_view)
             except discord.HTTPException:
                 pass
         await interaction.response.edit_message(
-            content=f"✅ **{discord.utils.escape_markdown(_text(person['person_name']))}** で確定しました。",
+            content=f"✅ **{discord.utils.escape_markdown(person_name_text)}** で確定しました。元の画面から再編集できます。",
             view=None,
         )
 
@@ -402,6 +520,10 @@ class FaceReviewView(discord.ui.View):
             view=FaceGroupView(state),
             ephemeral=True,
         )
+
+    @discord.ui.button(label="名前を入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=1)
+    async def name_input_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FacePersonModal(self))
 
     @discord.ui.button(label="今回は保留", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
     async def skip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
