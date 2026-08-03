@@ -112,6 +112,9 @@ class FacePersonModal(discord.ui.Modal, title="顔の人物を指定"):
     def __init__(self, parent: "FaceReviewView") -> None:
         super().__init__()
         self.parent_view = parent
+        current_name = _text(getattr(parent, "current_person_name", ""))
+        if current_name and current_name != "不明":
+            self.person_name.default = current_name[:100]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         name = _text(self.person_name.value)
@@ -389,7 +392,8 @@ class ConfirmedFaceEditView(discord.ui.View):
         state = FaceMemberSelectionState(self)
         await interaction.response.send_message(
             _face_selection_text(state)
-            + f"\n現在の登録人物: **{discord.utils.escape_markdown(self.current_person_name)}**",
+            + f"\n\n👤 **現在の登録人物**\n・{discord.utils.escape_markdown(self.current_person_name)}"
+            + "\n\n新しい人物を選ぶと、現在の登録内容を置き換えます。",
             view=FaceGroupView(state),
             ephemeral=True,
         )
