@@ -19,11 +19,12 @@ from photo_database import (
     save_admin_blog_browser_state,
     get_blog_image_ids,
     get_blog_progress_for_admin,
+    get_blog_images_for_review_admin,
     get_error_blogs_for_admin,
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
 )
-from photo_review_view import send_blog_person_review_batch, send_person_review_batch
+from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
 PROGRESS_SEGMENTS = 10
@@ -794,11 +795,98 @@ async def _open_author_blog_browser(
     await interaction.edit_original_response(content=heading, embed=None, view=view)
 
 
+class BlogPhotoSelect(discord.ui.Select):
+    def __init__(self, parent: "BlogPhotoBrowserView", rows: list[dict[str, Any]]):
+        options = []
+        for item in rows:
+            idx = int(item.get("image_index") or 0)
+            status = str(item.get("review_status") or "pending")
+            icon = "✅" if status == "completed" else ("⏭️" if status == "skipped" else "⏳")
+            people = str(item.get("confirmed_people") or "").strip()
+            desc = people or ("スキップ済み" if status == "skipped" else "未確認")
+            options.append(discord.SelectOption(label=f"{icon} {idx}枚目", value=str(item["image_id"]), description=desc[:100]))
+        super().__init__(placeholder="確認する写真を選択", min_values=1, max_values=1, options=options, row=0)
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        image_id = int(self.values[0])
+        item = next((x for x in self.parent_view.all_rows if int(x["image_id"]) == image_id), None)
+        if not item:
+            await interaction.response.send_message("写真情報を取得できませんでした。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await send_person_review(interaction, item, session=None)
+
+
+class BlogPhotoBrowserView(AdminWorkflowView):
+    PAGE_SIZE = 25
+
+    def __init__(self, blog_id: int, rows: list[dict[str, Any]], page: int = 0):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.all_rows = rows
+        self.page_count = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        start = self.page * self.PAGE_SIZE
+        page_rows = rows[start:start + self.PAGE_SIZE]
+        if page_rows:
+            self.add_item(BlogPhotoSelect(self, page_rows))
+        self.previous_page.disabled = self.page <= 0
+        self.next_page.disabled = self.page >= self.page_count - 1
+
+    def text(self) -> str:
+        completed = sum(str(x.get("review_status")) == "completed" for x in self.all_rows)
+        skipped = sum(str(x.get("review_status")) == "skipped" for x in self.all_rows)
+        pending = max(0, len(self.all_rows) - completed - skipped)
+        start = self.page * self.PAGE_SIZE + 1 if self.all_rows else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.all_rows))
+        return (
+            f"🖼️ **ブログ内写真一覧**\n"
+            f"全 **{len(self.all_rows)}枚** / ✅完了 **{completed}** / "
+            f"⏳未確認 **{pending}** / ⏭️スキップ **{skipped}**\n"
+            f"表示 **{start}〜{end}枚目**（{self.page + 1}/{self.page_count}ページ）\n"
+            "写真番号を選ぶと、1枚だけの確認画面が開きます。"
+            "長い画像一覧をスクロールする必要はありません。"
+        )
+
+    @discord.ui.button(label="前の25枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BlogPhotoBrowserView(self.blog_id, self.all_rows, self.page - 1)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="次の25枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BlogPhotoBrowserView(self.blog_id, self.all_rows, self.page + 1)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="未確認を連続確認", emoji="▶️", style=discord.ButtonStyle.success, row=1)
+    async def start_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        count = await send_blog_person_review_batch(interaction, self.blog_id, 1, continuous=True, require_final_confirmation=True)
+        if count:
+            await interaction.followup.send("未確認写真を1枚ずつ表示します。保存またはスキップすると自動で次へ進みます。", ephemeral=True)
+
+    @discord.ui.button(label="一覧を更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        rows = await asyncio.to_thread(get_blog_images_for_review_admin, self.blog_id)
+        view = BlogPhotoBrowserView(self.blog_id, rows, self.page)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
 class BlogArticleView(AdminWorkflowView):
     def __init__(self, blog_id: int, browser_state: dict[str, Any] | None = None):
         super().__init__()
         self.blog_id = int(blog_id)
         self.browser_state = dict(browser_state or {})
+
+    @discord.ui.button(label="写真一覧・ギャラリー", emoji="🖼️", style=discord.ButtonStyle.primary)
+    async def gallery(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        rows = await asyncio.to_thread(get_blog_images_for_review_admin, self.blog_id)
+        if not rows:
+            await interaction.followup.send("このブログには写真がありません。", ephemeral=True)
+            return
+        view = BlogPhotoBrowserView(self.blog_id, rows)
+        await interaction.edit_original_response(content=view.text(), embed=None, view=view)
 
     @discord.ui.button(label="人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
