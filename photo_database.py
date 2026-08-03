@@ -4096,6 +4096,78 @@ def set_confirmed_blog_people(
     return len(image_ids)
 
 
+
+def get_blog_images_for_review_admin(blog_id: int) -> list[dict[str, Any]]:
+    """ブログ内の全写真を人物確認用の情報付きで返す。完了・未確認・スキップを含む。"""
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                pi.id AS image_id,
+                pi.image_url,
+                pi.local_path,
+                pi.image_index,
+                pi.blog_id,
+                pb.blog_url,
+                pb.group_name,
+                pb.member_name,
+                pb.title,
+                pb.published_at,
+                COALESCE(prq.status, 'pending') AS review_status,
+                COALESCE(prq.candidates, '') AS candidates,
+                COALESCE(prq.review_note, '') AS review_note,
+                COALESCE(paa.person_name, '') AS ai_person_name,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = pi.id AND pip.relation_status = 'candidate'
+                ), '') AS candidate_people,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = pi.id AND pip.relation_status = 'confirmed'
+                ), '') AS confirmed_people,
+                (SELECT COUNT(*) FROM photo_images x WHERE x.blog_id = pi.blog_id) AS total_blog_images
+            FROM photo_images pi
+            JOIN photo_blogs pb ON pb.id = pi.blog_id
+            LEFT JOIN photo_review_queue prq
+              ON prq.image_id = pi.id AND prq.review_type = 'person_identity'
+            LEFT JOIN photo_ai_analysis paa ON paa.image_id = pi.id
+            WHERE pi.blog_id = ?
+            ORDER BY pi.image_index ASC, pi.id ASC
+            """,
+            (int(blog_id),),
+        ).fetchall()
+    return rows_to_dicts(rows)
+
+
+def get_previous_confirmed_people_in_blog(blog_id: int, image_index: int) -> list[str]:
+    """同じブログで現在写真より前に確定した、直近写真の人物名を返す。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT pi.id
+            FROM photo_images pi
+            WHERE pi.blog_id = ? AND pi.image_index < ?
+              AND EXISTS (
+                  SELECT 1 FROM photo_image_people pip
+                  WHERE pip.image_id = pi.id AND pip.relation_status = 'confirmed'
+              )
+            ORDER BY pi.image_index DESC, pi.id DESC
+            LIMIT 1
+            """,
+            (int(blog_id), int(image_index)),
+        ).fetchone()
+        if row is None:
+            return []
+        names = connection.execute(
+            """SELECT person_name FROM photo_image_people
+               WHERE image_id = ? AND relation_status = 'confirmed'
+               ORDER BY id ASC""",
+            (int(row['id']),),
+        ).fetchall()
+    return [str(item['person_name']).strip() for item in names if str(item['person_name']).strip()]
+
 # =========================
 # 単体実行テスト
 # =========================
