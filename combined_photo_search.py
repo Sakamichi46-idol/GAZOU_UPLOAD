@@ -59,7 +59,7 @@ async def _instagram_results(query: str, limit: int) -> tuple[list[dict[str, Any
             'id': row.get('id'),
             'image_url': row.get('attachment_url') or '',
             'title': shorten_text(row.get('caption') or 'Instagram投稿', 120),
-            'author': '@' + str(row.get('owner_username') or '不明'),
+            'author': str(row.get('display_name') or ('@' + str(row.get('owner_username') or '不明'))),
             'people': row.get('people_text') or '',
             'date': row.get('created_at') or '',
             'source_url': row.get('post_url') or '',
