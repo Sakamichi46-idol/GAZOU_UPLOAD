@@ -164,7 +164,12 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
     embed.add_field(name="現在の確定人物", value=format_people_for_users("、".join(confirmed)) or "未確定", inline=False)
     if review.get("blog_url"):
         embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
-    embed.set_footer(text="人物がいない写真は「人物なし」、写っているが判別できない場合は「人物不明」を押してください。")
+    embed.set_footer(
+        text=(
+            "人物の新規設定・再設定・スキップ再確認のすべてで、"
+            "名前不明人数を追加・減少できます。"
+        )
+    )
     return embed
 
 
@@ -473,8 +478,20 @@ class ReviewContinueView(discord.ui.View):
         self.stop()
 
 
-class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
-    person_names = discord.ui.TextInput(label="人物名", placeholder="複数人は「、」で区切ってください。", style=discord.TextStyle.paragraph, max_length=500)
+class PersonInputModal(discord.ui.Modal, title="人物名・名前不明人数を入力"):
+    person_names = discord.ui.TextInput(
+        label="名前が分かる人物",
+        placeholder="複数人は「、」で区切ります。名前不明だけなら空欄でOKです。",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500,
+    )
+    unknown_count = discord.ui.TextInput(
+        label="名前不明のその他人物の人数",
+        placeholder="例: 2（いなければ0または空欄）",
+        required=False,
+        max_length=3,
+    )
     note = discord.ui.TextInput(label="メモ", required=False, max_length=500)
 
     def __init__(self, parent: "PersonReviewView"):
@@ -483,8 +500,29 @@ class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         names = normalize_people_for_storage(split_person_names(self.person_names.value))
+        raw_unknown = normalize_text(self.unknown_count.value)
+        try:
+            unknown_count = int(raw_unknown or "0")
+        except ValueError:
+            await interaction.response.send_message(
+                "名前不明人数は0以上の整数で入力してください。",
+                ephemeral=True,
+            )
+            return
+        if unknown_count < 0 or unknown_count > 999:
+            await interaction.response.send_message(
+                "名前不明人数は0〜999人で入力してください。",
+                ephemeral=True,
+            )
+            return
+        if unknown_count:
+            names.append(make_unknown_other_label(unknown_count))
+            names = normalize_people_for_storage(names)
         if not names:
-            await interaction.response.send_message("人物名を入力してください。", ephemeral=True)
+            await interaction.response.send_message(
+                "人物名または名前不明人数を入力してください。人物が写っていない場合は「人物なし」を使ってください。",
+                ephemeral=True,
+            )
             return
         for name in names:
             if name not in _SAKAMICHI_MEMBER_NAMES and not unknown_other_count(name):
@@ -492,7 +530,7 @@ class PersonInputModal(discord.ui.Modal, title="人物名を手入力"):
         await self.parent_view.complete_review(
             interaction,
             names,
-            note=normalize_text(self.note.value) or "その他の人物名を手入力",
+            note=normalize_text(self.note.value) or "人物名・名前不明人数を手入力",
         )
 
 
@@ -914,6 +952,13 @@ class PersonReviewView(discord.ui.View):
             25,
         )
         self.accept_candidate.disabled = not bool(self.candidates)
+        has_confirmed_people = bool(split_person_names(review.get("confirmed_people", "")))
+        is_skipped_review = normalize_text(review.get("review_status")) == "skipped"
+        if has_confirmed_people or is_skipped_review:
+            self.select_person.label = "人物を再設定"
+            self.manual_input.label = "名前・不明人数を再入力"
+        else:
+            self.manual_input.label = "名前・不明人数を入力"
         if self.quick_people:
             self.add_item(QuickPeopleSelect(self, self.quick_people))
 
