@@ -646,7 +646,8 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
             description=(
                 "下のボタンから写真を検索できます。\n"
                 "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
-                "お気に入りはユーザーごとに保存されます。"
+                "お気に入りはユーザーごとに保存されます。\n"
+                "⚠️画像を表示するまでに多少時間がかかる場合があります。"
             ),
             color=0x3498DB,
         )
