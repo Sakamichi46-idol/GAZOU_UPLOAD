@@ -954,7 +954,11 @@ class PersonReviewView(discord.ui.View):
         self.accept_candidate.disabled = not bool(self.candidates)
         has_confirmed_people = bool(split_person_names(review.get("confirmed_people", "")))
         is_skipped_review = normalize_text(review.get("review_status")) == "skipped"
-        if has_confirmed_people or is_skipped_review:
+        if has_confirmed_people:
+            self.select_person.label = "登録人物を編集"
+            self.select_person.emoji = "✏️"
+            self.manual_input.label = "名前・不明人数を再入力"
+        elif is_skipped_review:
             self.select_person.label = "人物を再設定"
             self.manual_input.label = "名前・不明人数を再入力"
         else:
