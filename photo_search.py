@@ -28,6 +28,10 @@ DEFAULT_SEARCH_LIMIT = 20
 MAX_SEARCH_LIMIT = 50
 VIEW_TIMEOUT_SECONDS = 300
 RESULTS_PER_PAGE = 9
+PHOTO_SEARCH_DISPLAY_NAME = (
+    os.getenv("PHOTO_SEARCH_DISPLAY_NAME", "写真検索Bot").strip()
+    or "写真検索Bot"
+)
 
 
 def shorten_text(value: Any, max_length: int) -> str:
@@ -53,6 +57,8 @@ def build_search_embed(
         url=blog_url or None,
         color=0x00AAFF,
     )
+
+    embed.set_author(name=PHOTO_SEARCH_DISPLAY_NAME)
 
     embed.add_field(
         name="🏷️ グループ",
@@ -551,7 +557,7 @@ class PhotoSearchResultsView(discord.ui.View):
         start = self.page * RESULTS_PER_PAGE + 1
         end = min(len(self.results), start + RESULTS_PER_PAGE - 1)
         return (
-            f"🔍 **{self.search_label}結果**\n"
+            f"🔍 **{PHOTO_SEARCH_DISPLAY_NAME}｜{self.search_label}結果**\n"
             f"検索語: `{shorten_text(self.query, 1000)}`\n"
             f"取得件数: **{len(self.results)}件**\n"
             f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
