@@ -321,6 +321,64 @@ class FavoriteView(discord.ui.View):
         await invoke_existing_command(interaction, "favorite_list")
 
 
+class CombinedSearchModal(discord.ui.Modal):
+    def __init__(self, *, source: str, person_only: bool = False) -> None:
+        title = "人物で写真検索" if person_only else "写真検索"
+        super().__init__(title=title, timeout=300)
+        self.source = source
+        self.person_only = person_only
+        self.query_input = discord.ui.TextInput(
+            label="人物名" if person_only else "検索語",
+            placeholder="例: 山口陽世" if person_only else "人物名・投稿者・タイトル・キャプションなど",
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.query_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from combined_photo_search import send_combined_search
+        await send_combined_search(interaction, self.source, str(self.query_input.value))
+
+
+class PhotoSourceSelectView(discord.ui.View):
+    def __init__(self, *, owner_id: int, person_only: bool = False) -> None:
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.person_only = person_only
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await _reply(interaction, "この選択画面は操作した本人専用です。")
+            return False
+        return True
+
+    async def _open(self, interaction: discord.Interaction, source: str) -> None:
+        await interaction.response.send_modal(
+            CombinedSearchModal(source=source, person_only=self.person_only)
+        )
+
+    @discord.ui.button(label="ブログ", emoji="📚", style=discord.ButtonStyle.primary)
+    async def blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._open(interaction, "blog")
+
+    @discord.ui.button(label="Instagram", emoji="📸", style=discord.ButtonStyle.primary)
+    async def instagram(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._open(interaction, "instagram")
+
+    @discord.ui.button(label="両方", emoji="🔎", style=discord.ButtonStyle.success)
+    async def all_sources(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self._open(interaction, "all")
+
+
+async def send_source_selector(interaction: discord.Interaction, *, person_only: bool = False) -> None:
+    text = "検索対象を選んでください。結果は操作した本人だけに表示されます。"
+    await interaction.response.send_message(
+        text,
+        view=PhotoSourceSelectView(owner_id=interaction.user.id, person_only=person_only),
+        ephemeral=True,
+    )
+
+
 class UserPanelView(discord.ui.View):
     _last_action_at: dict[int, float] = {}
 
@@ -359,17 +417,11 @@ class UserPanelView(discord.ui.View):
 
     @discord.ui.button(label="写真検索", emoji="🔍", style=discord.ButtonStyle.primary, custom_id="photo:user:search")
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(CommandArgumentsModal(
-            title="写真検索", command_name="photo_search",
-            label="検索語", placeholder="人物名・タグ・ブログタイトルなど", required=True,
-        ))
+        await send_source_selector(interaction, person_only=False)
 
     @discord.ui.button(label="人物で探す", emoji="👤", style=discord.ButtonStyle.primary, custom_id="photo:user:person")
     async def person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(CommandArgumentsModal(
-            title="人物で写真検索", command_name="person",
-            label="人物名", placeholder="例: 井上和", required=True,
-        ))
+        await send_source_selector(interaction, person_only=True)
 
     @discord.ui.button(label="タグで探す", emoji="🏷️", style=discord.ButtonStyle.primary, custom_id="photo:user:tag")
     async def tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -412,7 +464,7 @@ class UserPanelView(discord.ui.View):
         embed.add_field(
             name="🔍 写真検索",
             value=(
-                "人物名・タグ・ブログタイトルなどを自由に入力して検索します。\n"
+                "最初にブログ・Instagram・両方から検索対象を選び、人物名・投稿者・タイトル・キャプションなどで検索します。\n"
                 "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
                 "一覧の選択メニューから写真の詳細を開き、お気に入り登録できます。"
             ),
@@ -421,7 +473,7 @@ class UserPanelView(discord.ui.View):
         embed.add_field(
             name="👤 人物で探す",
             value=(
-                "人物名を入力し、その人物が写っている写真を検索します。\n"
+                "最初にブログ・Instagram・両方から検索対象を選び、人物名で写真を検索します。\n"
                 "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
                 "一覧の選択メニューから詳細を開き、お気に入り登録できます。"
             ),
