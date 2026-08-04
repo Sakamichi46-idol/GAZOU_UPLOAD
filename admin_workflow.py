@@ -23,6 +23,7 @@ from photo_database import (
     get_error_blogs_for_admin,
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
+    reset_blog_processing_errors_for_admin,
 )
 from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
 
@@ -95,7 +96,23 @@ def _article_summary(blog: dict[str, Any]) -> str:
         f"人物確認 **{completed}/{total}**（残り{pending}）",
     ]
     if errors:
-        lines.append(f"⚠️ エラー画像 **{errors}枚**")
+        download_errors = int(blog.get("download_error_count") or 0)
+        analysis_errors = int(blog.get("analysis_error_count") or 0)
+        face_errors = int(blog.get("face_error_count") or 0)
+        parts = []
+        if download_errors:
+            parts.append(f"画像取得 {download_errors}")
+        if analysis_errors:
+            parts.append(f"AI解析 {analysis_errors}")
+        if face_errors:
+            parts.append(f"顔認証 {face_errors}")
+        lines.append(f"⚠️ 処理エラー **{errors}枚**（{' / '.join(parts) or '詳細不明'}）")
+    terminal = int(blog.get("terminal_excluded_count") or 0)
+    if terminal:
+        lines.append(f"🚫 除外済み **{terminal}枚**（不正URL・復旧不能）")
+    stale = int(blog.get("stale_error_count") or 0)
+    if stale:
+        lines.append(f"🧹 古いエラー記録 **{stale}枚**（再試行準備で整理可能）")
     return "\n".join(lines)
 
 
@@ -337,7 +354,11 @@ class ProgressBlogSelect(discord.ui.Select):
             title = str(blog.get("title") or "無題")[:100]
             description = f"{blog.get('member_name') or '不明'} / 人物確認 {completed}/{total} ({percent}%)"
             if errors:
-                description += f" / エラー{errors}"
+                d = int(blog.get("download_error_count") or 0)
+                a = int(blog.get("analysis_error_count") or 0)
+                f = int(blog.get("face_error_count") or 0)
+                detail = "/".join(x for x in (f"取得{d}" if d else "", f"AI{a}" if a else "", f"顔{f}" if f else "") if x)
+                description += f" / {detail or f'エラー{errors}'}"
             options.append(discord.SelectOption(
                 label=title,
                 value=str(blog["id"]),
@@ -496,7 +517,11 @@ class BlogArticleSelect(discord.ui.Select):
             if skipped:
                 description += f" / スキップ{skipped}"
             if errors:
-                description += f" / エラー{errors}"
+                d = int(blog.get("download_error_count") or 0)
+                a = int(blog.get("analysis_error_count") or 0)
+                f = int(blog.get("face_error_count") or 0)
+                detail = "/".join(x for x in (f"取得{d}" if d else "", f"AI{a}" if a else "", f"顔{f}" if f else "") if x)
+                description += f" / {detail or f'エラー{errors}'}"
             options.append(discord.SelectOption(
                 label=str(blog.get("title") or "無題")[:100],
                 value=str(blog["id"]),
@@ -927,7 +952,35 @@ class BlogArticleView(AdminWorkflowView):
     async def face_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._run(interaction, "face", True)
 
-    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="エラーを再試行待ちへ", emoji="♻️", style=discord.ButtonStyle.danger, row=2)
+    async def retry_errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        counts = await asyncio.to_thread(reset_blog_processing_errors_for_admin, self.blog_id)
+        total = sum(int(value) for value in counts.values())
+        await interaction.followup.send(
+            (
+                "♻️ 再試行可能な失敗を待機状態へ戻しました。\n"
+                f"画像取得 **{counts['download']}枚** / "
+                f"AI解析 **{counts['analysis']}枚** / "
+                f"顔認証 **{counts['face']}枚**\n"
+                "必要に応じて保存処理・AI解析・顔認証を再実行してください。"
+                if total else
+                "✅ 再試行可能な失敗はありませんでした。古いエラー文字だけ残っていた場合は整理済みです。"
+            ),
+            ephemeral=True,
+        )
+        blog = await asyncio.to_thread(get_blog_progress_for_admin, self.blog_id)
+        if blog:
+            try:
+                await interaction.edit_original_response(
+                    content=None,
+                    embed=_article_embed(blog),
+                    view=BlogArticleView(self.blog_id, browser_state=self.browser_state),
+                )
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         if self.browser_state.get("group") and self.browser_state.get("author"):
             await interaction.response.defer()
