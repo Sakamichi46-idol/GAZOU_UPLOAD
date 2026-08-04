@@ -37,6 +37,9 @@ import discord
 from discord.ext import commands
 from discord.ext.commands.view import StringView
 
+from community_features import FeedbackModal
+from runtime_guard import user_operation
+
 ADMIN_ROLE_ID = _env_int("PHOTO_BOT_ADMIN_ROLE_ID", 0, minimum=0)
 ADMIN_ROLE_NAME = os.getenv("PHOTO_BOT_ADMIN_ROLE_NAME", "PhotoBot Admin").strip() or "PhotoBot Admin"
 
@@ -197,7 +200,14 @@ async def invoke_existing_command(
         # 3秒以内に応答を確定させる。Context.sendは以後followupを利用できる。
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
-        await command.invoke(ctx)
+        if admin_required:
+            await command.invoke(ctx)
+        else:
+            try:
+                async with user_operation(interaction.user.id):
+                    await command.invoke(ctx)
+            except RuntimeError as exc:
+                await _reply(interaction, f"⏳ {exc}")
     except commands.CommandError as error:
         ctx.command_failed = True
         await bot.on_command_error(ctx, error)
@@ -448,6 +458,42 @@ class UserPanelView(discord.ui.View):
         await invoke_existing_command(interaction, "person_list")
 
     @discord.ui.button(
+        label="検索履歴",
+        emoji="🕘",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:history",
+    )
+    async def history(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "search_history", "15")
+
+    @discord.ui.button(
+        label="コレクション",
+        emoji="📚",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:collections",
+    )
+    async def collections(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "collection_list")
+
+    @discord.ui.button(
+        label="人気写真",
+        emoji="📈",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:popular",
+    )
+    async def popular(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "popular_photos", "10")
+
+    @discord.ui.button(
+        label="不具合・要望",
+        emoji="📮",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:feedback",
+    )
+    async def feedback(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FeedbackModal())
+
+    @discord.ui.button(
         label="使い方",
         emoji="❓",
         style=discord.ButtonStyle.secondary,
@@ -460,6 +506,11 @@ class UserPanelView(discord.ui.View):
                 "各ボタンの操作結果は、基本的に操作した本人だけに表示されます。\n"
                 "写真や検索内容が公開チャンネルへ流れることはありません。"
             ),
+        )
+        embed.add_field(
+            name="📮 不具合・要望",
+            value="匿名または記名で、不具合・人物名の間違い・機能要望を管理者へ送れます。写真に関する場合は画像IDも入力できます。",
+            inline=False,
         )
         embed.add_field(
             name="🔍 写真検索",
@@ -630,6 +681,14 @@ class AdminPanelView(discord.ui.View):
         from admin_workflow import make_admin_category_view
         await _reply(interaction, "🧭 管理カテゴリーを選択してください。", ephemeral=True)
         await interaction.followup.send("選択式管理メニュー", view=make_admin_category_view(), ephemeral=True)
+
+    @discord.ui.button(label="報告・要望箱", emoji="📬", style=discord.ButtonStyle.secondary, custom_id="photo:admin:feedback")
+    async def feedback_admin(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "feedback_admin", admin_required=True)
+
+    @discord.ui.button(label="運営・AI", emoji="🧠", style=discord.ButtonStyle.secondary, custom_id="photo:admin:operations")
+    async def operations(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "operations_dashboard", admin_required=True)
 
     @discord.ui.button(label="全コマンド", emoji="⌨️", style=discord.ButtonStyle.danger, custom_id="photo:admin:all_commands")
     async def all_commands(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
