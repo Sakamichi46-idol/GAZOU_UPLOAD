@@ -16,6 +16,7 @@ from blog_monitor import (
 from database import get_blog_count, init_db
 from image_getter import get_images
 from media_converter import send_blog_media
+from community_features import init_community_schema
 
 
 TOKEN = os.getenv("TOKEN")
@@ -71,6 +72,7 @@ async def on_ready():
     global blog_task
 
     init_db()
+    init_community_schema()
     print(f"[SUCCESS] {bot.user} が起動しました")
 
     if blog_task is None or blog_task.done():
