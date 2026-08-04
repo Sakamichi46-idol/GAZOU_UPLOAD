@@ -8,6 +8,7 @@ from typing import Any
 
 import discord
 
+from community_features import FeedbackModal, record_usage_event
 from photo_database import add_photo_favorite, get_connection
 from photo_search import (
     build_photo_attachment_files,
@@ -1600,6 +1601,13 @@ class DetailView(OwnedView):
                 image_id,
                 interaction.user.id,
             )
+            if added:
+                await asyncio.to_thread(
+                    record_usage_event,
+                    interaction.user.id,
+                    "favorite",
+                    image_id=image_id,
+                )
         except Exception as error:
             print("タグ検索画面のお気に入り登録エラー:", error)
             await interaction.response.send_message(
@@ -1616,6 +1624,22 @@ class DetailView(OwnedView):
         await interaction.response.send_message(
             message,
             ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="この写真を報告",
+        emoji="⚠️",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def report(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        await interaction.response.send_modal(
+            FeedbackModal(category="人物名・写真情報の間違い", image_id=image_id)
         )
 
     @discord.ui.button(
