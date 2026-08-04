@@ -4945,12 +4945,33 @@ def _blog_admin_progress_select() -> str:
                  AND prq.status = 'skipped' THEN prq.image_id
             END) AS review_skipped_count,
             COUNT(DISTINCT CASE
+                WHEN pi.download_status = 'failed' THEN pi.id
+            END) AS download_error_count,
+            COUNT(DISTINCT CASE
+                WHEN pi.analysis_status = 'failed' THEN pi.id
+            END) AS analysis_error_count,
+            COUNT(DISTINCT CASE
+                WHEN pfs.status = 'failed' THEN pi.id
+            END) AS face_error_count,
+            COUNT(DISTINCT CASE
+                WHEN pi.download_status IN ('invalid_url', 'permanent_failed') THEN pi.id
+            END) AS terminal_excluded_count,
+            COUNT(DISTINCT CASE
+                WHEN (
+                    pi.download_status <> 'failed'
+                    AND TRIM(COALESCE(pi.download_error, '')) <> ''
+                ) OR (
+                    pi.analysis_status <> 'failed'
+                    AND TRIM(COALESCE(pi.analysis_error, '')) <> ''
+                ) OR (
+                    COALESCE(pfs.status, '') <> 'failed'
+                    AND TRIM(COALESCE(pfs.error_message, '')) <> ''
+                ) THEN pi.id
+            END) AS stale_error_count,
+            COUNT(DISTINCT CASE
                 WHEN pi.download_status = 'failed'
-                  OR TRIM(COALESCE(pi.download_error, '')) <> ''
                   OR pi.analysis_status = 'failed'
-                  OR TRIM(COALESCE(pi.analysis_error, '')) <> ''
                   OR pfs.status = 'failed'
-                  OR TRIM(COALESCE(pfs.error_message, '')) <> ''
                 THEN pi.id
             END) AS error_count,
             MAX(COALESCE(NULLIF(prq.reviewed_at, ''), NULLIF(prq.updated_at, ''), pi.updated_at, pb.updated_at)) AS last_reviewed_at
@@ -5028,11 +5049,8 @@ def get_error_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
         GROUP BY pb.id
         HAVING COUNT(DISTINCT CASE
                 WHEN pi.download_status = 'failed'
-                  OR TRIM(COALESCE(pi.download_error, '')) <> ''
                   OR pi.analysis_status = 'failed'
-                  OR TRIM(COALESCE(pi.analysis_error, '')) <> ''
                   OR pfs.status = 'failed'
-                  OR TRIM(COALESCE(pfs.error_message, '')) <> ''
                 THEN pi.id
             END) > 0
         ORDER BY error_count DESC, pb.published_at DESC, pb.id DESC
@@ -5042,6 +5060,77 @@ def get_error_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
         rows = connection.execute(sql, (safe_limit,)).fetchall()
     return _normalize_blog_admin_rows(rows)
 
+
+
+def reset_blog_processing_errors_for_admin(blog_id: int) -> dict[str, int]:
+    """記事内の再試行可能な失敗を待機状態へ戻す。
+
+    invalid_url / permanent_failed は復旧不能として除外済みなので変更しない。
+    顔スキャン失敗行は削除し、次回の未処理顔認証対象へ戻す。
+    """
+    target_blog_id = int(blog_id)
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        download_cursor = connection.execute(
+            """
+            UPDATE photo_images
+            SET download_status = 'pending', download_error = '', updated_at = ?
+            WHERE blog_id = ? AND download_status = 'failed'
+            """,
+            (now, target_blog_id),
+        )
+        analysis_cursor = connection.execute(
+            """
+            UPDATE photo_images
+            SET analysis_status = 'pending', analysis_error = '', updated_at = ?
+            WHERE blog_id = ? AND analysis_status = 'failed'
+            """,
+            (now, target_blog_id),
+        )
+        face_rows = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM photo_face_scans pfs
+            JOIN photo_images pi ON pi.id = pfs.image_id
+            WHERE pi.blog_id = ? AND pfs.status = 'failed'
+            """,
+            (target_blog_id,),
+        ).fetchone()
+        face_count = int(face_rows['count'] or 0) if face_rows else 0
+        connection.execute(
+            """
+            DELETE FROM photo_face_scans
+            WHERE status = 'failed'
+              AND image_id IN (SELECT id FROM photo_images WHERE blog_id = ?)
+            """,
+            (target_blog_id,),
+        )
+        # 成功状態なのに古い文字だけ残ったレコードも安全に掃除する。
+        connection.execute(
+            """
+            UPDATE photo_images
+            SET download_error = CASE WHEN download_status = 'failed' THEN download_error ELSE '' END,
+                analysis_error = CASE WHEN analysis_status = 'failed' THEN analysis_error ELSE '' END,
+                updated_at = ?
+            WHERE blog_id = ?
+            """,
+            (now, target_blog_id),
+        )
+        connection.execute(
+            """
+            UPDATE photo_face_scans
+            SET error_message = ''
+            WHERE status <> 'failed'
+              AND image_id IN (SELECT id FROM photo_images WHERE blog_id = ?)
+            """,
+            (target_blog_id,),
+        )
+        connection.commit()
+    return {
+        'download': max(0, int(download_cursor.rowcount or 0)),
+        'analysis': max(0, int(analysis_cursor.rowcount or 0)),
+        'face': face_count,
+    }
 
 def get_blog_progress_for_admin(blog_id: int) -> dict[str, Any] | None:
     """1記事の人物確認進捗を返す。"""
