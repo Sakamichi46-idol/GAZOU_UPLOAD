@@ -62,6 +62,7 @@ from photo_archive_runner import (
     run_photo_archive_once,
 )
 from photo_commands import register_photo_commands
+from community_features import register_community_commands, init_community_schema
 from control_panel import (
     add_persistent_control_panel_views,
     register_control_panel,
@@ -83,6 +84,7 @@ bot = commands.Bot(
 )
 
 register_photo_commands(bot)
+register_community_commands(bot)
 register_control_panel(bot)
 
 # =========================
@@ -1409,7 +1411,8 @@ async def on_ready() -> None:
 
     global startup_initialized
 
-    # 常設ボタンを再起動後も有効にする。
+    # 追加機能用の非破壊DBマイグレーションと常設ボタンを有効化する。
+    init_community_schema()
     add_persistent_control_panel_views(bot)
 
     print(
