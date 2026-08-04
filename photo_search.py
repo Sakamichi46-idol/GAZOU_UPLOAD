@@ -13,6 +13,7 @@ import discord
 
 from person_labels import format_people_for_users
 from bucket_storage import bucket_is_configured, create_presigned_get_url
+from community_features import FeedbackModal, record_usage_event
 from photo_database import (
     search_photo_images,
     search_photo_images_by_author,
@@ -236,6 +237,13 @@ class DetailResultButton(discord.ui.Button):
             )
             return
 
+        await asyncio.to_thread(
+            record_usage_event,
+            interaction.user.id,
+            "detail",
+            image_id=int(self.parent_view.results[result_index].get("id") or 0),
+            query_text=self.parent_view.query,
+        )
         view = PhotoSearchDetailView(
             owner_id=self.parent_view.owner_id,
             results=self.parent_view.results,
@@ -388,6 +396,8 @@ class PhotoSearchDetailView(discord.ui.View):
 
         try:
             added = await asyncio.to_thread(add_photo_favorite, image_id, interaction.user.id)
+            if added:
+                await asyncio.to_thread(record_usage_event, interaction.user.id, "favorite", image_id=image_id)
         except Exception as error:
             print("検索詳細画面のお気に入り登録エラー:", error)
             await interaction.response.send_message(
@@ -402,6 +412,13 @@ class PhotoSearchDetailView(discord.ui.View):
             else f"⭐ 画像ID **{image_id}** はすでにお気に入り登録済みです。"
         )
         await interaction.response.send_message(text, ephemeral=True)
+
+    @discord.ui.button(label="この写真を報告", emoji="⚠️", style=discord.ButtonStyle.secondary, row=1)
+    async def report_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        await interaction.response.send_modal(
+            FeedbackModal(category="人物名・写真情報の間違い", image_id=image_id)
+        )
 
     @discord.ui.button(label="検索結果へ戻る", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
     async def back_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -692,6 +709,12 @@ async def _send_search(
         )
         return
 
+    await asyncio.to_thread(
+        record_usage_event,
+        ctx.author.id,
+        "search",
+        query_text=f"{search_label}:{clean_query}",
+    )
     view = PhotoSearchResultsView(
         owner_id=ctx.author.id,
         results=results,
