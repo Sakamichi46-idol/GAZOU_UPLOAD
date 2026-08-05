@@ -390,14 +390,159 @@ async def send_source_selector(interaction: discord.Interaction, *, person_only:
     )
 
 
+class _UserOwnedView(discord.ui.View):
+    """一般ユーザー向けの本人専用エフェメラルメニュー。"""
+
+    def __init__(self, owner_id: int, *, timeout: float = 600) -> None:
+        super().__init__(timeout=timeout)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if int(interaction.user.id) == self.owner_id:
+            return True
+        await _reply(interaction, "このメニューは、開いた本人だけが操作できます。")
+        return False
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[discord.ui.View],
+    ) -> None:
+        LOGGER.exception("一般ユーザー用サブメニューの操作でエラーが発生しました", exc_info=error)
+        await _reply(
+            interaction,
+            "⚠️ 操作中にエラーが発生しました。時間を置いてもう一度お試しください。",
+        )
+
+
+async def _send_user_submenu(
+    interaction: discord.Interaction,
+    *,
+    title: str,
+    description: str,
+    view: discord.ui.View,
+    color: int,
+) -> None:
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="このメニューと操作結果は、開いた本人にだけ表示されます。")
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class UserSearchMenuView(_UserOwnedView):
+    """「写真を探す」カテゴリー。"""
+
+    @discord.ui.button(label="写真検索", emoji="🔍", style=discord.ButtonStyle.primary)
+    async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await send_source_selector(interaction, person_only=False)
+
+    @discord.ui.button(label="人物検索", emoji="👤", style=discord.ButtonStyle.primary)
+    async def person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await send_source_selector(interaction, person_only=True)
+
+    @discord.ui.button(label="タグ検索", emoji="🏷️", style=discord.ButtonStyle.primary)
+    async def tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "photo_tags")
+
+    @discord.ui.button(label="画像ID", emoji="🖼️", style=discord.ButtonStyle.secondary)
+    async def image_id(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CommandArgumentsModal(
+            title="画像IDから表示",
+            command_name="photo_id",
+            label="画像ID",
+            placeholder="例: 125 / ID 125",
+            required=True,
+        ))
+
+    @discord.ui.button(label="人物一覧", emoji="📋", style=discord.ButtonStyle.secondary)
+    async def people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "person_list")
+
+
+class UserSavedMenuView(_UserOwnedView):
+    """「保存した写真」カテゴリー。"""
+
+    @discord.ui.button(label="お気に入り", emoji="⭐", style=discord.ButtonStyle.success)
+    async def favorites(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "favorite_list", "100")
+
+    @discord.ui.button(label="コレクション", emoji="📚", style=discord.ButtonStyle.success)
+    async def collections(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "collection_list")
+
+    @discord.ui.button(label="あとで見る", emoji="🔖", style=discord.ButtonStyle.secondary)
+    async def watch_later(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "watch_later", "25")
+
+    @discord.ui.button(label="最近見た", emoji="🕘", style=discord.ButtonStyle.secondary)
+    async def recently_viewed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "recently_viewed", "20")
+
+    @discord.ui.button(label="検索履歴", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def history(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "search_history", "15")
+
+
+class UserExploreMenuView(_UserOwnedView):
+    """「おすすめ」カテゴリー。"""
+
+    @discord.ui.button(label="人気写真", emoji="📈", style=discord.ButtonStyle.primary)
+    async def popular(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "popular_photos", "10")
+
+    @discord.ui.button(label="おすすめ・探索", emoji="✨", style=discord.ButtonStyle.primary)
+    async def explore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "user_explore")
+
+    @discord.ui.button(label="最近の写真", emoji="🕒", style=discord.ButtonStyle.secondary)
+    async def recent(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "photo_recent", "10")
+
+
+class UserOtherMenuView(_UserOwnedView):
+    """人物プロフィールや問い合わせなどの補助機能。"""
+
+    @discord.ui.button(label="人物プロフィール", emoji="👤", style=discord.ButtonStyle.secondary)
+    async def profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonProfileModal())
+
+    @discord.ui.button(label="不具合・要望", emoji="📮", style=discord.ButtonStyle.secondary)
+    async def feedback(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(FeedbackModal())
+
+    @discord.ui.button(label="Botについて", emoji="ℹ️", style=discord.ButtonStyle.secondary)
+    async def about(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        embed = discord.Embed(
+            title="ℹ️ 写真検索Botについて",
+            description=(
+                "坂道ブログなどから保存された写真を、人物・タグ・画像IDなどで探せるBotです。\n"
+                "検索結果、保存一覧、履歴、問い合わせ内容は本人専用画面で表示されます。"
+            ),
+            color=0x5865F2,
+        )
+        embed.add_field(
+            name="主な機能",
+            value="写真検索／人物検索／タグ検索／お気に入り／コレクション／おすすめ・探索",
+            inline=False,
+        )
+        embed.add_field(
+            name="困ったとき",
+            value="トップ画面の「📖 使い方」または、このメニューの「📮 不具合・要望」を利用してください。",
+            inline=False,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 class UserPanelView(discord.ui.View):
+    """常設トップパネル。目的別の5カテゴリーだけを表示する。"""
+
     _last_action_at: dict[int, float] = {}
 
     def __init__(self) -> None:
         super().__init__(timeout=None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # 連打で同じ重い検索が複数起動するのを防ぐ。
+        # 連打で同じ重い処理や複数のメニューが同時に開くのを防ぐ。
         now = time.monotonic()
         user_id = int(interaction.user.id)
         previous = self._last_action_at.get(user_id, 0.0)
@@ -426,106 +571,71 @@ class UserPanelView(discord.ui.View):
             "⚠️ パネル操作中にエラーが発生しました。時間を置いてもう一度お試しください。",
         )
 
-    @discord.ui.button(label="写真検索", emoji="🔍", style=discord.ButtonStyle.primary, custom_id="photo:user:search")
-    async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await send_source_selector(interaction, person_only=False)
-
-    @discord.ui.button(label="人物で探す", emoji="👤", style=discord.ButtonStyle.primary, custom_id="photo:user:person")
-    async def person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await send_source_selector(interaction, person_only=True)
-
-    @discord.ui.button(label="タグで探す", emoji="🏷️", style=discord.ButtonStyle.primary, custom_id="photo:user:tag")
-    async def tag(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        # DBに存在するカテゴリー → タグの順で選べる検索画面を開く。
-        await invoke_existing_command(interaction, "photo_tags")
-
-    @discord.ui.button(label="画像ID", emoji="🖼️", style=discord.ButtonStyle.secondary, custom_id="photo:user:id")
-    async def image_id(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(CommandArgumentsModal(
-            title="画像IDから表示", command_name="photo_id",
-            label="画像ID", placeholder="例: 125 / ID 125", required=True,
-        ))
-
-    @discord.ui.button(label="お気に入り", emoji="⭐", style=discord.ButtonStyle.success, custom_id="photo:user:favorites")
-    async def favorites(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "favorite_list", "100")
-
-    @discord.ui.button(label="最近の写真", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="photo:user:recent")
-    async def recent(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "photo_recent", "10")
-
-    @discord.ui.button(label="人物一覧", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="photo:user:people")
-    async def people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "person_list")
-
     @discord.ui.button(
-        label="検索履歴",
-        emoji="🕘",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:history",
+        label="写真を探す",
+        emoji="🔍",
+        style=discord.ButtonStyle.primary,
+        custom_id="photo:user:menu:search",
     )
-    async def history(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "search_history", "15")
+    async def search_menu(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await _send_user_submenu(
+            interaction,
+            title="🔍 写真を探す",
+            description="検索方法を選んでください。人物一覧から登録人物を確認することもできます。",
+            view=UserSearchMenuView(interaction.user.id),
+            color=0x3498DB,
+        )
 
     @discord.ui.button(
-        label="コレクション",
-        emoji="📚",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:collections",
+        label="保存した写真",
+        emoji="⭐",
+        style=discord.ButtonStyle.success,
+        custom_id="photo:user:menu:saved",
     )
-    async def collections(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "collection_list")
+    async def saved_menu(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await _send_user_submenu(
+            interaction,
+            title="⭐ 保存した写真",
+            description="お気に入りやコレクション、あとで見る、履歴を確認できます。",
+            view=UserSavedMenuView(interaction.user.id),
+            color=0x57F287,
+        )
 
     @discord.ui.button(
-        label="人気写真",
-        emoji="📈",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:popular",
-    )
-    async def popular(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "popular_photos", "10")
-
-    @discord.ui.button(
-        label="不具合・要望",
-        emoji="📮",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:feedback",
-    )
-    async def feedback(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(FeedbackModal())
-
-    @discord.ui.button(
-        label="おすすめ・探索",
+        label="おすすめ",
         emoji="✨",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:explore",
+        style=discord.ButtonStyle.primary,
+        custom_id="photo:user:menu:explore",
     )
-    async def explore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "user_explore")
+    async def explore_menu(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await _send_user_submenu(
+            interaction,
+            title="✨ おすすめ",
+            description="人気写真、ランダム写真、今日の1枚、最近追加された写真を楽しめます。",
+            view=UserExploreMenuView(interaction.user.id),
+            color=0xFEE75C,
+        )
 
     @discord.ui.button(
-        label="最近見た",
-        emoji="🕘",
+        label="その他",
+        emoji="⚙️",
         style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:recently_viewed",
+        custom_id="photo:user:menu:other",
     )
-    async def recently_viewed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await invoke_existing_command(interaction, "recently_viewed", "20")
-
-    @discord.ui.button(
-        label="人物プロフィール",
-        emoji="👤",
-        style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:profile",
-    )
-    async def profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(PersonProfileModal())
+    async def other_menu(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await _send_user_submenu(
+            interaction,
+            title="⚙️ その他",
+            description="人物プロフィール、問い合わせ、Botの概要を確認できます。",
+            view=UserOtherMenuView(interaction.user.id),
+            color=0x95A5A6,
+        )
 
     @discord.ui.button(
         label="使い方",
-        emoji="❓",
+        emoji="📖",
         style=discord.ButtonStyle.secondary,
-        custom_id="photo:user:help",
+        custom_id="photo:user:menu:help",
     )
     async def help(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message(
@@ -533,7 +643,6 @@ class UserPanelView(discord.ui.View):
             view=HelpHomeView(interaction.user.id),
             ephemeral=True,
         )
-
 
 
 class AdminQuickView(discord.ui.View):
@@ -717,16 +826,19 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
         user_embed = discord.Embed(
             title="📷 写真検索パネル",
             description=(
-                "下のボタンから写真を検索できます。\n"
-                "検索結果や操作結果は、操作した本人にだけ表示されます。\n"
-                "お気に入りはユーザーごとに保存されます。\n"
-                "⚠️画像を表示するまでに多少時間がかかる場合があります。"
+                "目的に合うカテゴリーを選んでください。\n"
+                "各カテゴリーを押すと、本人だけにサブメニューが表示されます。\n"
+                "お気に入りやコレクションなどの保存内容はユーザーごとに管理されます。\n"
+                "⚠️ 画像を表示するまでに多少時間がかかる場合があります。"
             ),
             color=0x3498DB,
         )
         user_embed.add_field(
             name="表示について",
-            value="検索結果は公開チャンネルには投稿されません。各操作は本人専用画面で進みます。",
+            value=(
+                "トップ画面は「写真を探す・保存した写真・おすすめ・その他・使い方」の5項目です。\n"
+                "検索結果や操作結果は公開チャンネルには投稿されません。"
+            ),
             inline=False,
         )
         sent_messages.append(await channel.send(
