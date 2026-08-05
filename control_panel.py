@@ -743,6 +743,11 @@ class AdminPanelView(discord.ui.View):
     async def ai_status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "ai_status", admin_required=True)
 
+    @discord.ui.button(label="AI育成センター", emoji="🧠", style=discord.ButtonStyle.primary, custom_id="photo:admin:ai_center")
+    async def ai_center(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from advanced_admin_features import send_ai_center
+        await send_ai_center(interaction)
+
     @discord.ui.button(label="保存状況", emoji="💾", style=discord.ButtonStyle.secondary, custom_id="photo:admin:storage")
     async def storage(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "photo_storage", admin_required=True)
