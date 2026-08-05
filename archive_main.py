@@ -1387,6 +1387,8 @@ async def send_blog_to_channel(
 
 async def run_ai_analysis_batch(
     limit: int | None = None,
+    *,
+    manual_api: bool = False,
 ) -> dict[str, Any]:
     """AI解析を多重起動させずに1バッチ実行する。"""
 
@@ -1402,7 +1404,7 @@ async def run_ai_analysis_batch(
 
     async with ai_analysis_lock:
         return await analyze_pending_images(
-            limit or PHOTO_AI_AUTO_LIMIT
+            limit or PHOTO_AI_AUTO_LIMIT, manual_api=manual_api
         )
 
 
@@ -2105,7 +2107,7 @@ async def ai_analyze_command(
     try:
 
         result = await run_ai_analysis_batch(
-            limit
+            limit, manual_api=True
         )
 
     except Exception as error:
