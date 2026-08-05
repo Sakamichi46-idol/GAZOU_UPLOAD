@@ -15,6 +15,10 @@ from typing import Any
 import discord
 from discord.ext import commands
 from embed_safety import safe_add_field
+from advanced_admin_features import (
+    init_advanced_admin_schema,
+    send_ai_center,
+)
 from ai_cost_control import (
     get_ai_cost_status,
     simulate_pending_api_usage,
@@ -883,6 +887,10 @@ class AdminOperationsView(discord.ui.View):
     async def errors(self, interaction, _):
         await interaction.response.send_message("再試行するエラー種別を選んでください。", view=ErrorManagementView(self.owner_id), ephemeral=True)
 
+    @discord.ui.button(label="AI育成センター", emoji="🤖", style=discord.ButtonStyle.primary)
+    async def ai_center(self, interaction, _):
+        await send_ai_center(interaction)
+
     @discord.ui.button(label="AI学習状況", emoji="🧠", style=discord.ButtonStyle.secondary)
     async def ai(self, interaction, _):
         await interaction.response.defer(ephemeral=True)
@@ -927,6 +935,7 @@ async def send_admin_operations(interaction: discord.Interaction) -> None:
 
 def register_admin_operations_commands(bot: commands.Bot) -> None:
     init_admin_operations_schema()
+    init_advanced_admin_schema()
 
     @bot.command(name="admin_dashboard")
     @commands.is_owner()
