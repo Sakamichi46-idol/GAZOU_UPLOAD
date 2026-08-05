@@ -60,6 +60,29 @@ def init_user_experience_schema() -> None:
         con.commit()
 
 
+def should_show_beginner_guide(user_id: int) -> bool:
+    init_user_experience_schema()
+    with closing(get_connection()) as con:
+        row = con.execute(
+            "SELECT beginner_mode FROM user_guide_preferences WHERE discord_user_hash=?",
+            (_user_hash(user_id),),
+        ).fetchone()
+        return row is None or bool(int(row[0]))
+
+
+def set_beginner_guide(user_id: int, enabled: bool) -> None:
+    init_user_experience_schema()
+    with closing(get_connection()) as con:
+        con.execute(
+            """INSERT INTO user_guide_preferences(discord_user_hash,beginner_mode,updated_at)
+               VALUES(?,?,?)
+               ON CONFLICT(discord_user_hash) DO UPDATE SET
+                 beginner_mode=excluded.beginner_mode, updated_at=excluded.updated_at""",
+            (_user_hash(user_id), 1 if enabled else 0, _now()),
+        )
+        con.commit()
+
+
 def record_recent_view(user_id: int, image_id: int) -> None:
     if image_id <= 0:
         return
@@ -282,50 +305,51 @@ def related_rows(
     image_id: int,
     limit: int = 9,
 ) -> list[dict[str, Any]]:
-    source = get_photo_image(int(image_id))
+    """人物・タグ・同じ記事を使って関連写真を返す。
 
+    AI特徴量の比較が利用できない環境でも軽く動き、同じ記事、確定人物、
+    AI/手動タグ、投稿者、グループの順に関連度を付ける。
+    """
+    source = get_photo_image(int(image_id))
     if not source:
         return []
 
-    # 同じブログを最優先し、その次に投稿者・グループが同じ写真を表示する。
+    blog_id = int(source.get("blog_id") or 0)
+    member_name = str(source.get("member_name") or "")
+    group_name = str(source.get("group_name") or "")
+    image_index = int(source.get("image_index") or 0)
+
     return _photo_rows(
         """
-        SELECT
-            i.*,
-            b.blog_url,
-            b.group_name,
-            b.member_name,
-            b.title,
-            b.published_at
+        WITH source_people AS (
+            SELECT person_name FROM photo_image_people
+            WHERE image_id=? AND relation_status='confirmed'
+        ),
+        source_tags AS (
+            SELECT tag FROM photo_ai_tags WHERE image_id=?
+            UNION
+            SELECT tag FROM photo_manual_tags WHERE image_id=?
+        )
+        SELECT i.*, b.blog_url, b.group_name, b.member_name, b.title, b.published_at,
+               (CASE WHEN i.blog_id=? THEN 100 ELSE 0 END) +
+               25 * (SELECT COUNT(*) FROM photo_image_people pp
+                     WHERE pp.image_id=i.id AND pp.relation_status='confirmed'
+                       AND pp.person_name IN (SELECT person_name FROM source_people)) +
+               12 * ((SELECT COUNT(*) FROM photo_ai_tags at
+                      WHERE at.image_id=i.id AND at.tag IN (SELECT tag FROM source_tags)) +
+                     (SELECT COUNT(*) FROM photo_manual_tags mt
+                      WHERE mt.image_id=i.id AND mt.tag IN (SELECT tag FROM source_tags))) +
+               (CASE WHEN b.member_name=? AND ?<>'' THEN 8 ELSE 0 END) +
+               (CASE WHEN b.group_name=? AND ?<>'' THEN 3 ELSE 0 END) AS related_score
         FROM photo_images i
-        JOIN photo_blogs b
-          ON b.id=i.blog_id
-        WHERE i.id<>?
-          AND (
-              i.blog_id=?
-              OR b.member_name=?
-              OR b.group_name=?
-          )
-        ORDER BY
-            CASE
-                WHEN i.blog_id=? THEN 0
-                WHEN b.member_name=? THEN 1
-                ELSE 2
-            END,
-            ABS(i.image_index-?) ASC,
-            i.id DESC
+        JOIN photo_blogs b ON b.id=i.blog_id
+        WHERE i.id<>? AND i.download_status='completed'
+        ORDER BY related_score DESC, ABS(i.image_index-?) ASC, i.id DESC
         LIMIT ?
         """,
-        (
-            int(image_id),
-            int(source.get("blog_id") or 0),
-            str(source.get("member_name") or ""),
-            str(source.get("group_name") or ""),
-            int(source.get("blog_id") or 0),
-            str(source.get("member_name") or ""),
-            int(source.get("image_index") or 0),
-            max(1, min(limit, 9)),
-        ),
+        (int(image_id), int(image_id), int(image_id), blog_id,
+         member_name, member_name, group_name, group_name, int(image_id), image_index,
+         max(1, min(limit, 25))),
     )
 
 
@@ -677,6 +701,53 @@ HELP_TOPICS: dict[str, tuple[str, str, str]] = {
 }
 
 
+class BeginnerGuideView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=600)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この案内は本人だけが操作できます。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="使い方を見る", emoji="📖", style=discord.ButtonStyle.primary)
+    async def help_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=help_home_embed(), view=HelpHomeView(self.owner_id))
+
+    @discord.ui.button(label="トップメニューを使う", emoji="✅", style=discord.ButtonStyle.success)
+    async def disable_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await asyncio.to_thread(set_beginner_guide, self.owner_id, False)
+        from control_panel import UserPanelView
+        embed = discord.Embed(
+            title="📷 写真検索パネル",
+            description="目的に合うカテゴリーを選んでください。",
+            color=0x3498DB,
+        )
+        await interaction.response.edit_message(embed=embed, view=UserPanelView(), content=None)
+
+
+def beginner_guide_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="👋 はじめての方へ",
+        description=(
+            "このBotでは、写真を検索・保存・整理できます。\n\n"
+            "① **🔍 写真を探す** から検索方法を選ぶ\n"
+            "② 写真の詳細を開く\n"
+            "③ お気に入り・コレクション・あとで見るへ保存\n"
+            "④ 困ったときは **📖 使い方** を確認"
+        ),
+        color=0x57F287,
+    )
+    embed.add_field(
+        name="💡 ポイント",
+        value="検索結果や保存一覧は本人だけに表示されます。初回ガイドは下のボタンで非表示にできます。",
+        inline=False,
+    )
+    return embed
+
+
 class HelpTopicView(discord.ui.View):
     def __init__(
         self,
@@ -732,36 +803,27 @@ class HelpTopicView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        command_map = {
-            "favorite": "favorite_list 100",
-            "collection": "collection_list",
-            "history": "recently_viewed",
-            "support": "feedback_box",
-        }
-
-        if self.topic in (
-            "photo",
-            "person",
-            "tag",
-        ):
-            await interaction.response.send_message(
-                "写真検索パネルへ戻り、対応する検索ボタンを押してください。",
-                ephemeral=True,
-            )
+        if self.topic == "photo":
+            from control_panel import send_source_selector
+            await send_source_selector(interaction, person_only=False)
             return
-
-        command_name = command_map.get(
-            self.topic,
-            "",
-        )
-
-        await interaction.response.send_message(
-            (
-                "写真検索パネルの該当ボタンから開けます。"
-                f"\n対応コマンド: `{command_name}`"
-            ),
-            ephemeral=True,
-        )
+        if self.topic == "person":
+            from control_panel import send_source_selector
+            await send_source_selector(interaction, person_only=True)
+            return
+        from control_panel import invoke_existing_command
+        command_map = {
+            "tag": ("photo_tags", ""),
+            "favorite": ("favorite_list", "100"),
+            "collection": ("collection_list", ""),
+            "history": ("recently_viewed", "20"),
+            "support": ("feedback_box", ""),
+        }
+        command_name, arguments = command_map.get(self.topic, ("", ""))
+        if not command_name:
+            await interaction.response.send_message("この機能を開けませんでした。", ephemeral=True)
+            return
+        await invoke_existing_command(interaction, command_name, arguments)
 
     @discord.ui.button(
         label="使い方メニューへ",
