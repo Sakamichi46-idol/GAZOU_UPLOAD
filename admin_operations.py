@@ -17,6 +17,7 @@ from discord.ext import commands
 from embed_safety import safe_add_field
 
 from photo_database import (
+    get_photo_blog_for_admin_edit,
     HIDDEN_REASON_LABELS,
     delete_hidden_photo_blog,
     get_connection,
@@ -500,6 +501,15 @@ class HiddenBlogDetailView(discord.ui.View):
             return True
         await interaction.response.send_message("この画面は開いた管理者だけが使えます。", ephemeral=True)
         return False
+
+    @discord.ui.button(label="投稿者を設定して復元", emoji="✏️", style=discord.ButtonStyle.success)
+    async def set_author_restore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from admin_workflow import BlogAuthorGroupSelectView
+        await interaction.response.send_message(
+            "✏️ **投稿者を設定して復元**\n正しいグループを選択してください。",
+            view=BlogAuthorGroupSelectView(self.blog_id, restore_if_hidden=True),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="復元", emoji="👁️", style=discord.ButtonStyle.success)
     async def restore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
