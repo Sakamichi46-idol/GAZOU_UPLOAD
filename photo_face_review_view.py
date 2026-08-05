@@ -6,6 +6,7 @@ from typing import Any
 
 import discord
 from discord.ext import commands
+from embed_safety import safe_add_field
 
 from local_face_recognition import (
     FaceEngineUnavailable,
@@ -63,13 +64,13 @@ def build_face_review_embed(
         description="候補・投稿者ボタン、またはメンバー選択メニューから確定してください。候補はローカル処理による参考値です。",
         color=discord.Color.blue(),
     )
-    embed.add_field(name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
-    embed.add_field(name="画像ID", value=str(review.get("image_id", "不明")), inline=True)
-    embed.add_field(name="顔番号", value=str(review.get("face_index", "不明")), inline=True)
-    embed.add_field(name="グループ", value=_text(review.get("group_name")) or "不明", inline=True)
-    embed.add_field(name="ブログ投稿者", value=_text(review.get("member_name")) or "不明", inline=True)
-    embed.add_field(name="投稿日", value=_short(review.get("published_at"), 100) or "不明", inline=True)
-    embed.add_field(name="タイトル", value=_short(review.get("title")) or "タイトルなし", inline=False)
+    safe_add_field(embed, name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
+    safe_add_field(embed, name="画像ID", value=str(review.get("image_id", "不明")), inline=True)
+    safe_add_field(embed, name="顔番号", value=str(review.get("face_index", "不明")), inline=True)
+    safe_add_field(embed, name="グループ", value=_text(review.get("group_name")) or "不明", inline=True)
+    safe_add_field(embed, name="ブログ投稿者", value=_text(review.get("member_name")) or "不明", inline=True)
+    safe_add_field(embed, name="投稿日", value=_short(review.get("published_at"), 100) or "不明", inline=True)
+    safe_add_field(embed, name="タイトル", value=_short(review.get("title")) or "タイトルなし", inline=False)
 
     if candidates:
         lines = [
@@ -79,10 +80,10 @@ def build_face_review_embed(
         candidate_text = "\n".join(lines)
     else:
         candidate_text = "一致閾値を超えた候補はありません。メンバー選択または投稿者ボタンを使ってください。"
-    embed.add_field(name="ローカル顔候補", value=candidate_text, inline=False)
+    safe_add_field(embed, name="ローカル顔候補", value=candidate_text, inline=False)
 
     if review.get("blog_url"):
-        embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
+        safe_add_field(embed, name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
     embed.set_image(url="attachment://face_review.jpg")
     embed.set_footer(text="OpenAI APIは使用しません。最終確定は必ず画像を見て行ってください。")
     return embed
@@ -94,10 +95,10 @@ def build_completed_embed(
     user: discord.abc.User,
 ) -> discord.Embed:
     embed = discord.Embed(title="✅ 顔レビュー完了", color=discord.Color.green())
-    embed.add_field(name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
-    embed.add_field(name="画像ID", value=str(review.get("image_id", "不明")), inline=True)
-    embed.add_field(name="確定人物", value=person_name, inline=False)
-    embed.add_field(name="確認者", value=_text(getattr(user, "display_name", user.name)), inline=False)
+    safe_add_field(embed, name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
+    safe_add_field(embed, name="画像ID", value=str(review.get("image_id", "不明")), inline=True)
+    safe_add_field(embed, name="確定人物", value=person_name, inline=False)
+    safe_add_field(embed, name="確認者", value=_text(getattr(user, "display_name", user.name)), inline=False)
     return embed
 
 
@@ -572,8 +573,8 @@ class FaceReviewView(discord.ui.View):
         self.finished = True
         self.stop()
         embed = discord.Embed(title="⏭️ 顔レビューを保留しました", color=discord.Color.orange())
-        embed.add_field(name="顔ID", value=str(self.review.get("face_id", "不明")), inline=True)
-        embed.add_field(name="画像ID", value=str(self.review.get("image_id", "不明")), inline=True)
+        safe_add_field(embed, name="顔ID", value=str(self.review.get("face_id", "不明")), inline=True)
+        safe_add_field(embed, name="画像ID", value=str(self.review.get("image_id", "不明")), inline=True)
         await interaction.response.edit_message(embed=embed, view=None)
 
     async def on_timeout(self) -> None:
@@ -668,8 +669,8 @@ def build_fast_review_embed(
         ),
         color=discord.Color.gold(),
     )
-    embed.add_field(name="対象件数", value=f"{len(items):,}件", inline=True)
-    embed.add_field(name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
+    safe_add_field(embed, name="対象件数", value=f"{len(items):,}件", inline=True)
+    safe_add_field(embed, name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
 
     grouped: dict[str, list[float]] = {}
     for item in items:
@@ -682,7 +683,7 @@ def build_fast_review_embed(
             f"・**{discord.utils.escape_markdown(name)}**: {len(values)}件 "
             f"({min(values) * 100:.1f}〜{max(values) * 100:.1f}%)"
         )
-    embed.add_field(
+    safe_add_field(embed, 
         name="候補別内訳",
         value="\n".join(lines[:20]) or "候補なし",
         inline=False,
@@ -732,8 +733,8 @@ class FastFaceReviewView(discord.ui.View):
         self.finished = True
         self.stop()
         embed = discord.Embed(title="✅ 高信頼度の顔候補を一括確定しました", color=discord.Color.green())
-        embed.add_field(name="確定件数", value=f"{completed:,}件", inline=True)
-        embed.add_field(name="最低信頼度", value=f"{self.min_confidence * 100:.1f}%", inline=True)
+        safe_add_field(embed, name="確定件数", value=f"{completed:,}件", inline=True)
+        safe_add_field(embed, name="最低信頼度", value=f"{self.min_confidence * 100:.1f}%", inline=True)
         await interaction.edit_original_response(embed=embed, view=None)
 
     @discord.ui.button(label="キャンセル", emoji="✖️", style=discord.ButtonStyle.secondary)
@@ -798,11 +799,11 @@ def build_person_group_review_embed(
         ),
         color=discord.Color.purple(),
     )
-    embed.add_field(name="人物", value=person_name, inline=True)
-    embed.add_field(name="対象件数", value=f"{len(items):,}件", inline=True)
-    embed.add_field(name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
+    safe_add_field(embed, name="人物", value=person_name, inline=True)
+    safe_add_field(embed, name="対象件数", value=f"{len(items):,}件", inline=True)
+    safe_add_field(embed, name="最低信頼度", value=f"{min_confidence * 100:.1f}%", inline=True)
     if confidences:
-        embed.add_field(
+        safe_add_field(embed, 
             name="候補信頼度",
             value=(
                 f"最低 {min(confidences) * 100:.1f}% / "
@@ -819,7 +820,7 @@ def build_person_group_review_embed(
             f"画像ID **{int(item['image_id'])}** / "
             f"{float(item.get('confidence') or 0) * 100:.1f}%"
         )
-    embed.add_field(
+    safe_add_field(embed, 
         name="先頭10件",
         value="\n".join(samples) or "対象なし",
         inline=False,
@@ -880,9 +881,9 @@ class PersonGroupFaceReviewView(discord.ui.View):
             title="✅ 同じ人物候補を一括確定しました",
             color=discord.Color.green(),
         )
-        embed.add_field(name="人物", value=self.person_name, inline=True)
-        embed.add_field(name="確定件数", value=f"{completed:,}件", inline=True)
-        embed.add_field(
+        safe_add_field(embed, name="人物", value=self.person_name, inline=True)
+        safe_add_field(embed, name="確定件数", value=f"{completed:,}件", inline=True)
+        safe_add_field(embed, 
             name="最低信頼度",
             value=f"{self.min_confidence * 100:.1f}%",
             inline=True,
