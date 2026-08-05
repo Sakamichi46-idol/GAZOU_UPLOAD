@@ -16,7 +16,15 @@ import discord
 from discord.ext import commands
 from embed_safety import safe_add_field
 
-from photo_database import get_connection
+from photo_database import (
+    HIDDEN_REASON_LABELS,
+    delete_hidden_photo_blog,
+    get_connection,
+    get_hidden_photo_blog,
+    list_hidden_photo_blogs,
+    queue_hidden_blog_reanalysis,
+    restore_hidden_photo_blog,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -111,6 +119,7 @@ def get_admin_dashboard_stats() -> dict[str, int]:
         stats = {
             "images": _scalar(con, "SELECT COUNT(*) FROM photo_images") if _table_exists(con, "photo_images") else 0,
             "blogs": _scalar(con, "SELECT COUNT(*) FROM photo_blogs") if _table_exists(con, "photo_blogs") else 0,
+            "hidden_blogs": _scalar(con, "SELECT COUNT(*) FROM photo_blogs WHERE COALESCE(is_hidden,0)=1") if "is_hidden" in _columns(con, "photo_blogs") else 0,
             "people": _scalar(con, "SELECT COUNT(*) FROM photo_people") if _table_exists(con, "photo_people") else 0,
             "faces": _scalar(con, "SELECT COUNT(*) FROM photo_faces") if _table_exists(con, "photo_faces") else 0,
             "embeddings": _scalar(con, "SELECT COUNT(*) FROM photo_faces WHERE TRIM(COALESCE(face_embedding,''))<>''") if _table_exists(con, "photo_faces") else 0,
@@ -144,7 +153,7 @@ def dashboard_embed() -> discord.Embed:
     )
     safe_add_field(embed, 
         name="📷 アーカイブ",
-        value=f"記事 **{s['blogs']:,}**\n画像 **{s['images']:,}**\n人物 **{s['people']:,}**",
+        value=f"記事 **{s['blogs']:,}**（除外 **{s['hidden_blogs']:,}**）\n画像 **{s['images']:,}**\n人物 **{s['people']:,}**",
         inline=True,
     )
     safe_add_field(embed, 
@@ -226,7 +235,7 @@ def ai_quality_embed() -> discord.Embed:
 def get_health_report() -> dict[str, Any]:
     required: dict[str, set[str]] = {
         "photo_images": {"id", "blog_id", "download_status", "analysis_status"},
-        "photo_blogs": {"id", "title", "member_name"},
+        "photo_blogs": {"id", "title", "member_name", "is_hidden", "hidden_reason"},
         "photo_people": {"id", "person_name"},
         "photo_faces": {"id", "image_id", "confirmed_person_id", "face_embedding"},
     }
@@ -243,6 +252,11 @@ def get_health_report() -> dict[str, Any]:
         duplicate_urls = _scalar(con, "SELECT COUNT(*) FROM (SELECT image_url FROM photo_images WHERE TRIM(COALESCE(image_url,''))<>'' GROUP BY image_url HAVING COUNT(*)>1)") if "image_url" in _columns(con, "photo_images") else 0
         stale_download = _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE download_status<>'failed' AND TRIM(COALESCE(download_error,''))<>''") if "download_error" in _columns(con, "photo_images") else 0
         stale_analysis = _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE analysis_status<>'failed' AND TRIM(COALESCE(analysis_error,''))<>''") if "analysis_error" in _columns(con, "photo_images") else 0
+        hidden_blogs = _scalar(con, "SELECT COUNT(*) FROM photo_blogs WHERE COALESCE(is_hidden,0)=1") if "is_hidden" in _columns(con, "photo_blogs") else 0
+        unknown_member_candidates = _scalar(
+            con,
+            "SELECT COUNT(*) FROM photo_blogs WHERE COALESCE(is_hidden,0)=0 AND TRIM(COALESCE(member_name,'')) IN ('','不明','投稿者不明')",
+        ) if _table_exists(con, "photo_blogs") else 0
         integrity_row = con.execute("PRAGMA integrity_check").fetchone()
         integrity = str(integrity_row[0]) if integrity_row else "unknown"
     return {
@@ -253,6 +267,8 @@ def get_health_report() -> dict[str, Any]:
         "orphan_people": orphan_people,
         "duplicate_urls": duplicate_urls,
         "stale_errors": stale_download + stale_analysis,
+        "hidden_blogs": hidden_blogs,
+        "unknown_member_candidates": unknown_member_candidates,
         "integrity": integrity,
     }
 
@@ -272,6 +288,8 @@ def health_embed() -> discord.Embed:
     safe_add_field(embed, name="孤立人物参照", value=f"{r['orphan_people']:,}", inline=True)
     safe_add_field(embed, name="重複URL群", value=f"{r['duplicate_urls']:,}", inline=True)
     safe_add_field(embed, name="古いエラー文字", value=f"{r['stale_errors']:,}", inline=True)
+    safe_add_field(embed, name="除外済み記事", value=f"{r['hidden_blogs']:,}", inline=True)
+    safe_add_field(embed, name="投稿者不明の除外候補", value=f"{r['unknown_member_candidates']:,}", inline=True)
     details = []
     if r["missing_tables"]:
         details.append("不足テーブル: " + ", ".join(r["missing_tables"][:10]))
@@ -434,6 +452,198 @@ class PersonMasterModal(discord.ui.Modal):
         await interaction.response.send_message(f"✅ **{name}** の人物マスターを保存しました。", ephemeral=True)
 
 
+
+class ConfirmHiddenDeleteView(discord.ui.View):
+    def __init__(self, owner_id: int, blog_id: int) -> None:
+        super().__init__(timeout=120)
+        self.owner_id = int(owner_id)
+        self.blog_id = int(blog_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この確認画面は開いた管理者だけが使えます。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="完全削除する", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        deleted = await asyncio.to_thread(delete_hidden_photo_blog, self.blog_id)
+        if deleted:
+            await asyncio.to_thread(
+                write_audit,
+                interaction.user.id,
+                "hidden_blog_delete",
+                target_type="blog",
+                target_id=self.blog_id,
+                detail="除外済み記事を完全削除",
+            )
+            await interaction.response.edit_message(content=f"✅ ブログID **{self.blog_id}** を完全削除しました。", embed=None, view=None)
+        else:
+            await interaction.response.edit_message(content="対象が見つからないか、除外状態ではありません。", embed=None, view=None)
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="削除をキャンセルしました。", view=None)
+        self.stop()
+
+
+class HiddenBlogDetailView(discord.ui.View):
+    def __init__(self, owner_id: int, blog_id: int, return_page: int = 0) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.blog_id = int(blog_id)
+        self.return_page = max(0, int(return_page))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この画面は開いた管理者だけが使えます。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="復元", emoji="👁️", style=discord.ButtonStyle.success)
+    async def restore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        restored = await asyncio.to_thread(restore_hidden_photo_blog, self.blog_id)
+        if restored:
+            await asyncio.to_thread(write_audit, interaction.user.id, "hidden_blog_restore", target_type="blog", target_id=self.blog_id, detail="除外一覧から復元")
+            await interaction.response.edit_message(content=f"✅ ブログID **{self.blog_id}** を人物確認対象へ戻しました。", embed=None, view=None)
+        else:
+            await interaction.response.send_message("復元対象が見つかりませんでした。", ephemeral=True)
+
+    @discord.ui.button(label="再解析待ちへ", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def reanalyze(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        changed = await asyncio.to_thread(queue_hidden_blog_reanalysis, self.blog_id)
+        await asyncio.to_thread(write_audit, interaction.user.id, "hidden_blog_reanalysis", target_type="blog", target_id=self.blog_id, detail=str(changed))
+        await interaction.followup.send(
+            f"✅ 再処理待ちへ戻しました。\n画像取得対象 **{changed['download']}件** / AI解析対象 **{changed['analysis']}件**\n除外状態は維持されます。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="完全削除", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def delete(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        blog = await asyncio.to_thread(get_hidden_photo_blog, self.blog_id)
+        count = int((blog or {}).get("image_count") or 0)
+        await interaction.response.send_message(
+            f"⚠️ ブログID **{self.blog_id}** と関連画像 **{count}件**を完全削除します。\nこの操作は元に戻せません。",
+            view=ConfirmHiddenDeleteView(self.owner_id, self.blog_id),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="除外一覧へ", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = await HiddenBlogsView.create(self.owner_id, self.return_page)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
+class HiddenBlogSelect(discord.ui.Select):
+    def __init__(self, parent: "HiddenBlogsView", rows: list[dict[str, Any]]) -> None:
+        self.parent_view = parent
+        options: list[discord.SelectOption] = []
+        for row in rows:
+            blog_id = int(row.get("id") or 0)
+            reason = HIDDEN_REASON_LABELS.get(str(row.get("hidden_reason") or ""), str(row.get("hidden_reason") or "理由不明"))
+            member = str(row.get("member_name") or "投稿者不明")
+            title = str(row.get("title") or "無題")
+            options.append(discord.SelectOption(
+                label=f"{blog_id}: {title}"[:100],
+                value=str(blog_id),
+                description=f"{member} / {reason} / 画像{int(row.get('image_count') or 0)}件"[:100],
+                emoji="🚫",
+            ))
+        if not options:
+            options = [discord.SelectOption(label="除外済みデータはありません", value="__none__")]
+        super().__init__(placeholder="除外済みデータを選択", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        if value == "__none__":
+            await interaction.response.send_message("除外済みデータはありません。", ephemeral=True)
+            return
+        blog_id = int(value)
+        blog = await asyncio.to_thread(get_hidden_photo_blog, blog_id)
+        if not blog:
+            await interaction.response.send_message("対象が見つかりませんでした。", ephemeral=True)
+            return
+        reason_code = str(blog.get("hidden_reason") or "")
+        reason = HIDDEN_REASON_LABELS.get(reason_code, reason_code or "理由不明")
+        embed = discord.Embed(title=f"🚫 除外データ #{blog_id}", color=0xED4245)
+        safe_add_field(embed, name="グループ", value=str(blog.get("group_name") or "不明"), inline=True)
+        safe_add_field(embed, name="投稿者", value=str(blog.get("member_name") or "投稿者不明"), inline=True)
+        safe_add_field(embed, name="画像数", value=str(int(blog.get("image_count") or 0)), inline=True)
+        safe_add_field(embed, name="タイトル", value=str(blog.get("title") or "無題"), inline=False)
+        safe_add_field(embed, name="除外理由", value=f"{reason} (`{reason_code or 'UNKNOWN'}`)", inline=False)
+        safe_add_field(embed, name="管理メモ", value=str(blog.get("hidden_note") or "なし"), inline=False)
+        safe_add_field(embed, name="処理エラー", value=f"画像取得 {int(blog.get('download_errors') or 0)} / AI解析 {int(blog.get('analysis_errors') or 0)}", inline=False)
+        safe_add_field(embed, name="ブログURL", value=str(blog.get("blog_url") or "なし"), inline=False)
+        await interaction.response.edit_message(embed=embed, view=HiddenBlogDetailView(self.parent_view.owner_id, blog_id, self.parent_view.page))
+
+
+class HiddenBlogsView(discord.ui.View):
+    PAGE_SIZE = 25
+
+    def __init__(self, owner_id: int, rows: list[dict[str, Any]], total: int, page: int) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.rows = rows
+        self.total = int(total)
+        self.page_count = max(1, (self.total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        self.add_item(HiddenBlogSelect(self, rows))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    @classmethod
+    async def create(cls, owner_id: int, page: int = 0) -> "HiddenBlogsView":
+        safe_page = max(0, int(page))
+        rows, total = await asyncio.to_thread(list_hidden_photo_blogs, cls.PAGE_SIZE, safe_page * cls.PAGE_SIZE)
+        page_count = max(1, (int(total) + cls.PAGE_SIZE - 1) // cls.PAGE_SIZE)
+        safe_page = min(safe_page, page_count - 1)
+        if safe_page * cls.PAGE_SIZE and not rows:
+            rows, total = await asyncio.to_thread(list_hidden_photo_blogs, cls.PAGE_SIZE, safe_page * cls.PAGE_SIZE)
+        return cls(owner_id, rows, total, safe_page)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この画面は開いた管理者だけが使えます。", ephemeral=True)
+        return False
+
+    def embed(self) -> discord.Embed:
+        start = self.page * self.PAGE_SIZE + 1 if self.total else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, self.total)
+        embed = discord.Embed(
+            title="🚫 除外データ管理",
+            description=(
+                f"表示 **{start}〜{end}件目 / 全{self.total}件**（{self.page + 1}/{self.page_count}ページ）\n"
+                "データとBucket画像は保持されたままです。復元・再解析・完全削除を選べます。"
+            ),
+            color=0xED4245,
+        )
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            code = str(row.get("hidden_reason") or "UNKNOWN")
+            counts[code] = counts.get(code, 0) + 1
+        if counts:
+            safe_add_field(embed, name="このページの内訳", value="\n".join(f"・{HIDDEN_REASON_LABELS.get(k, k)}: {v}件" for k, v in counts.items()), inline=False)
+        return embed
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = await HiddenBlogsView.create(self.owner_id, self.page - 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = await HiddenBlogsView.create(self.owner_id, self.page + 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = await HiddenBlogsView.create(self.owner_id, self.page)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+
 class AdminOperationsView(discord.ui.View):
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=900)
@@ -491,6 +701,13 @@ class AdminOperationsView(discord.ui.View):
     async def health(self, interaction, _):
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(embed=await asyncio.to_thread(health_embed), ephemeral=True)
+
+
+    @discord.ui.button(label="除外データ管理", emoji="🚫", style=discord.ButtonStyle.secondary)
+    async def hidden_blogs(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        view = await HiddenBlogsView.create(self.owner_id, 0)
+        await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
 
 async def send_admin_operations(interaction: discord.Interaction) -> None:
