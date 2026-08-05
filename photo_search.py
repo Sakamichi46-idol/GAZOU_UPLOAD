@@ -36,6 +36,16 @@ PHOTO_SEARCH_DISPLAY_NAME = (
 )
 
 
+def _split_labels(value: Any, limit: int = 25) -> list[str]:
+    text = str(value or "").replace("，", "、").replace(",", "、")
+    values: list[str] = []
+    for part in text.split("、"):
+        clean = part.strip()
+        if clean and clean not in values:
+            values.append(clean)
+    return values[:limit]
+
+
 def shorten_text(value: Any, max_length: int) -> str:
     text = str(value or "").strip()
     if len(text) <= max_length:
@@ -268,6 +278,43 @@ class DetailResultButton(discord.ui.Button):
         self.parent_view.stop()
 
 
+class DetailSearchSelect(discord.ui.Select):
+    def __init__(self, parent: "PhotoSearchDetailView", people: list[str], tags: list[str]) -> None:
+        self.parent_view = parent
+        options: list[discord.SelectOption] = []
+        for value in people[:12]:
+            options.append(discord.SelectOption(label=f"人物：{value}"[:100], value=f"person:{value}", emoji="👤"))
+        for value in tags[:12]:
+            options.append(discord.SelectOption(label=f"タグ：{value}"[:100], value=f"tag:{value}", emoji="🏷️"))
+        super().__init__(
+            placeholder="人物・タグから別の写真を探す",
+            options=options[:25],
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        mode, query = self.values[0].split(":", 1)
+        await interaction.response.defer(ephemeral=True)
+        if mode == "person":
+            rows = await asyncio.to_thread(search_photo_images_by_person, query, DEFAULT_SEARCH_LIMIT)
+            label = "人物検索"
+        else:
+            rows = await asyncio.to_thread(search_photo_images_by_tag, query, DEFAULT_SEARCH_LIMIT)
+            label = "タグ検索"
+        if not rows:
+            await interaction.followup.send("該当する写真が見つかりませんでした。", ephemeral=True)
+            return
+        view = PhotoSearchResultsView(owner_id=interaction.user.id, results=rows, query=query, search_label=label, page=0)
+        files = await view.current_files()
+        if not files:
+            await interaction.followup.send("画像を取得できませんでした。", ephemeral=True)
+            return
+        try:
+            await interaction.followup.send(content=view.control_content(), files=files, view=view, ephemeral=True)
+        finally:
+            close_discord_files(files)
+
+
 class PhotoSearchDetailView(discord.ui.View):
     """検索結果の写真詳細とお気に入り登録を提供する。"""
 
@@ -291,6 +338,11 @@ class PhotoSearchDetailView(discord.ui.View):
         self.message: discord.Message | None = None
         self.previous_button.disabled = self.index <= 0
         self.next_button.disabled = self.index >= len(results) - 1
+        current = self.results[self.index]
+        people = _split_labels(format_people_for_users(str(current.get("confirmed_people") or current.get("candidate_people") or "")))
+        tags = _split_labels(str(current.get("manual_tags") or "") + "、" + str(current.get("ai_tags") or ""))
+        if people or tags:
+            self.add_item(DetailSearchSelect(self, people, tags))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
@@ -321,6 +373,14 @@ class PhotoSearchDetailView(discord.ui.View):
         embed.add_field(
             name="👤 写っている人物",
             value=shorten_text(format_people_for_users(confirmed or candidates) or "未確定", 1024),
+            inline=False,
+        )
+        tag_text = "、".join(_split_labels(
+            str(result.get("manual_tags") or "") + "、" + str(result.get("ai_tags") or "")
+        )) or "未設定"
+        embed.add_field(
+            name="🏷️ タグ",
+            value=shorten_text(tag_text, 1024),
             inline=False,
         )
         embed.add_field(
@@ -581,6 +641,16 @@ class PhotoSearchResultSelect(discord.ui.Select):
             view=view,
         )
         self.parent_view.stop()
+
+    @discord.ui.button(label="トップメニュー", emoji="🏠", style=discord.ButtonStyle.secondary, row=3)
+    async def home_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from control_panel import UserPanelView
+        embed = discord.Embed(
+            title="📷 写真検索パネル",
+            description="目的に合うカテゴリーを選んでください。",
+            color=0x3498DB,
+        )
+        await interaction.response.send_message(embed=embed, view=UserPanelView(), ephemeral=True)
 
 
 class PhotoSearchResultsView(discord.ui.View):
