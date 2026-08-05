@@ -273,6 +273,18 @@ class AICenterView(discord.ui.View):
     async def decisions(self, interaction, _):
         await _send_ai_db_list(interaction, "decisions")
 
+    @discord.ui.button(label="AI候補確認", emoji="🤖", style=discord.ButtonStyle.primary)
+    async def candidate_review(self, interaction, _):
+        await send_ai_candidate_review(interaction)
+
+    @discord.ui.button(label="仮確定を本確定", emoji="✅", style=discord.ButtonStyle.success)
+    async def promote(self, interaction, _):
+        await interaction.response.send_message("本確定する写真を選んでください。", view=ProvisionalPromoteView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="直前変更を取り消す", emoji="↩️", style=discord.ButtonStyle.danger)
+    async def undo(self, interaction, _):
+        await interaction.response.send_message("取り消す変更を選んでください。", view=SnapshotRestoreView(interaction.user.id), ephemeral=True)
+
     @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.success)
     async def refresh(self, interaction, _):
         await interaction.response.edit_message(embed=await asyncio.to_thread(ai_center_embed), view=self)
@@ -395,3 +407,241 @@ async def _send_ai_db_list(interaction: discord.Interaction, kind: str) -> None:
     await interaction.response.defer(ephemeral=True)
     view = AIDBListView(interaction.user.id, kind)
     await interaction.followup.send(embed=await asyncio.to_thread(view.embed), view=view, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: 人物確認フローへ接続する実働機能
+# ---------------------------------------------------------------------------
+
+HOLD_REASON_LABELS = {
+    "UNKNOWN": "誰か分からない",
+    "FACE_HIDDEN": "顔が見えない",
+    "TOO_MANY": "人数が多い",
+    "BAD_IMAGE": "画像不良",
+    "LATER": "後で確認",
+    "OTHER": "その他",
+}
+
+def create_people_snapshot(image_id: int, admin_user_id: int, action_type: str = "people_change") -> int:
+    """人物変更前の状態を保存し、後から1操作単位で復元できるようにする。"""
+    init_advanced_admin_schema()
+    with closing(get_connection()) as con:
+        people = [str(r[0]) for r in con.execute(
+            "SELECT person_name FROM photo_image_people WHERE image_id=? AND relation_status='confirmed' ORDER BY person_name",
+            (int(image_id),),
+        ).fetchall()]
+        queue = con.execute(
+            "SELECT status,selected_value,reviewed_by,review_note,reviewed_at FROM photo_review_queue WHERE image_id=?",
+            (int(image_id),),
+        ).fetchone()
+        payload = {
+            "image_id": int(image_id),
+            "people": people,
+            "queue": dict(queue) if queue else {},
+        }
+        cur = con.execute(
+            """INSERT INTO photo_admin_change_snapshots(
+                   admin_user_id,action_type,target_type,target_id,snapshot_json,restored_at,created_at
+               ) VALUES(?,?,?,?,?,'',?)""",
+            (int(admin_user_id), action_type, "image", str(int(image_id)), json.dumps(payload, ensure_ascii=False), _now()),
+        )
+        con.commit()
+        return int(cur.lastrowid)
+
+def restore_people_snapshot(snapshot_id: int, admin_user_id: int) -> dict[str, Any]:
+    init_advanced_admin_schema()
+    with closing(get_connection()) as con:
+        row = con.execute(
+            "SELECT snapshot_json,restored_at,target_id FROM photo_admin_change_snapshots WHERE id=?",
+            (int(snapshot_id),),
+        ).fetchone()
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+        if str(row[1] or ""):
+            return {"ok": False, "reason": "already_restored"}
+        try:
+            data = json.loads(str(row[0] or "{}"))
+        except Exception:
+            return {"ok": False, "reason": "invalid_snapshot"}
+        image_id = int(data.get("image_id") or row[2] or 0)
+        people = [str(x).strip() for x in data.get("people", []) if str(x).strip()]
+        q = data.get("queue") or {}
+        now = _now()
+        con.execute("DELETE FROM photo_image_people WHERE image_id=? AND relation_status='confirmed'", (image_id,))
+        for name in people:
+            con.execute(
+                """INSERT INTO photo_image_people(
+                       image_id,person_name,relation_status,source,confidence,confirmed_by,note,created_at,updated_at
+                   ) VALUES(?,?,'confirmed','snapshot_restore',1.0,?,'変更取り消し',?,?)
+                   ON CONFLICT(image_id,person_name) DO UPDATE SET relation_status='confirmed',source='snapshot_restore',
+                   confidence=1.0,confirmed_by=excluded.confirmed_by,note=excluded.note,updated_at=excluded.updated_at""",
+                (image_id, name, f"Discord admin {admin_user_id}", now, now),
+            )
+        if q:
+            con.execute(
+                """UPDATE photo_review_queue SET status=?,selected_value=?,reviewed_by=?,review_note=?,reviewed_at=?,updated_at=?
+                   WHERE image_id=?""",
+                (q.get("status", "pending"), q.get("selected_value", ""), q.get("reviewed_by", ""),
+                 q.get("review_note", ""), q.get("reviewed_at", ""), now, image_id),
+            )
+        else:
+            con.execute("UPDATE photo_review_queue SET status='pending',updated_at=? WHERE image_id=?", (now, image_id))
+        con.execute("UPDATE photo_admin_change_snapshots SET restored_at=? WHERE id=?", (now, int(snapshot_id)))
+        con.commit()
+    return {"ok": True, "image_id": image_id, "people": people}
+
+def save_hold_reason(image_id: int, reason_code: str, note: str, admin_user_id: int) -> None:
+    init_advanced_admin_schema()
+    code = reason_code if reason_code in HOLD_REASON_LABELS else "OTHER"
+    now = _now()
+    with closing(get_connection()) as con:
+        con.execute(
+            """INSERT INTO photo_review_hold_reasons(image_id,reason_code,note,updated_by,updated_at)
+               VALUES(?,?,?,?,?) ON CONFLICT(image_id) DO UPDATE SET reason_code=excluded.reason_code,
+               note=excluded.note,updated_by=excluded.updated_by,updated_at=excluded.updated_at""",
+            (int(image_id), code, str(note or ""), int(admin_user_id), now),
+        )
+        con.execute(
+            """UPDATE photo_review_queue SET status='skipped',review_note=?,reviewed_by=?,reviewed_at=?,updated_at=?
+               WHERE image_id=?""",
+            (f"保留理由: {HOLD_REASON_LABELS[code]}" + (f" / {note}" if note else ""), str(admin_user_id), now, now, int(image_id)),
+        )
+        con.commit()
+
+def save_provisional_people(image_id: int, names: list[str], source: str = "admin_provisional", confidence: float = 0.0) -> None:
+    init_advanced_admin_schema()
+    now = _now()
+    clean = []
+    for x in names:
+        n = str(x or "").strip()
+        if n and n not in clean:
+            clean.append(n)
+    with closing(get_connection()) as con:
+        con.execute("DELETE FROM photo_provisional_people WHERE image_id=?", (int(image_id),))
+        for name in clean:
+            con.execute(
+                "INSERT INTO photo_provisional_people(image_id,person_name,source,confidence,created_at) VALUES(?,?,?,?,?)",
+                (int(image_id), name, source, float(confidence or 0), now),
+            )
+        con.commit()
+
+def promote_provisional(image_id: int, admin_user_id: int) -> list[str]:
+    init_advanced_admin_schema()
+    with closing(get_connection()) as con:
+        names = [str(r[0]) for r in con.execute(
+            "SELECT person_name FROM photo_provisional_people WHERE image_id=? ORDER BY person_name", (int(image_id),)
+        ).fetchall()]
+    if not names:
+        return []
+    create_people_snapshot(image_id, admin_user_id, "promote_provisional")
+    from photo_database import set_confirmed_image_people
+    set_confirmed_image_people(int(image_id), names, confirmed_by=f"Discord admin {admin_user_id}", note="仮確定から本確定")
+    with closing(get_connection()) as con:
+        con.execute("DELETE FROM photo_provisional_people WHERE image_id=?", (int(image_id),))
+        con.commit()
+    return names
+
+def load_person_sets(limit: int = 25) -> list[dict[str, Any]]:
+    init_advanced_admin_schema()
+    with closing(get_connection()) as con:
+        rows = con.execute(
+            "SELECT id,set_name,people_json FROM photo_person_sets ORDER BY updated_at DESC LIMIT ?",
+            (max(1, min(int(limit), 25)),),
+        ).fetchall()
+    return [{"id": int(r[0]), "name": str(r[1]), "people": _safe_json_list(r[2])} for r in rows]
+
+class SnapshotRestoreSelect(discord.ui.Select):
+    def __init__(self, owner_id: int):
+        with closing(get_connection()) as con:
+            rows = con.execute(
+                "SELECT id,action_type,target_id,created_at FROM photo_admin_change_snapshots WHERE restored_at='' ORDER BY id DESC LIMIT 25"
+            ).fetchall()
+        options = [discord.SelectOption(label=f"#{r[0]} 画像{r[2]}", description=f"{r[1]} / {str(r[3])[:16]}", value=str(r[0])) for r in rows]
+        if not options:
+            options=[discord.SelectOption(label="復元できる変更はありません", value="none")]
+        super().__init__(placeholder="取り消す変更を選択", options=options)
+        self.owner_id=owner_id
+    async def callback(self, interaction: discord.Interaction):
+        if self.values[0] == "none":
+            await interaction.response.send_message("復元できる変更はありません。", ephemeral=True); return
+        result = await asyncio.to_thread(restore_people_snapshot, int(self.values[0]), interaction.user.id)
+        if not result.get("ok"):
+            await interaction.response.send_message(f"復元できませんでした: {result.get('reason')}", ephemeral=True); return
+        await interaction.response.send_message(
+            f"↩️ 画像ID **{result['image_id']}** を変更前へ戻しました。\n人物: {'、'.join(result['people']) or '人物なし'}", ephemeral=True
+        )
+
+class SnapshotRestoreView(discord.ui.View):
+    def __init__(self, owner_id:int):
+        super().__init__(timeout=600); self.owner_id=owner_id; self.add_item(SnapshotRestoreSelect(owner_id))
+    async def interaction_check(self, interaction):
+        if interaction.user.id==self.owner_id: return True
+        await interaction.response.send_message("この画面は開いた管理者だけが操作できます。",ephemeral=True); return False
+
+class ProvisionalPromoteSelect(discord.ui.Select):
+    def __init__(self, owner_id:int):
+        with closing(get_connection()) as con:
+            rows=con.execute(
+                "SELECT image_id,GROUP_CONCAT(person_name,'、') FROM photo_provisional_people GROUP BY image_id ORDER BY MAX(created_at) DESC LIMIT 25"
+            ).fetchall()
+        options=[discord.SelectOption(label=f"画像ID {r[0]}",description=str(r[1])[:100],value=str(r[0])) for r in rows]
+        if not options: options=[discord.SelectOption(label="仮確定はありません",value="none")]
+        super().__init__(placeholder="本確定する写真を選択",options=options); self.owner_id=owner_id
+    async def callback(self,interaction):
+        if self.values[0]=="none":
+            await interaction.response.send_message("仮確定はありません。",ephemeral=True); return
+        names=await asyncio.to_thread(promote_provisional,int(self.values[0]),interaction.user.id)
+        await interaction.response.send_message(
+            f"✅ 画像ID **{self.values[0]}** を本確定しました。\n人物: {'、'.join(names)}",ephemeral=True
+        )
+class ProvisionalPromoteView(discord.ui.View):
+    def __init__(self,owner_id:int): super().__init__(timeout=600); self.owner_id=owner_id; self.add_item(ProvisionalPromoteSelect(owner_id))
+    async def interaction_check(self,interaction):
+        if interaction.user.id==self.owner_id:return True
+        await interaction.response.send_message("この画面は開いた管理者だけが操作できます。",ephemeral=True);return False
+
+class AICandidateSelect(discord.ui.Select):
+    def __init__(self,parent,rows):
+        opts=[]
+        for r in rows:
+            iid=int(r.get("image_id") or 0); member=str(r.get("member_name") or "不明")
+            cand=str(r.get("candidate_people") or r.get("candidates") or "候補あり")
+            opts.append(discord.SelectOption(label=f"画像ID {iid} / {member}"[:100],description=cand[:100],value=str(iid)))
+        super().__init__(placeholder="AI候補を確認する写真を選択",options=opts); self.parent_view=parent
+    async def callback(self,interaction):
+        iid=int(self.values[0]); row=next((x for x in self.parent_view.rows if int(x.get("image_id") or 0)==iid),None)
+        if not row:
+            await interaction.response.send_message("対象写真が見つかりません。",ephemeral=True);return
+        await interaction.response.defer(ephemeral=True)
+        from photo_review_view import send_person_review
+        await send_person_review(interaction,row)
+
+class AICandidateReviewListView(discord.ui.View):
+    PAGE_SIZE=25
+    def __init__(self,owner_id:int,rows:list[dict[str,Any]],page:int=0):
+        super().__init__(timeout=900); self.owner_id=owner_id; self.rows=rows; self.page=max(0,page)
+        self.pages=max(1,(len(rows)+24)//25); self.page=min(self.page,self.pages-1)
+        chunk=rows[self.page*25:(self.page+1)*25]
+        if chunk:self.add_item(AICandidateSelect(self,chunk))
+        self.previous.disabled=self.page<=0; self.next.disabled=self.page>=self.pages-1
+    async def interaction_check(self,interaction):
+        if interaction.user.id==self.owner_id:return True
+        await interaction.response.send_message("この画面は開いた管理者だけが操作できます。",ephemeral=True);return False
+    def embed(self):
+        e=discord.Embed(title="🤖 AI候補専用確認",description="AI候補がある未確認写真だけを選べます。人物確定は通常の安全な確認画面で行います。",color=0x5865F2)
+        e.set_footer(text=f"{self.page+1}/{self.pages}ページ / 全{len(self.rows)}件"); return e
+    @discord.ui.button(label="前の25件",emoji="◀️",style=discord.ButtonStyle.secondary)
+    async def previous(self,interaction,_):
+        v=AICandidateReviewListView(self.owner_id,self.rows,self.page-1); await interaction.response.edit_message(embed=v.embed(),view=v)
+    @discord.ui.button(label="次の25件",emoji="▶️",style=discord.ButtonStyle.secondary)
+    async def next(self,interaction,_):
+        v=AICandidateReviewListView(self.owner_id,self.rows,self.page+1); await interaction.response.edit_message(embed=v.embed(),view=v)
+
+async def send_ai_candidate_review(interaction: discord.Interaction) -> None:
+    from photo_database import get_pending_person_reviews
+    rows = await asyncio.to_thread(get_pending_person_reviews, 500, "")
+    rows = [r for r in rows if str(r.get("candidate_people") or r.get("candidates") or r.get("ai_person_name") or "").strip()]
+    if not rows:
+        await interaction.response.send_message("AI候補がある未確認写真はありません。",ephemeral=True);return
+    view=AICandidateReviewListView(interaction.user.id,rows)
+    await interaction.response.send_message(embed=view.embed(),view=view,ephemeral=True)
