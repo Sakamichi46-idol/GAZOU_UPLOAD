@@ -14,6 +14,7 @@ from typing import Any
 
 import discord
 from discord.ext import commands
+from embed_safety import safe_add_field
 
 from photo_database import get_connection
 
@@ -141,36 +142,36 @@ def dashboard_embed() -> discord.Embed:
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc),
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="📷 アーカイブ",
         value=f"記事 **{s['blogs']:,}**\n画像 **{s['images']:,}**\n人物 **{s['people']:,}**",
         inline=True,
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="✅ 人物確認",
         value=f"未確認 **{s['pending_reviews']:,}**\nスキップ **{s['skipped_reviews']:,}**\n確定顔 **{s['confirmed_faces']:,}**",
         inline=True,
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="⚠️ エラー",
         value=(f"画像取得 **{s['download_errors']:,}**\n"
                f"AI解析 **{s['analysis_errors']:,}**\n"
                f"顔認証 **{s['face_errors']:,}**"),
         inline=True,
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="⏳ 待機中",
         value=(f"保存 **{s['storage_pending']:,}**\n"
                f"AI解析 **{s['analysis_pending']:,}**\n"
                f"顔認証 **{s['face_pending']:,}**"),
         inline=True,
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="🧠 AI学習元",
         value=f"検出顔 **{s['faces']:,}**\n特徴量 **{s['embeddings']:,}**\n確定済み **{s['confirmed_faces']:,}**",
         inline=True,
     )
-    embed.add_field(
+    safe_add_field(embed, 
         name="📬 要望箱",
         value=f"未対応 **{s['feedback_pending']:,}**",
         inline=True,
@@ -218,7 +219,7 @@ def ai_quality_embed() -> discord.Embed:
         f"・{p['person_name']}: 確定 {int(p['confirmed_faces'] or 0):,} / 特徴量 {int(p['embeddings'] or 0):,}"
         for p in d["people"][:15]
     ]
-    embed.add_field(name="人物別の学習元", value="\n".join(lines) or "まだデータがありません。", inline=False)
+    safe_add_field(embed, name="人物別の学習元", value="\n".join(lines) or "まだデータがありません。", inline=False)
     return embed
 
 
@@ -263,21 +264,21 @@ def health_embed() -> discord.Embed:
         title="🩺 DB・保存データ健全性",
         color=0x57F287 if problems == 0 and r["integrity"] == "ok" else 0xFEE75C,
     )
-    embed.add_field(name="SQLite整合性", value=r["integrity"], inline=True)
-    embed.add_field(name="不足テーブル", value=str(len(r["missing_tables"])), inline=True)
-    embed.add_field(name="不足カラム", value=str(len(r["missing_columns"])), inline=True)
-    embed.add_field(name="孤立画像", value=f"{r['orphan_images']:,}", inline=True)
-    embed.add_field(name="孤立顔", value=f"{r['orphan_faces']:,}", inline=True)
-    embed.add_field(name="孤立人物参照", value=f"{r['orphan_people']:,}", inline=True)
-    embed.add_field(name="重複URL群", value=f"{r['duplicate_urls']:,}", inline=True)
-    embed.add_field(name="古いエラー文字", value=f"{r['stale_errors']:,}", inline=True)
+    safe_add_field(embed, name="SQLite整合性", value=r["integrity"], inline=True)
+    safe_add_field(embed, name="不足テーブル", value=str(len(r["missing_tables"])), inline=True)
+    safe_add_field(embed, name="不足カラム", value=str(len(r["missing_columns"])), inline=True)
+    safe_add_field(embed, name="孤立画像", value=f"{r['orphan_images']:,}", inline=True)
+    safe_add_field(embed, name="孤立顔", value=f"{r['orphan_faces']:,}", inline=True)
+    safe_add_field(embed, name="孤立人物参照", value=f"{r['orphan_people']:,}", inline=True)
+    safe_add_field(embed, name="重複URL群", value=f"{r['duplicate_urls']:,}", inline=True)
+    safe_add_field(embed, name="古いエラー文字", value=f"{r['stale_errors']:,}", inline=True)
     details = []
     if r["missing_tables"]:
         details.append("不足テーブル: " + ", ".join(r["missing_tables"][:10]))
     if r["missing_columns"]:
         details.append("不足カラム: " + ", ".join(r["missing_columns"][:15]))
     if details:
-        embed.add_field(name="詳細", value="\n".join(details)[:1024], inline=False)
+        safe_add_field(embed, name="詳細", value="\n".join(details)[:1024], inline=False)
     embed.set_footer(text="この画面は診断のみです。削除や自動修復は行いません。")
     return embed
 
