@@ -936,6 +936,7 @@ class BulkFinalConfirmView(discord.ui.View):
         await interaction.response.defer(ephemeral=True); ok=0; failed=0
         for iid in sorted(self.parent.selected_ids):
             try:
+                await asyncio.to_thread(create_people_snapshot,iid,interaction.user.id,"bulk_people_confirm")
                 await asyncio.to_thread(set_confirmed_image_people,iid,self.names,confirmed_by=f"{interaction.user} ({interaction.user.id})",note="ブログ内写真を選択して一括確定")
                 ok+=1
             except Exception:
