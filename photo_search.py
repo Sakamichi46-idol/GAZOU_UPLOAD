@@ -279,21 +279,47 @@ class DetailResultButton(discord.ui.Button):
 
 
 class DetailSearchSelect(discord.ui.Select):
+    PAGE_SIZE = 23
+
     def __init__(self, parent: "PhotoSearchDetailView", people: list[str], tags: list[str]) -> None:
         self.parent_view = parent
+        self.items = [("person", value) for value in people] + [("tag", value) for value in tags]
+        self.page_count = max(1, (len(self.items) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        parent.detail_option_page = max(0, min(parent.detail_option_page, self.page_count - 1))
+        start = parent.detail_option_page * self.PAGE_SIZE
+        visible = self.items[start:start + self.PAGE_SIZE]
         options: list[discord.SelectOption] = []
-        for value in people[:12]:
-            options.append(discord.SelectOption(label=f"人物：{value}"[:100], value=f"person:{value}", emoji="👤"))
-        for value in tags[:12]:
-            options.append(discord.SelectOption(label=f"タグ：{value}"[:100], value=f"tag:{value}", emoji="🏷️"))
+        for mode, value in visible:
+            prefix = "人物" if mode == "person" else "タグ"
+            emoji = "👤" if mode == "person" else "🏷️"
+            options.append(discord.SelectOption(label=f"{prefix}：{value}"[:100], value=f"{mode}:{value}", emoji=emoji))
+        if parent.detail_option_page > 0:
+            options.append(discord.SelectOption(label="前の候補ページ", value="__page_prev__", emoji="◀️"))
+        if parent.detail_option_page < self.page_count - 1:
+            options.append(discord.SelectOption(label="次の候補ページ", value="__page_next__", emoji="▶️"))
         super().__init__(
-            placeholder="人物・タグから別の写真を探す",
-            options=options[:25],
+            placeholder=f"人物・タグから探す（{parent.detail_option_page + 1}/{self.page_count}ページ）",
+            options=options,
             row=4,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        mode, query = self.values[0].split(":", 1)
+        selected = self.values[0]
+        if selected in {"__page_prev__", "__page_next__"}:
+            new_page = self.parent_view.detail_option_page + (-1 if selected == "__page_prev__" else 1)
+            view = PhotoSearchDetailView(
+                owner_id=self.parent_view.owner_id,
+                results=self.parent_view.results,
+                query=self.parent_view.query,
+                search_label=self.parent_view.search_label,
+                index=self.parent_view.index,
+                return_page=self.parent_view.return_page,
+                detail_option_page=new_page,
+            )
+            view.message = interaction.message
+            await interaction.response.edit_message(embeds=[view.build_embed()], view=view)
+            return
+        mode, query = selected.split(":", 1)
         await interaction.response.defer(ephemeral=True)
         if mode == "person":
             rows = await asyncio.to_thread(search_photo_images_by_person, query, DEFAULT_SEARCH_LIMIT)
@@ -327,6 +353,7 @@ class PhotoSearchDetailView(discord.ui.View):
         search_label: str,
         index: int,
         return_page: int,
+        detail_option_page: int = 0,
     ) -> None:
         super().__init__(timeout=VIEW_TIMEOUT_SECONDS)
         self.owner_id = int(owner_id)
@@ -335,6 +362,7 @@ class PhotoSearchDetailView(discord.ui.View):
         self.search_label = search_label
         self.index = max(0, min(index, len(results) - 1))
         self.return_page = return_page
+        self.detail_option_page = max(0, int(detail_option_page))
         self.message: discord.Message | None = None
         self.previous_button.disabled = self.index <= 0
         self.next_button.disabled = self.index >= len(results) - 1
@@ -426,6 +454,7 @@ class PhotoSearchDetailView(discord.ui.View):
             search_label=self.search_label,
             index=self.index - 1,
             return_page=self.return_page,
+            detail_option_page=self.detail_option_page,
         )
         view.message = interaction.message
         await interaction.response.edit_message(embeds=[view.build_embed()], view=view)
@@ -440,6 +469,7 @@ class PhotoSearchDetailView(discord.ui.View):
             search_label=self.search_label,
             index=self.index + 1,
             return_page=self.return_page,
+            detail_option_page=self.detail_option_page,
         )
         view.message = interaction.message
         await interaction.response.edit_message(embeds=[view.build_embed()], view=view)
