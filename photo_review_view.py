@@ -931,7 +931,9 @@ class QuickPeopleSelect(discord.ui.Select):
             min_values=1,
             max_values=max(1, min(len(options), 10)),
             options=options,
-            row=2,
+            # row=2 には「保留・仮確定・人物セット」のボタンがある。
+            # DiscordではSelectが1行を専有するため、専用行へ分離する。
+            row=3,
         )
         self.parent_view = parent
 
