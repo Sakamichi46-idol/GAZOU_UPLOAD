@@ -12,6 +12,8 @@ from embed_safety import safe_add_field, safe_embed, safe_text
 from photo_ai_analyzer import analyze_photo_image
 from local_face_recognition import detect_faces_for_image
 from photo_database import (
+    get_photo_blog_for_admin_edit,
+    update_photo_blog_info_for_admin,
     get_blog_authors_for_admin,
     get_blogs_for_admin,
     get_blogs_for_admin_filtered,
@@ -28,6 +30,7 @@ from photo_database import (
     set_confirmed_image_people,
 )
 from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
+from sakamichi_members import SAKAMICHI_MEMBERS
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
 PROGRESS_SEGMENTS = 10
@@ -1039,6 +1042,176 @@ class BlogPhotoBrowserView(AdminWorkflowView):
         view = BlogPhotoBrowserView(self.blog_id, rows, self.page)
         await interaction.response.edit_message(content=view.text(), embed=None, view=view)
 
+
+class BlogAuthorChangeConfirmView(AdminWorkflowView):
+    def __init__(self, blog_id: int, new_group: str, new_member: str, *, restore_if_hidden: bool = False, browser_state: dict[str, Any] | None = None):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.new_group = str(new_group)
+        self.new_member = str(new_member)
+        self.restore_if_hidden = bool(restore_if_hidden)
+        self.browser_state = dict(browser_state or {})
+
+    @discord.ui.button(label="この内容で変更", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        result = await asyncio.to_thread(
+            update_photo_blog_info_for_admin,
+            self.blog_id,
+            group_name=self.new_group,
+            member_name=self.new_member,
+            restore_if_hidden=self.restore_if_hidden,
+        )
+        if not result:
+            await interaction.followup.send("対象記事が見つかりませんでした。", ephemeral=True)
+            return
+        before = result["before"]
+        try:
+            from admin_operations import write_audit
+            await asyncio.to_thread(
+                write_audit, interaction.user.id, "blog_author_update",
+                target_type="blog", target_id=self.blog_id,
+                detail=(f"{before.get('group_name') or '不明'}/{before.get('member_name') or '不明'}"
+                        f" -> {self.new_group}/{self.new_member}; restore={self.restore_if_hidden}"),
+            )
+        except Exception:
+            LOGGER.exception("ブログ投稿者変更の監査ログ保存に失敗しました")
+        text = (
+            f"✅ ブログID **{self.blog_id}** の投稿者を変更しました。\n\n"
+            f"変更前：**{before.get('member_name') or '投稿者不明'}**\n"
+            f"変更後：**{self.new_member}**\n"
+            f"グループ：**{self.new_group}**\n"
+            f"関連画像：**{int(result.get('image_count') or 0)}枚**"
+        )
+        if self.restore_if_hidden:
+            text += "\n\n👁️ 除外状態も解除し、人物確認対象へ戻しました。"
+        await interaction.followup.send(text, ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="投稿者変更をキャンセルしました。", embed=None, view=None)
+
+
+class BlogAuthorMemberSelect(discord.ui.Select):
+    PAGE_SIZE = 25
+    def __init__(self, parent: "BlogAuthorMemberSelectView") -> None:
+        self.parent_view = parent
+        start = parent.page * self.PAGE_SIZE
+        members = parent.members[start:start + self.PAGE_SIZE]
+        options = [discord.SelectOption(label=name[:100], value=name[:100], emoji="👤") for name in members]
+        super().__init__(placeholder="正しい投稿者を選択", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        member = self.values[0]
+        blog = await asyncio.to_thread(get_photo_blog_for_admin_edit, self.parent_view.blog_id)
+        if not blog:
+            await interaction.response.send_message("対象記事が見つかりませんでした。", ephemeral=True)
+            return
+        embed = safe_embed(title="✏️ ブログ投稿者の変更確認", color=discord.Color.orange())
+        safe_add_field(embed, name="記事", value=str(blog.get("title") or "無題"), inline=False)
+        safe_add_field(embed, name="変更前", value=f"{blog.get('group_name') or '不明'} / {blog.get('member_name') or '投稿者不明'}", inline=False)
+        safe_add_field(embed, name="変更後", value=f"{self.parent_view.group_name} / {member}", inline=False)
+        safe_add_field(embed, name="関連画像", value=f"{int(blog.get('image_count') or 0)}枚", inline=True)
+        if self.parent_view.restore_if_hidden:
+            safe_add_field(embed, name="復元", value="投稿者変更と同時に除外状態を解除します。", inline=False)
+        await interaction.response.edit_message(
+            content=None, embed=embed,
+            view=BlogAuthorChangeConfirmView(
+                self.parent_view.blog_id, self.parent_view.group_name, member,
+                restore_if_hidden=self.parent_view.restore_if_hidden,
+                browser_state=self.parent_view.browser_state,
+            ),
+        )
+
+
+class BlogAuthorMemberSelectView(AdminWorkflowView):
+    PAGE_SIZE = 25
+    def __init__(self, blog_id: int, group_name: str, generation_name: str, members: list[str], *, page: int = 0, restore_if_hidden: bool = False, browser_state: dict[str, Any] | None = None):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.group_name = str(group_name)
+        self.generation_name = str(generation_name)
+        self.members = list(members)
+        self.page_count = max(1, (len(self.members) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        self.restore_if_hidden = bool(restore_if_hidden)
+        self.browser_state = dict(browser_state or {})
+        self.add_item(BlogAuthorMemberSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def text(self) -> str:
+        start = self.page * self.PAGE_SIZE + 1
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.members))
+        return f"👤 **{self.group_name} / {self.generation_name}**\n正しい投稿者を選択してください。\n表示 **{start}〜{end}人目 / 全{len(self.members)}人**"
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BlogAuthorMemberSelectView(self.blog_id, self.group_name, self.generation_name, self.members, page=self.page-1, restore_if_hidden=self.restore_if_hidden, browser_state=self.browser_state)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BlogAuthorMemberSelectView(self.blog_id, self.group_name, self.generation_name, self.members, page=self.page+1, restore_if_hidden=self.restore_if_hidden, browser_state=self.browser_state)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+
+class BlogAuthorGenerationSelect(discord.ui.Select):
+    def __init__(self, parent: "BlogAuthorGenerationSelectView") -> None:
+        self.parent_view = parent
+        generations = list(SAKAMICHI_MEMBERS.get(parent.group_name, {}).keys())
+        options = [discord.SelectOption(label=g[:100], value=g[:100]) for g in generations[:25]]
+        super().__init__(placeholder="期・区分を選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        generation = self.values[0]
+        members = list(SAKAMICHI_MEMBERS.get(self.parent_view.group_name, {}).get(generation, []))
+        view = BlogAuthorMemberSelectView(
+            self.parent_view.blog_id, self.parent_view.group_name, generation, members,
+            restore_if_hidden=self.parent_view.restore_if_hidden, browser_state=self.parent_view.browser_state,
+        )
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+
+class BlogAuthorGenerationSelectView(AdminWorkflowView):
+    def __init__(self, blog_id: int, group_name: str, *, restore_if_hidden: bool = False, browser_state: dict[str, Any] | None = None):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.group_name = str(group_name)
+        self.restore_if_hidden = bool(restore_if_hidden)
+        self.browser_state = dict(browser_state or {})
+        self.add_item(BlogAuthorGenerationSelect(self))
+
+
+class BlogAuthorGroupSelect(discord.ui.Select):
+    def __init__(self, parent: "BlogAuthorGroupSelectView") -> None:
+        self.parent_view = parent
+        super().__init__(placeholder="正しいグループを選択", options=[discord.SelectOption(label=g, value=g) for g in GROUPS])
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        group = self.values[0]
+        await interaction.response.edit_message(
+            content=f"✏️ **ブログ投稿者を変更**\n{group}の期・区分を選択してください。",
+            embed=None,
+            view=BlogAuthorGenerationSelectView(
+                self.parent_view.blog_id, group, restore_if_hidden=self.parent_view.restore_if_hidden, browser_state=self.parent_view.browser_state,
+            ),
+        )
+
+
+class BlogAuthorGroupSelectView(AdminWorkflowView):
+    def __init__(self, blog_id: int, *, restore_if_hidden: bool = False, browser_state: dict[str, Any] | None = None):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.restore_if_hidden = bool(restore_if_hidden)
+        self.browser_state = dict(browser_state or {})
+        self.add_item(BlogAuthorGroupSelect(self))
+
+
 class BlogArticleView(AdminWorkflowView):
     def __init__(self, blog_id: int, browser_state: dict[str, Any] | None = None):
         super().__init__()
@@ -1086,6 +1259,14 @@ class BlogArticleView(AdminWorkflowView):
     @discord.ui.button(label="未処理だけ顔認証", emoji="🙂", style=discord.ButtonStyle.secondary)
     async def face_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._run(interaction, "face", True)
+
+    @discord.ui.button(label="ブログ投稿者を編集", emoji="✏️", style=discord.ButtonStyle.secondary, row=2)
+    async def edit_author(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            "✏️ **ブログ投稿者を変更**\n正しいグループを選択してください。",
+            view=BlogAuthorGroupSelectView(self.blog_id, browser_state=self.browser_state),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="エラーを再試行待ちへ", emoji="♻️", style=discord.ButtonStyle.danger, row=2)
     async def retry_errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
