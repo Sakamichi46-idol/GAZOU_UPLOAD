@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import shutil
 import sqlite3
@@ -21,6 +22,9 @@ from discord.ext import commands
 from photo_database import PHOTO_DB_PATH, get_connection, get_photo_image
 
 
+logger = logging.getLogger(__name__)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -28,6 +32,36 @@ def _now() -> str:
 def _anon_key(user_id: int) -> str:
     salt = os.getenv("PHOTO_FEEDBACK_HASH_SALT", "photo-feedback-v1")
     return hashlib.sha256(f"{salt}:{int(user_id)}".encode()).hexdigest()[:16]
+
+
+def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
+    """Return the actual column names for an existing SQLite table."""
+
+    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"] if isinstance(row, sqlite3.Row) else row[1]) for row in rows}
+
+
+def _validate_community_dependencies(connection: sqlite3.Connection) -> None:
+    """Log schema mismatches without preventing the bot from starting."""
+
+    required = {
+        "photo_images": {"id", "blog_id", "image_url", "download_status"},
+        "photo_blogs": {"id", "blog_url", "group_name", "member_name", "title"},
+    }
+
+    for table_name, expected_columns in required.items():
+        actual_columns = _table_columns(connection, table_name)
+        if not actual_columns:
+            logger.warning("Community features: table %s does not exist yet.", table_name)
+            continue
+
+        missing = sorted(expected_columns - actual_columns)
+        if missing:
+            logger.warning(
+                "Community features: table %s is missing columns: %s",
+                table_name,
+                ", ".join(missing),
+            )
 
 
 def init_community_schema() -> None:
@@ -88,6 +122,7 @@ def init_community_schema() -> None:
             CREATE INDEX IF NOT EXISTS idx_usage_image ON photo_usage_events(image_id, event_type);
             """
         )
+        _validate_community_dependencies(con)
         con.commit()
 
 
@@ -450,16 +485,18 @@ def _popular_rows(limit: int = 10, period: str = "all") -> list[dict[str, Any]]:
     params.append(max(1, min(limit, 25)))
     with closing(get_connection()) as con:
         rows = con.execute(
-            f"""SELECT e.image_id, COUNT(*) AS score, b.title, b.member_name,
-                       b.group_name, b.blog_url, i.image_url, i.bucket_public_url
+            f"""SELECT i.*, COUNT(*) AS score,
+                       b.title, b.member_name, b.group_name,
+                       b.blog_url, b.published_at
                 FROM photo_usage_events e
                 JOIN photo_images i ON i.id=e.image_id
                 JOIN photo_blogs b ON b.id=i.blog_id
                 WHERE e.image_id IS NOT NULL
                   AND e.event_type IN ('detail','favorite','collection')
                   {cutoff_clause}
-                GROUP BY e.image_id
-                ORDER BY score DESC,e.image_id DESC LIMIT ?""",
+                GROUP BY i.id
+                ORDER BY score DESC, i.id DESC
+                LIMIT ?""",
             tuple(params),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -584,7 +621,20 @@ def register_community_commands(bot: commands.Bot) -> None:
         if period not in {"week", "month", "all"}:
             await ctx.send("期間は `week` / `month` / `all` から選んでください。")
             return
-        rows = await asyncio.to_thread(_popular_rows, limit, period)
+        try:
+            rows = await asyncio.to_thread(_popular_rows, limit, period)
+        except sqlite3.OperationalError as exc:
+            logger.exception(
+                "Popular photos query failed (period=%s, limit=%s)",
+                period,
+                limit,
+            )
+            await ctx.send(
+                "⚠️ 人気写真の取得に失敗しました。"
+                "データベース構成をログで確認してください。"
+            )
+            return
+
         if not rows:
             await ctx.send("📈 人気データはまだありません。")
             return
