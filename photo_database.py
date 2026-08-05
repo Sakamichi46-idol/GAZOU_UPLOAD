@@ -1007,6 +1007,64 @@ def init_photo_db() -> None:
             """
         )
 
+        # 過去バージョンで「確定人物は存在するが確認キューが未確認／未作成」になった
+        # データを非破壊で修復する。候補だけの画像は対象にしない。
+        now_for_repair = utc_now_text()
+        cursor.execute(
+            """
+            UPDATE photo_review_queue
+               SET status='completed',
+                   selected_value=COALESCE((
+                       SELECT GROUP_CONCAT(pip.person_name, '、')
+                         FROM photo_image_people pip
+                        WHERE pip.image_id=photo_review_queue.image_id
+                          AND pip.relation_status='confirmed'
+                   ), selected_value),
+                   updated_at=?
+             WHERE EXISTS (
+                       SELECT 1 FROM photo_image_people pip
+                        WHERE pip.image_id=photo_review_queue.image_id
+                          AND pip.relation_status='confirmed'
+                   )
+               AND status <> 'completed'
+            """,
+            (now_for_repair,),
+        )
+        cursor.execute(
+            """
+            INSERT INTO photo_review_queue(
+                image_id, review_type, question, candidates, status,
+                reviewed_by, selected_value, review_note,
+                created_at, updated_at, reviewed_at
+            )
+            SELECT pi.id,
+                   'person_identity',
+                   'この写真に写っている人物を確認してください。',
+                   '',
+                   'completed',
+                   'system_repair',
+                   COALESCE((
+                       SELECT GROUP_CONCAT(pip.person_name, '、')
+                         FROM photo_image_people pip
+                        WHERE pip.image_id=pi.id
+                          AND pip.relation_status='confirmed'
+                   ), ''),
+                   '人物登録済みデータから確認状態を自動修復',
+                   ?, ?, ?
+              FROM photo_images pi
+             WHERE EXISTS (
+                       SELECT 1 FROM photo_image_people pip
+                        WHERE pip.image_id=pi.id
+                          AND pip.relation_status='confirmed'
+                   )
+               AND NOT EXISTS (
+                       SELECT 1 FROM photo_review_queue prq
+                        WHERE prq.image_id=pi.id
+                   )
+            """,
+            (now_for_repair, now_for_repair, now_for_repair),
+        )
+
         connection.commit()
 
     print(
@@ -3396,10 +3454,27 @@ def set_confirmed_image_people(image_id: int, person_names: list[str], *, confir
                    ON CONFLICT(person_name) DO UPDATE SET updated_at=excluded.updated_at""",
                 (name, now, now),
             )
+        # 確認キューが存在しない画像でも、人物確定と同時に必ず完了状態を作る。
+        # 以前は UPDATE のみだったため、候補キュー未作成の画像では人物名だけ保存され、
+        # 管理画面では「未確認」のまま残る不整合が発生していた。
         connection.execute(
-            """UPDATE photo_review_queue SET status='completed', selected_value=?, reviewed_by=?,
-               review_note=?, reviewed_at=?, updated_at=? WHERE image_id=?""",
-            ("、".join(names), confirmed_by, note, now, now, image_id),
+            """
+            INSERT INTO photo_review_queue (
+                image_id, review_type, question, candidates, status,
+                reviewed_by, selected_value, review_note,
+                created_at, updated_at, reviewed_at
+            ) VALUES (?, 'person_identity', 'この写真に写っている人物を確認してください。', '',
+                      'completed', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(image_id) DO UPDATE SET
+                review_type='person_identity',
+                status='completed',
+                reviewed_by=excluded.reviewed_by,
+                selected_value=excluded.selected_value,
+                review_note=excluded.review_note,
+                reviewed_at=excluded.reviewed_at,
+                updated_at=excluded.updated_at
+            """,
+            (image_id, confirmed_by, "、".join(names), note, now, now, now),
         )
         # 管理者運用ダッシュボードの監査ログが導入済みなら、
         # すべての人物確定経路を中央で記録する。
@@ -4102,6 +4177,12 @@ def get_person_reviews_by_status(
                 ON photo_ai_analysis.image_id = photo_images.id
             WHERE photo_review_queue.status = ?
               AND photo_review_queue.review_type = 'person_identity'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM photo_image_people confirmed_review
+                  WHERE confirmed_review.image_id = photo_images.id
+                    AND confirmed_review.relation_status = 'confirmed'
+              )
               AND COALESCE(photo_blogs.is_hidden, 0) = 0
               {extra_filter}
             ORDER BY photo_blogs.id ASC, photo_images.image_index ASC, photo_review_queue.id ASC
@@ -4190,7 +4271,14 @@ def get_blog_images_for_review_admin(blog_id: int) -> list[dict[str, Any]]:
                 pb.member_name,
                 pb.title,
                 pb.published_at,
-                COALESCE(prq.status, 'pending') AS review_status,
+                CASE
+                    WHEN EXISTS (
+                        SELECT 1 FROM photo_image_people confirmed_status
+                        WHERE confirmed_status.image_id = pi.id
+                          AND confirmed_status.relation_status = 'confirmed'
+                    ) THEN 'completed'
+                    ELSE COALESCE(prq.status, 'pending')
+                END AS review_status,
                 COALESCE(prq.candidates, '') AS candidates,
                 COALESCE(prq.review_note, '') AS review_note,
                 COALESCE(paa.person_name, '') AS ai_person_name,
