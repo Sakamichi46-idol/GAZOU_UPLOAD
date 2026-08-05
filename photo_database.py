@@ -4662,7 +4662,7 @@ def search_photo_images_by_person_with_candidates(person_name: str, limit: int =
     )
 
 
-def get_blog_authors_for_admin(group_name: str = '', limit: int = 25) -> list[dict[str, Any]]:
+def get_blog_authors_for_admin(group_name: str = '', limit: int = 500) -> list[dict[str, Any]]:
     """投稿者ごとの記事数と人物確認完了記事数を返す。
 
     記事内の全画像について人物確認が完了している場合のみ、その記事を
@@ -4670,11 +4670,11 @@ def get_blog_authors_for_admin(group_name: str = '', limit: int = 25) -> list[di
     """
     group_name = str(group_name or '').strip()
     params: list[Any] = []
-    where = "WHERE pb.member_name <> ''"
+    where = "WHERE TRIM(COALESCE(pb.member_name, '')) <> '' AND TRIM(COALESCE(pb.member_name, '')) NOT IN ('不明', '投稿者不明')"
     if group_name:
         where += " AND pb.group_name = ?"
         params.append(group_name)
-    params.append(max(1, min(int(limit), 25)))
+    params.append(max(1, min(int(limit), 500)))
 
     with closing(get_connection()) as connection:
         rows = connection.execute(
