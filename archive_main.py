@@ -2449,12 +2449,22 @@ async def ai_analysis_loop() -> None:
     )
 
     if result.get("found", 0) > 0:
+        reason_text = ""
+        blocked_reasons = result.get("blocked_reasons") or {}
+        if blocked_reasons:
+            reason_text = " / ".join(
+                f"{reason}={count}" for reason, count in blocked_reasons.items()
+            )
         print(
             "AI自動解析完了:",
             f"検出={result.get('found', 0)}",
+            f"API送信={result.get('api_sent', 0)}",
+            f"キャッシュ={result.get('cache_reused', 0)}",
             f"完了={result.get('completed', 0)}",
             f"確認待ち={result.get('review', 0)}",
+            f"スキップ={result.get('blocked', 0)}",
             f"失敗={result.get('failed', 0)}",
+            f"理由={reason_text}" if reason_text else "",
         )
 
 
