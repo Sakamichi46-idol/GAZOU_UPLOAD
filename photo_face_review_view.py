@@ -170,6 +170,7 @@ class FaceMemberSelectionState:
         self.owner_id = parent_view.owner_id
         self.group_name = ""
         self.generation_name = ""
+        self.member_page = 0
 
 
 def _face_selection_text(state: FaceMemberSelectionState) -> str:
@@ -216,6 +217,7 @@ class FaceGroupSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         self.state.group_name = self.values[0]
         self.state.generation_name = ""
+        self.state.member_page = 0
         await interaction.response.edit_message(
             content=_face_selection_text(self.state),
             view=FaceGenerationView(self.state),
@@ -242,6 +244,7 @@ class FaceGenerationSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.state.generation_name = self.values[0]
+        self.state.member_page = 0
         await interaction.response.edit_message(
             content=_face_selection_text(self.state),
             view=FaceMemberView(self.state),
@@ -264,11 +267,17 @@ class FaceGenerationView(FaceMemberOwnedView):
 
 
 class FaceMemberSelect(discord.ui.Select):
+    PAGE_SIZE = 25
+
     def __init__(self, state: FaceMemberSelectionState) -> None:
-        names = SAKAMICHI_MEMBERS[state.group_name][state.generation_name]
+        all_names = list(SAKAMICHI_MEMBERS[state.group_name][state.generation_name])
+        page_count = max(1, (len(all_names) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        state.member_page = max(0, min(state.member_page, page_count - 1))
+        start = state.member_page * self.PAGE_SIZE
+        names = all_names[start:start + self.PAGE_SIZE]
         options = [discord.SelectOption(label=name, value=name) for name in names]
         super().__init__(
-            placeholder="メンバーを選択して確定",
+            placeholder=f"メンバーを選択して確定（{state.member_page + 1}/{page_count}ページ）",
             min_values=1,
             max_values=1,
             options=options,
@@ -280,11 +289,33 @@ class FaceMemberSelect(discord.ui.Select):
 
 
 class FaceMemberView(FaceMemberOwnedView):
+    PAGE_SIZE = 25
+
     def __init__(self, state: FaceMemberSelectionState) -> None:
         super().__init__(state)
         self.add_item(FaceMemberSelect(state))
+        total = len(SAKAMICHI_MEMBERS[state.group_name][state.generation_name])
+        page_count = max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.previous.disabled = state.member_page <= 0
+        self.next.disabled = state.member_page >= page_count - 1
 
-    @discord.ui.button(label="別の期・区分へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page = max(0, self.state.member_page - 1)
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceMemberView(self.state),
+        )
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page += 1
+        await interaction.response.edit_message(
+            content=_face_selection_text(self.state),
+            view=FaceMemberView(self.state),
+        )
+
+    @discord.ui.button(label="別の期・区分へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def generation(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.state.generation_name = ""
         await interaction.response.edit_message(
@@ -292,7 +323,7 @@ class FaceMemberView(FaceMemberOwnedView):
             view=FaceGenerationView(self.state),
         )
 
-    @discord.ui.button(label="別グループへ戻る", emoji="🌳", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="別グループへ戻る", emoji="🌳", style=discord.ButtonStyle.secondary, row=2)
     async def group(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.state.group_name = ""
         self.state.generation_name = ""
@@ -532,10 +563,24 @@ class FaceReviewView(discord.ui.View):
                 await self.message.edit(embed=embed, view=edit_view)
             except discord.HTTPException:
                 pass
-        await interaction.response.edit_message(
-            content=f"✅ **{discord.utils.escape_markdown(person_name_text)}** で確定しました。元の画面から再編集できます。",
-            view=None,
-        )
+        try:
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            try:
+                await interaction.edit_original_response(content=None, embed=None, view=None)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
+        try:
+            notice = await interaction.followup.send(
+                f"✅ **{discord.utils.escape_markdown(person_name_text)}** で確定しました。",
+                ephemeral=True,
+                wait=True,
+            )
+            await asyncio.sleep(2.5)
+            await notice.delete()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            pass
 
     @discord.ui.button(label="投稿者で確定", emoji="📝", style=discord.ButtonStyle.primary, row=1)
     async def author_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
