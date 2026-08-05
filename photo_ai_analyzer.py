@@ -904,43 +904,68 @@ def request_photo_analysis(
             diagnostic.get("error_message", "")
         )
 
-        if incomplete_reason:
-            message = (
-                "AI解析が未完了で終了しました。"
-                f" status={response_status},"
-                f" reason={incomplete_reason},"
-                f" reasoning_tokens="
-                f"{usage_data.get('reasoning_tokens', 0)}"
-            )
-        elif refusal:
-            message = (
-                "AIが画像解析を拒否しました。"
-                f" refusal={refusal[:300]}"
-            )
-        elif api_error:
-            message = (
-                "OpenAI APIが失敗を返しました。"
-                f" error={api_error[:300]}"
-            )
-        elif not raw_output:
-            message = (
-                "AIの解析本文が空でした。"
-                f" status={response_status or 'unknown'},"
-                f" reasoning_tokens="
-                f"{usage_data.get('reasoning_tokens', 0)}"
-            )
-        else:
-            message = (
-                "AI解析レスポンスが完了状態ではありません。"
-                f" status={response_status or 'unknown'}"
-            )
+        if incomplete_reason == "max_output_tokens":
+            # 出力上限で途切れた場合は、より短い指示と広い出力枠で1回だけ再試行する。
+            retry_options = dict(request_options)
+            retry_options["max_output_tokens"] = min(max(PHOTO_AI_MAX_OUTPUT_TOKENS * 2, 2048), 8192)
+            retry_options["input"] = [
+                {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "JSONスキーマに必要な項目だけを最短で返してください。説明文は不要です。"},
+                    {"type": "input_image", "image_url": image_data_url, "detail": "low"},
+                ]},
+            ]
+            retry_response = client.responses.create(**retry_options)
+            retry_status = normalize_text(get_object_value(retry_response, "status", ""))
+            retry_output = extract_response_text(retry_response)
+            if retry_status == "completed" and retry_output:
+                response = retry_response
+                raw_output = retry_output
+                usage_data = build_usage_data(retry_response)
+                response_status = retry_status
+                diagnostic = {}
+                incomplete_reason = ""
+            else:
+                print("AI短縮再試行も未完了:", json.dumps(build_response_diagnostic(retry_response), ensure_ascii=False, default=str))
 
-        raise AIResponseError(
-            message,
-            usage_data=usage_data,
-            response_status=response_status,
-            response_id=usage_data.get("response_id", ""),
-        )
+        if response_status != "completed" or not raw_output:
+            if incomplete_reason:
+                message = (
+                    "AI解析が未完了で終了しました。"
+                    f" status={response_status},"
+                    f" reason={incomplete_reason},"
+                    f" reasoning_tokens="
+                    f"{usage_data.get('reasoning_tokens', 0)}"
+                )
+            elif refusal:
+                message = (
+                    "AIが画像解析を拒否しました。"
+                    f" refusal={refusal[:300]}"
+                )
+            elif api_error:
+                message = (
+                    "OpenAI APIが失敗を返しました。"
+                    f" error={api_error[:300]}"
+                )
+            elif not raw_output:
+                message = (
+                    "AIの解析本文が空でした。"
+                    f" status={response_status or 'unknown'},"
+                    f" reasoning_tokens="
+                    f"{usage_data.get('reasoning_tokens', 0)}"
+                )
+            else:
+                message = (
+                    "AI解析レスポンスが完了状態ではありません。"
+                    f" status={response_status or 'unknown'}"
+                )
+
+            raise AIResponseError(
+                message,
+                usage_data=usage_data,
+                response_status=response_status,
+                response_id=usage_data.get("response_id", ""),
+            )
 
     try:
         analysis = json.loads(raw_output)
