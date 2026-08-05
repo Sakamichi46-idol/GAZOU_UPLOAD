@@ -1465,19 +1465,27 @@ def analyze_photo_image_sync(
                     "status": final_status,
                     "reused": True,
                     "source_image_id": source_image_id,
+                    "api_sent": False,
                 }
 
         api_allowed, block_reason = can_send_image_to_api(manual=manual_api)
         if not api_allowed:
-            record_api_attempt(
-                image_id, trigger_kind="manual" if manual_api else "automatic",
-                allowed=False, result_status="blocked", reason=block_reason,
-            )
+            # 自動巡回では、OFF・上限到達を失敗記録として毎分増やさない。
+            # 管理者の手動操作だけ、ブロック理由を監査用に残す。
+            if manual_api:
+                record_api_attempt(
+                    image_id,
+                    trigger_kind="manual",
+                    allowed=False,
+                    result_status="blocked",
+                    reason=block_reason,
+                )
             update_image_analysis_status(image_id, "pending", block_reason[:1000])
             return {
                 "image_id": image_id,
                 "status": "blocked",
                 "api_blocked": True,
+                "api_sent": False,
                 "reason": block_reason,
             }
 
@@ -1515,6 +1523,7 @@ def analyze_photo_image_sync(
         )
         result["usage"] = usage_data
         result["estimated_cost_usd"] = costs["estimated_cost_usd"]
+        result["api_sent"] = True
         finish_api_attempt(api_attempt_id, status="completed")
 
         print(
@@ -1587,6 +1596,7 @@ def analyze_photo_image_sync(
         return {
             "image_id": image_id,
             "status": "failed",
+            "api_sent": bool("api_attempt_id" in locals()),
             "error": error_message,
         }
 
@@ -1642,6 +1652,10 @@ async def analyze_pending_images(
     completed = 0
     review = 0
     failed = 0
+    blocked = 0
+    cache_reused = 0
+    api_sent = 0
+    blocked_reasons: dict[str, int] = {}
 
     for image in images:
 
@@ -1662,21 +1676,26 @@ async def analyze_pending_images(
             "",
         )
 
+        if result.get("reused"):
+            cache_reused += 1
+
+        if result.get("api_sent"):
+            api_sent += 1
+
         if status == "completed":
             completed += 1
-
         elif status == "review":
             review += 1
-
+        elif status == "blocked":
+            blocked += 1
+            reason = str(result.get("reason") or "理由不明")
+            blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
         else:
             failed += 1
 
-        if PHOTO_AI_REQUEST_INTERVAL > 0:
-
-            # APIへの連続アクセスを少し緩和する。
-            await asyncio.sleep(
-                PHOTO_AI_REQUEST_INTERVAL
-            )
+        if PHOTO_AI_REQUEST_INTERVAL > 0 and result.get("api_sent"):
+            # 実際にAPIへ送った場合だけ待機する。
+            await asyncio.sleep(PHOTO_AI_REQUEST_INTERVAL)
 
     return {
         "requested": limit,
@@ -1684,6 +1703,10 @@ async def analyze_pending_images(
         "completed": completed,
         "review": review,
         "failed": failed,
+        "blocked": blocked,
+        "cache_reused": cache_reused,
+        "api_sent": api_sent,
+        "blocked_reasons": blocked_reasons,
         "results": results,
     }
 
