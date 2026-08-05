@@ -9,6 +9,7 @@ from typing import Any
 
 import discord
 from discord.ext import commands
+from embed_safety import safe_add_field
 
 from person_labels import (
     count_people_for_users,
@@ -143,24 +144,24 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
         description=description,
         color=SUCCESS_EMBED_COLOR if confirmed else (SKIP_EMBED_COLOR if is_skipped else REVIEW_EMBED_COLOR),
     )
-    embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
+    safe_add_field(embed, name="画像ID", value=str(review.get("image_id", 0)), inline=True)
     image_index = int(review.get("image_index") or 0)
     total_blog_images = int(review.get("total_blog_images") or 0)
     image_position = f"{image_index} / {total_blog_images}" if total_blog_images else str(image_index or "不明")
-    embed.add_field(name="ブログ内の画像", value=image_position, inline=True)
-    embed.add_field(name="グループ", value=normalize_text(review.get("group_name")) or "不明", inline=True)
-    embed.add_field(name="ブログ投稿者（最優先候補）", value=normalize_text(review.get("member_name")) or "不明", inline=True)
-    embed.add_field(name="タイトル", value=truncate_text(review.get("title"), 1000) or "タイトルなし", inline=False)
+    safe_add_field(embed, name="ブログ内の画像", value=image_position, inline=True)
+    safe_add_field(embed, name="グループ", value=normalize_text(review.get("group_name")) or "不明", inline=True)
+    safe_add_field(embed, name="ブログ投稿者（最優先候補）", value=normalize_text(review.get("member_name")) or "不明", inline=True)
+    safe_add_field(embed, name="タイトル", value=truncate_text(review.get("title"), 1000) or "タイトルなし", inline=False)
     if is_skipped and normalize_text(review.get("review_note")):
-        embed.add_field(
+        safe_add_field(embed, 
             name="前回のスキップメモ",
             value=truncate_text(review.get("review_note"), 1000),
             inline=False,
         )
     if review.get("published_at"):
-        embed.add_field(name="投稿日", value=truncate_text(review.get("published_at"), 1000), inline=False)
+        safe_add_field(embed, name="投稿日", value=truncate_text(review.get("published_at"), 1000), inline=False)
     candidate_text = "\n".join(f"{i}. {name}" for i, name in enumerate(candidates[:MAX_CANDIDATE_DISPLAY], 1))
-    embed.add_field(name="🤖 人物候補", value=candidate_text or "候補はありません。", inline=False)
+    safe_add_field(embed, name="🤖 人物候補", value=candidate_text or "候補はありません。", inline=False)
     if quick_people:
         quick_text = " / ".join(
             f"{item.get('person_name', '')}（{int(item.get('confirmed_count') or 0)}）"
@@ -168,10 +169,10 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
             if normalize_text(item.get("person_name"))
         )
         if quick_text:
-            embed.add_field(name="⚡ よく使う人物", value=truncate_text(quick_text, 1000), inline=False)
-    embed.add_field(name="現在の確定人物", value=format_people_for_users("、".join(confirmed)) or "未確定", inline=False)
+            safe_add_field(embed, name="⚡ よく使う人物", value=truncate_text(quick_text, 1000), inline=False)
+    safe_add_field(embed, name="現在の確定人物", value=format_people_for_users("、".join(confirmed)) or "未確定", inline=False)
     if review.get("blog_url"):
-        embed.add_field(name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
+        safe_add_field(embed, name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
     embed.set_footer(
         text=(
             "人物の新規設定・再設定・スキップ再確認のすべてで、"
@@ -183,16 +184,16 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
 
 def build_completed_embed(review: dict[str, Any], names: list[str], reviewer: discord.abc.User) -> discord.Embed:
     embed = discord.Embed(title="✅ 人物確認完了", description="写真に写っている人物を確定しました。", color=SUCCESS_EMBED_COLOR)
-    embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
-    embed.add_field(name="確定人物", value=format_people_for_users("、".join(names)) if names else "人物なし", inline=False)
-    embed.add_field(name="確認者", value=discord.utils.escape_markdown(normalize_text(getattr(reviewer, "display_name", reviewer.name))), inline=False)
+    safe_add_field(embed, name="画像ID", value=str(review.get("image_id", 0)), inline=True)
+    safe_add_field(embed, name="確定人物", value=format_people_for_users("、".join(names)) if names else "人物なし", inline=False)
+    safe_add_field(embed, name="確認者", value=discord.utils.escape_markdown(normalize_text(getattr(reviewer, "display_name", reviewer.name))), inline=False)
     return embed
 
 
 def build_skipped_embed(review: dict[str, Any], reviewer: discord.abc.User) -> discord.Embed:
     embed = discord.Embed(title="⏭️ 人物確認をスキップしました", color=SKIP_EMBED_COLOR)
-    embed.add_field(name="画像ID", value=str(review.get("image_id", 0)), inline=True)
-    embed.add_field(name="操作した人", value=normalize_text(getattr(reviewer, "display_name", reviewer.name)), inline=False)
+    safe_add_field(embed, name="画像ID", value=str(review.get("image_id", 0)), inline=True)
+    safe_add_field(embed, name="操作した人", value=normalize_text(getattr(reviewer, "display_name", reviewer.name)), inline=False)
     return embed
 
 
@@ -422,8 +423,8 @@ class ReviewSession:
                     description=f"このブログの対象画像を **{format_people_for_users('、'.join(names))}** で確定しました。",
                     color=SUCCESS_EMBED_COLOR,
                 )
-                embed.add_field(name="画像ID", value=str(image_id), inline=True)
-                embed.add_field(name="確定人物", value=format_people_for_users("、".join(names)), inline=False)
+                safe_add_field(embed, name="画像ID", value=str(image_id), inline=True)
+                safe_add_field(embed, name="確定人物", value=format_people_for_users("、".join(names)), inline=False)
                 await message.edit(embed=embed, view=None, attachments=[])
             except (discord.HTTPException, discord.NotFound):
                 pass
