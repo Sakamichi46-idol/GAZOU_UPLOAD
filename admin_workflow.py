@@ -25,6 +25,7 @@ from photo_database import (
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
     reset_blog_processing_errors_for_admin,
+    set_confirmed_image_people,
 )
 from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
 
@@ -403,14 +404,10 @@ class GroupSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         group = self.values[0]
         await interaction.response.defer()
-        authors = await asyncio.to_thread(get_blog_authors_for_admin, group, 25)
+        authors = await asyncio.to_thread(get_blog_authors_for_admin, group, 500)
+        view = AuthorSelectView(group, authors, page=0)
         await interaction.edit_original_response(
-            content=(
-                f"📖 **{group}** のブログ投稿者を選択してください。\n"
-                "各投稿者には、完了記事数・全記事数・未完了数を表示しています。"
-            ),
-            embed=None,
-            view=AuthorSelectView(group, authors),
+            content=view.text(), embed=None, view=view,
         )
 
 
@@ -421,8 +418,8 @@ class GroupSelectView(AdminWorkflowView):
 
 
 class AuthorSelect(discord.ui.Select):
-    def __init__(self, group: str, authors: list[dict[str, Any]]):
-        self.group = group
+    def __init__(self, parent: "AuthorSelectView", authors: list[dict[str, Any]]):
+        self.parent_view = parent
         self.authors = {str(author.get("member_name") or ""): author for author in authors}
         options = []
         for author in authors:
@@ -431,45 +428,56 @@ class AuthorSelect(discord.ui.Select):
             pending = max(0, int(author.get("pending_blog_count") or (total - completed)))
             percent = int(author.get("completion_percent") or (round(completed * 100 / total) if total else 0))
             options.append(discord.SelectOption(
-                label=str(author["member_name"])[:100],
-                value=str(author["member_name"])[:100],
+                label=str(author["member_name"])[:100], value=str(author["member_name"])[:100],
                 description=(f"完了 {completed}/{total}件 ({percent}%) ・ 未完了 {pending}件")[:100],
                 emoji="✅" if total > 0 and completed >= total else "👤",
             ))
         if not options:
             options = [discord.SelectOption(label="投稿者が見つかりません", value="__none__")]
-        super().__init__(placeholder="投稿者を選択（完了記事数 / 全記事数）", options=options)
+        super().__init__(placeholder="投稿者を選択（完了記事数 / 全記事数）", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         author = self.values[0]
         if author == "__none__":
-            await interaction.response.send_message("対象がありません。", ephemeral=True)
-            return
+            await interaction.response.send_message("対象がありません。", ephemeral=True); return
         await interaction.response.defer()
-        state = await asyncio.to_thread(
-            get_admin_blog_browser_state,
-            interaction.user.id,
-            self.group,
-            author,
-        ) or {}
+        state = await asyncio.to_thread(get_admin_blog_browser_state, interaction.user.id, self.parent_view.group, author) or {}
         await _open_author_blog_browser(
-            interaction,
-            self.group,
-            author,
-            self.authors.get(author, {}),
-            user_id=interaction.user.id,
-            page=int(state.get("page") or 0),
-            selected_year=int(state.get("selected_year") or 0),
-            selected_month=int(state.get("selected_month") or 0),
-            title_query=str(state.get("title_query") or ""),
+            interaction, self.parent_view.group, author, self.authors.get(author, {}), user_id=interaction.user.id,
+            page=int(state.get("page") or 0), selected_year=int(state.get("selected_year") or 0),
+            selected_month=int(state.get("selected_month") or 0), title_query=str(state.get("title_query") or ""),
             only_unprocessed=bool(state.get("only_unprocessed") or 0),
         )
 
 
 class AuthorSelectView(AdminWorkflowView):
-    def __init__(self, group: str, authors: list[dict[str, Any]]):
-        super().__init__()
-        self.add_item(AuthorSelect(group, authors))
+    PAGE_SIZE = 25
+    def __init__(self, group: str, authors: list[dict[str, Any]], page: int = 0):
+        super().__init__(); self.group=group; self.authors=authors
+        self.page_count=max(1,(len(authors)+self.PAGE_SIZE-1)//self.PAGE_SIZE)
+        self.page=max(0,min(int(page),self.page_count-1))
+        start=self.page*self.PAGE_SIZE; page_authors=authors[start:start+self.PAGE_SIZE]
+        self.add_item(AuthorSelect(self,page_authors))
+        self.previous.disabled=self.page<=0; self.next.disabled=self.page>=self.page_count-1
+    def text(self)->str:
+        start=self.page*self.PAGE_SIZE+1 if self.authors else 0; end=min((self.page+1)*self.PAGE_SIZE,len(self.authors))
+        return (
+            f"📖 **{self.group}** のブログ投稿者を選択してください。\n"
+            f"表示 **{start}〜{end}人目 / 全{len(self.authors)}人**（{self.page+1}/{self.page_count}ページ）\n"
+            "各投稿者には、完了記事数・全記事数・未完了数を表示しています。"
+        )
+    @discord.ui.button(label="前の25人",emoji="◀️",style=discord.ButtonStyle.secondary,row=1)
+    async def previous(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        v=AuthorSelectView(self.group,self.authors,self.page-1); await interaction.response.edit_message(content=v.text(),embed=None,view=v)
+    @discord.ui.button(label="次の25人",emoji="▶️",style=discord.ButtonStyle.secondary,row=1)
+    async def next(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        v=AuthorSelectView(self.group,self.authors,self.page+1); await interaction.response.edit_message(content=v.text(),embed=None,view=v)
+    @discord.ui.button(label="グループ選択へ",emoji="↩️",style=discord.ButtonStyle.secondary,row=1)
+    async def back(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        await interaction.response.edit_message(
+            content="👤 **投稿者から選ぶ**\nグループを選択してください。",
+            embed=None, view=GroupSelectView(),
+        )
 
 
 class BlogTitleSearchModal(discord.ui.Modal):
@@ -852,6 +860,93 @@ class BlogPhotoSelect(discord.ui.Select):
         await send_person_review(interaction, item, session=None)
 
 
+class BulkPhotoSelect(discord.ui.Select):
+    def __init__(self, parent: "BulkPhotoSelectionView", rows: list[dict[str, Any]]):
+        self.parent_view=parent
+        opts=[]
+        for item in rows:
+            iid=int(item["image_id"]); num=int(item.get("image_index") or 0)
+            status=str(item.get("review_status") or "pending")
+            opts.append(discord.SelectOption(label=f"{num}枚目",value=str(iid),description=("登録済み" if status=="completed" else "スキップ済み" if status=="skipped" else "未確認"),default=iid in parent.selected_ids))
+        super().__init__(placeholder="一括確定する写真を複数選択",min_values=0,max_values=len(opts),options=opts,row=0)
+    async def callback(self,interaction:discord.Interaction)->None:
+        page_ids={int(x["image_id"]) for x in self.parent_view.page_rows()}
+        self.parent_view.selected_ids.difference_update(page_ids); self.parent_view.selected_ids.update(int(x) for x in self.values)
+        v=BulkPhotoSelectionView(self.parent_view.blog_id,self.parent_view.all_rows,self.parent_view.page,self.parent_view.selected_ids)
+        await interaction.response.edit_message(content=v.text(),view=v)
+
+class BulkPeopleModal(discord.ui.Modal):
+    def __init__(self,parent:"BulkPhotoSelectionView"):
+        super().__init__(title="選択写真を一括確定",timeout=300); self.parent_view=parent
+        self.people=discord.ui.TextInput(label="人物名（複数は読点・カンマ区切り）",placeholder="例：金村美玖、小坂菜緒",max_length=500)
+        self.add_item(self.people)
+    async def on_submit(self,interaction:discord.Interaction)->None:
+        names=[x.strip() for x in str(self.people.value).replace(',', '、').replace('，','、').split('、') if x.strip()]
+        if not names or not self.parent_view.selected_ids:
+            await interaction.response.send_message("写真と人物を選択してください。",ephemeral=True); return
+        selected=sorted(self.parent_view.selected_ids)
+        overwrite=sum(1 for r in self.parent_view.all_rows if int(r['image_id']) in self.parent_view.selected_ids and str(r.get('review_status'))=='completed')
+        await interaction.response.send_message(
+            f"⚠️ **一括確定の最終確認**\n"
+            f"対象 **{len(selected)}枚** / 既存登録の上書き **{overwrite}枚**\n"
+            f"写真ID: {', '.join(map(str, selected))}\n"
+            f"人物: {'、'.join(names)}",
+            view=BulkFinalConfirmView(self.parent_view,names),ephemeral=True)
+
+class BulkFinalConfirmView(discord.ui.View):
+    def __init__(self,parent:"BulkPhotoSelectionView",names:list[str]): super().__init__(timeout=300); self.parent=parent; self.names=names
+    @discord.ui.button(label="この内容で一括確定",emoji="✅",style=discord.ButtonStyle.danger)
+    async def confirm(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        await interaction.response.defer(ephemeral=True); ok=0; failed=0
+        for iid in sorted(self.parent.selected_ids):
+            try:
+                await asyncio.to_thread(set_confirmed_image_people,iid,self.names,confirmed_by=f"{interaction.user} ({interaction.user.id})",note="ブログ内写真を選択して一括確定")
+                ok+=1
+            except Exception:
+                LOGGER.exception("選択式一括確定に失敗 image_id=%s",iid); failed+=1
+        await interaction.followup.send(
+            f"✅ 一括確定完了\n成功 **{ok}枚** / 失敗 **{failed}枚**\n人物: {'、'.join(self.names)}",
+            ephemeral=True,
+        )
+    @discord.ui.button(label="キャンセル",style=discord.ButtonStyle.secondary)
+    async def cancel(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        await interaction.response.edit_message(content="一括確定をキャンセルしました。",view=None)
+
+class BulkPhotoSelectionView(AdminWorkflowView):
+    PAGE_SIZE=25
+    def __init__(self,blog_id:int,rows:list[dict[str,Any]],page:int=0,selected_ids:set[int]|None=None):
+        super().__init__(); self.blog_id=int(blog_id); self.all_rows=rows; self.selected_ids=set(selected_ids or set())
+        self.page_count=max(1,(len(rows)+self.PAGE_SIZE-1)//self.PAGE_SIZE); self.page=max(0,min(page,self.page_count-1))
+        if self.page_rows(): self.add_item(BulkPhotoSelect(self,self.page_rows()))
+        self.previous.disabled=self.page<=0; self.next.disabled=self.page>=self.page_count-1
+    def page_rows(self):
+        st=self.page*self.PAGE_SIZE; return self.all_rows[st:st+self.PAGE_SIZE]
+    def text(self):
+        nums=[str(int(r.get('image_index') or 0)) for r in self.all_rows if int(r['image_id']) in self.selected_ids]
+        return (
+            f"☑️ **写真を選んで一括確定**\n"
+            f"選択中 **{len(nums)}枚**: {', '.join(nums[:40]) or 'なし'}\n"
+            f"ページ {self.page+1}/{self.page_count}。ページを移動しても選択は保持されます。"
+        )
+    @discord.ui.button(label="前の25枚",emoji="◀️",style=discord.ButtonStyle.secondary,row=1)
+    async def previous(self,interaction:discord.Interaction,_:discord.ui.Button):
+        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page-1,self.selected_ids); await interaction.response.edit_message(content=v.text(),view=v)
+    @discord.ui.button(label="次の25枚",emoji="▶️",style=discord.ButtonStyle.secondary,row=1)
+    async def next(self,interaction:discord.Interaction,_:discord.ui.Button):
+        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page+1,self.selected_ids); await interaction.response.edit_message(content=v.text(),view=v)
+    @discord.ui.button(label="未確認を全選択",emoji="⏳",style=discord.ButtonStyle.primary,row=1)
+    async def pending(self,interaction:discord.Interaction,_:discord.ui.Button):
+        ids={int(r['image_id']) for r in self.all_rows if str(r.get('review_status') or 'pending')!='completed'}
+        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page,ids); await interaction.response.edit_message(content=v.text(),view=v)
+    @discord.ui.button(label="選択解除",emoji="🧹",style=discord.ButtonStyle.secondary,row=2)
+    async def clear(self,interaction:discord.Interaction,_:discord.ui.Button):
+        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page,set()); await interaction.response.edit_message(content=v.text(),view=v)
+    @discord.ui.button(label="人物を設定して確定",emoji="👥",style=discord.ButtonStyle.success,row=2)
+    async def people(self,interaction:discord.Interaction,_:discord.ui.Button):
+        if not self.selected_ids: await interaction.response.send_message("先に写真を選択してください。",ephemeral=True); return
+        await interaction.response.send_modal(BulkPeopleModal(self))
+
+
 class BlogPhotoBrowserView(AdminWorkflowView):
     PAGE_SIZE = 25
 
@@ -899,6 +994,11 @@ class BlogPhotoBrowserView(AdminWorkflowView):
         count = await send_blog_person_review_batch(interaction, self.blog_id, 1, continuous=True, require_final_confirmation=True)
         if count:
             await interaction.followup.send("未確認写真を1枚ずつ表示します。保存またはスキップすると自動で次へ進みます。", ephemeral=True)
+
+    @discord.ui.button(label="写真を選んで一括確定", emoji="☑️", style=discord.ButtonStyle.primary, row=2)
+    async def bulk_select(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BulkPhotoSelectionView(self.blog_id, self.all_rows)
+        await interaction.response.send_message(content=view.text(), view=view, ephemeral=True)
 
     @discord.ui.button(label="一覧を更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
