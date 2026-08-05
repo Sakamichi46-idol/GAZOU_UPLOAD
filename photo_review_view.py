@@ -30,6 +30,9 @@ from photo_database import (
     utc_now_text,
 )
 from sakamichi_members import SAKAMICHI_MEMBERS, iter_members
+from advanced_admin_features import (
+    HOLD_REASON_LABELS, create_people_snapshot, save_hold_reason, save_provisional_people, load_person_sets,
+)
 
 REVIEW_EMBED_COLOR = discord.Color.blue()
 SUCCESS_EMBED_COLOR = discord.Color.green()
@@ -818,6 +821,7 @@ class SelectedPeopleView(OwnedView):
         if self.state.unknown_other_people:
             names.append(make_unknown_other_label(self.state.unknown_other_people))
         names = normalize_people_for_storage(names)
+        await asyncio.to_thread(create_people_snapshot, self.image_id, interaction.user.id, "person_review_confirm")
         await asyncio.to_thread(
             set_confirmed_image_people,
             image_id,
@@ -964,6 +968,39 @@ class FinalPersonConfirmView(discord.ui.View):
         await interaction.response.edit_message(content="↩️ 確定せず、元のレビュー画面に戻りました。", view=None)
         self.stop()
 
+
+
+
+class HoldReasonView(discord.ui.View):
+    def __init__(self, review_view: "PersonReviewView") -> None:
+        super().__init__(timeout=300)
+        self.review_view = review_view
+        for code, label in HOLD_REASON_LABELS.items():
+            button = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, custom_id=f"hold:{code}")
+            async def callback(interaction: discord.Interaction, c=code, l=label):
+                await interaction.response.defer(ephemeral=True)
+                await asyncio.to_thread(save_hold_reason, self.review_view.image_id, c, "", interaction.user.id)
+                await _delete_message_safely(self.review_view.message or interaction.message)
+                await interaction.edit_original_response(content=f"⏸️ 写真ID **{self.review_view.image_id}** を「{l}」で保留しました。", view=None)
+                asyncio.create_task(_delete_original_response_later(interaction))
+                if self.review_view.session:
+                    await self.review_view.session.mark_done(self.review_view.image_id, interaction)
+            button.callback = callback
+            self.add_item(button)
+
+class PersonSetApplySelect(discord.ui.Select):
+    def __init__(self, review_view: "PersonReviewView", sets: list[dict[str, Any]]):
+        self.review_view=review_view
+        options=[discord.SelectOption(label=x["name"][:100],description="、".join(x["people"])[:100],value=str(x["id"])) for x in sets]
+        super().__init__(placeholder="人物セットを選択",options=options)
+        self.sets={str(x["id"]):x for x in sets}
+    async def callback(self, interaction: discord.Interaction):
+        item=self.sets[self.values[0]]
+        await self.review_view.complete_review(interaction,item["people"],note=f"人物セット「{item['name']}」を使用")
+
+class PersonSetApplyView(discord.ui.View):
+    def __init__(self, review_view: "PersonReviewView", sets: list[dict[str, Any]]):
+        super().__init__(timeout=300); self.add_item(PersonSetApplySelect(review_view,sets))
 
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
@@ -1164,6 +1201,27 @@ class PersonReviewView(discord.ui.View):
             [make_unknown_other_label(1)],
             note="その他の人物が1人写っているが名前不明",
         )
+
+    @discord.ui.button(label="理由を選んで保留", emoji="⏸️", style=discord.ButtonStyle.secondary, row=2)
+    async def hold_with_reason(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message("保留理由を選んでください。", view=HoldReasonView(self), ephemeral=True)
+
+    @discord.ui.button(label="候補を仮確定", emoji="🧪", style=discord.ButtonStyle.secondary, row=2)
+    async def provisional_candidates(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not self.candidates:
+            await interaction.response.send_message("仮確定できる候補がありません。", ephemeral=True); return
+        await asyncio.to_thread(save_provisional_people, self.image_id, self.candidates, "review_candidates", 0.0)
+        await interaction.response.send_message(
+            f"🧪 写真ID **{self.image_id}** を仮確定しました。\n人物: {'、'.join(self.candidates)}\n本確定はAI育成センターから行えます。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="人物セット", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
+    async def use_person_set(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        sets=await asyncio.to_thread(load_person_sets,25)
+        if not sets:
+            await interaction.response.send_message("人物セットがまだ登録されていません。",ephemeral=True);return
+        await interaction.response.send_message("使用する人物セットを選んでください。",view=PersonSetApplyView(self,sets),ephemeral=True)
 
 
 async def send_person_review(
