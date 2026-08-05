@@ -230,12 +230,22 @@ async def _finish_selection_message(
     source_message: discord.Message | None,
     text: str,
 ) -> None:
-    """選択画面を成功表示へ変え、元写真と成功表示を自動で片付ける。"""
+    """人物確定後、元写真と人物選択用エフェメラルを削除する。"""
     if not interaction.response.is_done():
         await interaction.response.defer()
     await _delete_message_safely(source_message)
-    await interaction.edit_original_response(content=text, view=None)
-    asyncio.create_task(_delete_original_response_later(interaction))
+    try:
+        await interaction.delete_original_response()
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+        try:
+            await interaction.edit_original_response(content=None, embed=None, view=None)
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            pass
+    try:
+        notice = await interaction.followup.send(text, ephemeral=True, wait=True)
+        asyncio.create_task(_delete_message_later(notice))
+    except discord.HTTPException:
+        pass
 
 
 async def _finish_review_message(
