@@ -17,6 +17,8 @@ from openai import OpenAI
 
 from bucket_storage import download_to_file
 
+from ai_cost_control import can_send_image_to_api, finish_api_attempt, record_api_attempt
+
 from photo_database import (
     clear_ai_tags,
     copy_ai_result,
@@ -1401,6 +1403,8 @@ def materialize_analysis_image(image: dict[str, Any]):
 
 def analyze_photo_image_sync(
     image_id: int,
+    *,
+    manual_api: bool = False,
 ) -> dict[str, Any]:
     """
     画像1枚を同期処理で解析する。
@@ -1463,6 +1467,25 @@ def analyze_photo_image_sync(
                     "source_image_id": source_image_id,
                 }
 
+        api_allowed, block_reason = can_send_image_to_api(manual=manual_api)
+        if not api_allowed:
+            record_api_attempt(
+                image_id, trigger_kind="manual" if manual_api else "automatic",
+                allowed=False, result_status="blocked", reason=block_reason,
+            )
+            update_image_analysis_status(image_id, "pending", block_reason[:1000])
+            return {
+                "image_id": image_id,
+                "status": "blocked",
+                "api_blocked": True,
+                "reason": block_reason,
+            }
+
+        api_attempt_id = record_api_attempt(
+            image_id, trigger_kind="manual" if manual_api else "automatic",
+            allowed=True, result_status="started",
+        )
+
         with materialize_analysis_image(image) as analysis_image_path:
             analysis, raw_output, usage_data = (
                 request_photo_analysis(
@@ -1492,6 +1515,7 @@ def analyze_photo_image_sync(
         )
         result["usage"] = usage_data
         result["estimated_cost_usd"] = costs["estimated_cost_usd"]
+        finish_api_attempt(api_attempt_id, status="completed")
 
         print(
             "AI画像解析完了:",
@@ -1543,6 +1567,9 @@ def analyze_photo_image_sync(
                     f"{type(usage_error).__name__}: {usage_error}",
                 )
 
+        if "api_attempt_id" in locals():
+            finish_api_attempt(api_attempt_id, status="failed", reason=error_message)
+
         update_image_analysis_status(
             image_id,
             "failed",
@@ -1566,6 +1593,8 @@ def analyze_photo_image_sync(
 
 async def analyze_photo_image(
     image_id: int,
+    *,
+    manual_api: bool = False,
 ) -> dict[str, Any]:
     """
     Discord Botのイベントループを止めずに
@@ -1575,6 +1604,7 @@ async def analyze_photo_image(
     return await asyncio.to_thread(
         analyze_photo_image_sync,
         image_id,
+        manual_api=manual_api,
     )
 
 
@@ -1584,6 +1614,8 @@ async def analyze_photo_image(
 
 async def analyze_pending_images(
     limit: int | None = None,
+    *,
+    manual_api: bool = False,
 ) -> dict[str, Any]:
     """
     ダウンロード済みの未解析画像を
@@ -1618,7 +1650,7 @@ async def analyze_pending_images(
         )
 
         result = await analyze_photo_image(
-            image_id
+            image_id, manual_api=manual_api
         )
 
         results.append(
