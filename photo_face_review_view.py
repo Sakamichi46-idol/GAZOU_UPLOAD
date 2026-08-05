@@ -416,6 +416,7 @@ class FaceReviewView(discord.ui.View):
         self.owner_id = int(owner_id)
         self.message: discord.Message | None = None
         self.finished = False
+        self.candidates = list(candidates or [])
         if candidates:
             self.add_item(CandidateSelect(self, candidates))
 
@@ -447,6 +448,37 @@ class FaceReviewView(discord.ui.View):
             _reviewer(interaction.user),
             note,
         )
+        try:
+            from admin_operations import record_ai_decision, write_audit
+            top = self.candidates[0] if self.candidates else {}
+            suggested_name = _text(top.get("person_name"))
+            confidence = float(top.get("confidence") or 0)
+            if not self.candidates:
+                decision = "no_candidate"
+            elif int(top.get("person_id") or 0) == int(person_id):
+                decision = "accepted"
+            else:
+                decision = "corrected"
+            await asyncio.to_thread(
+                record_ai_decision,
+                interaction.user.id,
+                int(self.review.get("image_id") or 0),
+                int(self.review["face_id"]),
+                decision,
+                suggested_person=suggested_name,
+                confirmed_person=person_name,
+                confidence=confidence,
+            )
+            await asyncio.to_thread(
+                write_audit,
+                interaction.user.id,
+                "face_person_confirm",
+                target_type="face",
+                target_id=int(self.review["face_id"]),
+                detail=f"{suggested_name or '候補なし'} -> {person_name} ({decision})",
+            )
+        except Exception:
+            LOGGER.exception("AI判断・監査ログの保存に失敗しました")
         self.finished = True
         self.stop()
         embed = build_completed_embed(self.review, person_name, interaction.user)
