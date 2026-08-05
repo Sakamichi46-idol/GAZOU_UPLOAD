@@ -3341,6 +3341,22 @@ def set_confirmed_image_people(image_id: int, person_names: list[str], *, confir
                review_note=?, reviewed_at=?, updated_at=? WHERE image_id=?""",
             ("、".join(names), confirmed_by, note, now, now, image_id),
         )
+        # 管理者運用ダッシュボードの監査ログが導入済みなら、
+        # すべての人物確定経路を中央で記録する。
+        audit_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='photo_admin_audit_log'"
+        ).fetchone()
+        if audit_exists:
+            connection.execute(
+                """INSERT INTO photo_admin_audit_log(
+                       admin_user_id, action_type, target_type, target_id, detail, created_at
+                   ) VALUES(0, 'image_people_confirm', 'image', ?, ?, ?)""",
+                (
+                    str(image_id),
+                    f"reviewer={confirmed_by}; people={'、'.join(names) or '人物なし'}; note={note}"[:2000],
+                    now,
+                ),
+            )
         connection.commit()
 
 
