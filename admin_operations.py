@@ -1,0 +1,519 @@
+"""管理者向け運用ダッシュボード。
+
+既存の管理ワークフローを壊さず、状態把握、前回作業の再開、
+エラー再試行、AI候補の実測状況、監査ログ、人物マスター管理、
+DB健全性確認を一か所へ集約する。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from contextlib import closing
+from datetime import datetime, timezone
+from typing import Any
+
+import discord
+from discord.ext import commands
+
+from photo_database import get_connection
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _table_exists(con, table: str) -> bool:
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _columns(con, table: str) -> set[str]:
+    if not _table_exists(con, table):
+        return set()
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def init_admin_operations_schema() -> None:
+    with closing(get_connection()) as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS photo_admin_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL DEFAULT 0,
+                action_type TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_photo_admin_audit_time
+              ON photo_admin_audit_log(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS photo_ai_decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL DEFAULT 0,
+                image_id INTEGER NOT NULL DEFAULT 0,
+                face_id INTEGER NOT NULL DEFAULT 0,
+                decision TEXT NOT NULL,
+                suggested_person TEXT NOT NULL DEFAULT '',
+                confirmed_person TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_photo_ai_decision_time
+              ON photo_ai_decision_log(created_at DESC);
+            """
+        )
+        con.commit()
+
+
+def write_audit(
+    admin_user_id: int,
+    action_type: str,
+    *,
+    target_type: str = "",
+    target_id: str | int = "",
+    detail: str = "",
+) -> None:
+    init_admin_operations_schema()
+    with closing(get_connection()) as con:
+        con.execute(
+            """INSERT INTO photo_admin_audit_log(
+                   admin_user_id,action_type,target_type,target_id,detail,created_at
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                int(admin_user_id),
+                str(action_type)[:100],
+                str(target_type)[:100],
+                str(target_id)[:200],
+                str(detail)[:2000],
+                _now(),
+            ),
+        )
+        con.commit()
+
+
+def _scalar(con, sql: str, params: tuple[Any, ...] = ()) -> int:
+    try:
+        row = con.execute(sql, params).fetchone()
+        return int(row[0] or 0) if row else 0
+    except Exception:
+        return 0
+
+
+def get_admin_dashboard_stats() -> dict[str, int]:
+    init_admin_operations_schema()
+    with closing(get_connection()) as con:
+        stats = {
+            "images": _scalar(con, "SELECT COUNT(*) FROM photo_images") if _table_exists(con, "photo_images") else 0,
+            "blogs": _scalar(con, "SELECT COUNT(*) FROM photo_blogs") if _table_exists(con, "photo_blogs") else 0,
+            "people": _scalar(con, "SELECT COUNT(*) FROM photo_people") if _table_exists(con, "photo_people") else 0,
+            "faces": _scalar(con, "SELECT COUNT(*) FROM photo_faces") if _table_exists(con, "photo_faces") else 0,
+            "embeddings": _scalar(con, "SELECT COUNT(*) FROM photo_faces WHERE TRIM(COALESCE(face_embedding,''))<>''") if _table_exists(con, "photo_faces") else 0,
+            "confirmed_faces": _scalar(con, "SELECT COUNT(*) FROM photo_faces WHERE confirmed_person_id IS NOT NULL") if _table_exists(con, "photo_faces") else 0,
+            "pending_reviews": _scalar(con, "SELECT COUNT(*) FROM photo_review_queue WHERE status='pending'") if _table_exists(con, "photo_review_queue") else 0,
+            "skipped_reviews": _scalar(con, "SELECT COUNT(*) FROM photo_review_queue WHERE status='skipped'") if _table_exists(con, "photo_review_queue") else 0,
+            "download_errors": _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE download_status='failed'") if _table_exists(con, "photo_images") else 0,
+            "analysis_errors": _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE analysis_status='failed'") if _table_exists(con, "photo_images") else 0,
+            "face_errors": _scalar(con, "SELECT COUNT(*) FROM photo_face_scans WHERE status='failed'") if _table_exists(con, "photo_face_scans") else 0,
+            "storage_pending": _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE download_status='pending'") if _table_exists(con, "photo_images") else 0,
+            "analysis_pending": _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE analysis_status='pending'") if _table_exists(con, "photo_images") else 0,
+            "face_pending": _scalar(con, "SELECT COUNT(*) FROM photo_face_scans WHERE status='pending'") if _table_exists(con, "photo_face_scans") else 0,
+        }
+        if _table_exists(con, "community_feedback"):
+            cols = _columns(con, "community_feedback")
+            status_col = "status" if "status" in cols else None
+            stats["feedback_pending"] = _scalar(con, "SELECT COUNT(*) FROM community_feedback WHERE status='pending'") if status_col else 0
+        else:
+            stats["feedback_pending"] = 0
+    stats["errors"] = stats["download_errors"] + stats["analysis_errors"] + stats["face_errors"]
+    return stats
+
+
+def dashboard_embed() -> discord.Embed:
+    s = get_admin_dashboard_stats()
+    embed = discord.Embed(
+        title="📊 管理者運用ダッシュボード",
+        description="優先度の高い作業とシステム状態をまとめて確認できます。",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(
+        name="📷 アーカイブ",
+        value=f"記事 **{s['blogs']:,}**\n画像 **{s['images']:,}**\n人物 **{s['people']:,}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="✅ 人物確認",
+        value=f"未確認 **{s['pending_reviews']:,}**\nスキップ **{s['skipped_reviews']:,}**\n確定顔 **{s['confirmed_faces']:,}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="⚠️ エラー",
+        value=(f"画像取得 **{s['download_errors']:,}**\n"
+               f"AI解析 **{s['analysis_errors']:,}**\n"
+               f"顔認証 **{s['face_errors']:,}**"),
+        inline=True,
+    )
+    embed.add_field(
+        name="⏳ 待機中",
+        value=(f"保存 **{s['storage_pending']:,}**\n"
+               f"AI解析 **{s['analysis_pending']:,}**\n"
+               f"顔認証 **{s['face_pending']:,}**"),
+        inline=True,
+    )
+    embed.add_field(
+        name="🧠 AI学習元",
+        value=f"検出顔 **{s['faces']:,}**\n特徴量 **{s['embeddings']:,}**\n確定済み **{s['confirmed_faces']:,}**",
+        inline=True,
+    )
+    embed.add_field(
+        name="📬 要望箱",
+        value=f"未対応 **{s['feedback_pending']:,}**",
+        inline=True,
+    )
+    embed.set_footer(text="数字は現在のDB状態から取得しています。")
+    return embed
+
+
+def get_ai_quality_stats() -> dict[str, Any]:
+    init_admin_operations_schema()
+    with closing(get_connection()) as con:
+        decisions = _scalar(con, "SELECT COUNT(*) FROM photo_ai_decision_log")
+        accepted = _scalar(con, "SELECT COUNT(*) FROM photo_ai_decision_log WHERE decision='accepted'")
+        corrected = _scalar(con, "SELECT COUNT(*) FROM photo_ai_decision_log WHERE decision='corrected'")
+        no_candidate = _scalar(con, "SELECT COUNT(*) FROM photo_ai_decision_log WHERE decision='no_candidate'")
+        people = []
+        if _table_exists(con, "photo_faces") and _table_exists(con, "photo_people"):
+            people = [dict(r) for r in con.execute(
+                """SELECT pp.person_name,
+                          COUNT(pf.id) AS confirmed_faces,
+                          SUM(CASE WHEN TRIM(COALESCE(pf.face_embedding,''))<>'' THEN 1 ELSE 0 END) AS embeddings,
+                          MAX(pf.confirmed_at) AS last_confirmed_at
+                   FROM photo_people pp
+                   LEFT JOIN photo_faces pf ON pf.confirmed_person_id=pp.id
+                   GROUP BY pp.id
+                   HAVING COUNT(pf.id)>0
+                   ORDER BY confirmed_faces DESC LIMIT 20"""
+            ).fetchall()]
+    rate = round(accepted * 100 / decisions, 1) if decisions else None
+    return {"decisions": decisions, "accepted": accepted, "corrected": corrected,
+            "no_candidate": no_candidate, "acceptance_rate": rate, "people": people}
+
+
+def ai_quality_embed() -> discord.Embed:
+    d = get_ai_quality_stats()
+    rate_text = f"{d['acceptance_rate']:.1f}%" if d["acceptance_rate"] is not None else "未計測"
+    embed = discord.Embed(title="🧠 AI学習・候補品質", color=0x9B59B6)
+    embed.description = (
+        f"候補判定記録 **{d['decisions']:,}件**\n"
+        f"候補どおり **{d['accepted']:,}件** / 修正 **{d['corrected']:,}件** / 候補なし **{d['no_candidate']:,}件**\n"
+        f"実測採用率 **{rate_text}**\n\n"
+        "※ 採用率は記録開始後の管理者判断だけから計算します。"
+    )
+    lines = [
+        f"・{p['person_name']}: 確定 {int(p['confirmed_faces'] or 0):,} / 特徴量 {int(p['embeddings'] or 0):,}"
+        for p in d["people"][:15]
+    ]
+    embed.add_field(name="人物別の学習元", value="\n".join(lines) or "まだデータがありません。", inline=False)
+    return embed
+
+
+def get_health_report() -> dict[str, Any]:
+    required: dict[str, set[str]] = {
+        "photo_images": {"id", "blog_id", "download_status", "analysis_status"},
+        "photo_blogs": {"id", "title", "member_name"},
+        "photo_people": {"id", "person_name"},
+        "photo_faces": {"id", "image_id", "confirmed_person_id", "face_embedding"},
+    }
+    with closing(get_connection()) as con:
+        missing_tables = [t for t in required if not _table_exists(con, t)]
+        missing_columns: list[str] = []
+        for table, cols in required.items():
+            actual = _columns(con, table)
+            for col in sorted(cols - actual):
+                missing_columns.append(f"{table}.{col}")
+        orphan_images = _scalar(con, "SELECT COUNT(*) FROM photo_images i LEFT JOIN photo_blogs b ON b.id=i.blog_id WHERE b.id IS NULL") if _table_exists(con, "photo_images") and _table_exists(con, "photo_blogs") else 0
+        orphan_faces = _scalar(con, "SELECT COUNT(*) FROM photo_faces f LEFT JOIN photo_images i ON i.id=f.image_id WHERE i.id IS NULL") if _table_exists(con, "photo_faces") and _table_exists(con, "photo_images") else 0
+        orphan_people = _scalar(con, "SELECT COUNT(*) FROM photo_faces f LEFT JOIN photo_people p ON p.id=f.confirmed_person_id WHERE f.confirmed_person_id IS NOT NULL AND p.id IS NULL") if _table_exists(con, "photo_faces") and _table_exists(con, "photo_people") else 0
+        duplicate_urls = _scalar(con, "SELECT COUNT(*) FROM (SELECT image_url FROM photo_images WHERE TRIM(COALESCE(image_url,''))<>'' GROUP BY image_url HAVING COUNT(*)>1)") if "image_url" in _columns(con, "photo_images") else 0
+        stale_download = _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE download_status<>'failed' AND TRIM(COALESCE(download_error,''))<>''") if "download_error" in _columns(con, "photo_images") else 0
+        stale_analysis = _scalar(con, "SELECT COUNT(*) FROM photo_images WHERE analysis_status<>'failed' AND TRIM(COALESCE(analysis_error,''))<>''") if "analysis_error" in _columns(con, "photo_images") else 0
+        integrity_row = con.execute("PRAGMA integrity_check").fetchone()
+        integrity = str(integrity_row[0]) if integrity_row else "unknown"
+    return {
+        "missing_tables": missing_tables,
+        "missing_columns": missing_columns,
+        "orphan_images": orphan_images,
+        "orphan_faces": orphan_faces,
+        "orphan_people": orphan_people,
+        "duplicate_urls": duplicate_urls,
+        "stale_errors": stale_download + stale_analysis,
+        "integrity": integrity,
+    }
+
+
+def health_embed() -> discord.Embed:
+    r = get_health_report()
+    problems = len(r["missing_tables"]) + len(r["missing_columns"]) + r["orphan_images"] + r["orphan_faces"] + r["orphan_people"] + r["stale_errors"]
+    embed = discord.Embed(
+        title="🩺 DB・保存データ健全性",
+        color=0x57F287 if problems == 0 and r["integrity"] == "ok" else 0xFEE75C,
+    )
+    embed.add_field(name="SQLite整合性", value=r["integrity"], inline=True)
+    embed.add_field(name="不足テーブル", value=str(len(r["missing_tables"])), inline=True)
+    embed.add_field(name="不足カラム", value=str(len(r["missing_columns"])), inline=True)
+    embed.add_field(name="孤立画像", value=f"{r['orphan_images']:,}", inline=True)
+    embed.add_field(name="孤立顔", value=f"{r['orphan_faces']:,}", inline=True)
+    embed.add_field(name="孤立人物参照", value=f"{r['orphan_people']:,}", inline=True)
+    embed.add_field(name="重複URL群", value=f"{r['duplicate_urls']:,}", inline=True)
+    embed.add_field(name="古いエラー文字", value=f"{r['stale_errors']:,}", inline=True)
+    details = []
+    if r["missing_tables"]:
+        details.append("不足テーブル: " + ", ".join(r["missing_tables"][:10]))
+    if r["missing_columns"]:
+        details.append("不足カラム: " + ", ".join(r["missing_columns"][:15]))
+    if details:
+        embed.add_field(name="詳細", value="\n".join(details)[:1024], inline=False)
+    embed.set_footer(text="この画面は診断のみです。削除や自動修復は行いません。")
+    return embed
+
+
+def record_ai_decision(
+    admin_user_id: int,
+    image_id: int,
+    face_id: int,
+    decision: str,
+    *,
+    suggested_person: str = "",
+    confirmed_person: str = "",
+    confidence: float = 0.0,
+) -> None:
+    init_admin_operations_schema()
+    with closing(get_connection()) as con:
+        con.execute(
+            """INSERT INTO photo_ai_decision_log(
+                   admin_user_id,image_id,face_id,decision,suggested_person,
+                   confirmed_person,confidence,created_at
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                int(admin_user_id), int(image_id), int(face_id), str(decision),
+                str(suggested_person)[:100], str(confirmed_person)[:100],
+                float(confidence or 0), _now(),
+            ),
+        )
+        con.commit()
+
+
+def list_audit(limit: int = 20) -> list[dict[str, Any]]:
+    init_admin_operations_schema()
+    with closing(get_connection()) as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM photo_admin_audit_log ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 50)),),
+        ).fetchall()]
+
+
+def reset_error_type(error_type: str) -> int:
+    now = _now()
+    with closing(get_connection()) as con:
+        if error_type == "download":
+            cur = con.execute("UPDATE photo_images SET download_status='pending',download_error='',updated_at=? WHERE download_status='failed'", (now,))
+        elif error_type == "analysis":
+            cur = con.execute("UPDATE photo_images SET analysis_status='pending',analysis_error='',updated_at=? WHERE analysis_status='failed'", (now,))
+        elif error_type == "face":
+            count = _scalar(con, "SELECT COUNT(*) FROM photo_face_scans WHERE status='failed'") if _table_exists(con, "photo_face_scans") else 0
+            con.execute("DELETE FROM photo_face_scans WHERE status='failed'")
+            con.commit()
+            return count
+        else:
+            return 0
+        con.commit()
+        return max(0, int(cur.rowcount or 0))
+
+
+class ConfirmErrorResetView(discord.ui.View):
+    def __init__(self, owner_id: int, error_type: str, count: int) -> None:
+        super().__init__(timeout=120)
+        self.owner_id = int(owner_id)
+        self.error_type = error_type
+        self.count = int(count)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この確認画面は操作した管理者だけが使えます。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="再試行待ちへ戻す", emoji="♻️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        changed = await asyncio.to_thread(reset_error_type, self.error_type)
+        await asyncio.to_thread(write_audit, interaction.user.id, "error_retry_reset", target_type=self.error_type, target_id="all", detail=f"対象 {self.count} / 更新 {changed}")
+        await interaction.followup.send(f"✅ **{changed:,}件**を再試行待ちへ戻しました。通常ワーカーが順番に処理します。", ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="キャンセルしました。", view=None)
+        self.stop()
+
+
+class ErrorManagementView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("管理者本人だけが操作できます。", ephemeral=True)
+        return False
+
+    async def _confirm(self, interaction: discord.Interaction, kind: str, label: str) -> None:
+        s = await asyncio.to_thread(get_admin_dashboard_stats)
+        count = s[f"{kind}_errors"]
+        if count <= 0:
+            await interaction.response.send_message(f"✅ {label}はありません。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"⚠️ **{label} {count:,}件**を再試行待ちへ戻します。\n復旧不能・不正URLは対象外です。",
+            view=ConfirmErrorResetView(self.owner_id, kind, count),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="画像取得エラー", emoji="💾", style=discord.ButtonStyle.primary)
+    async def download(self, interaction, _):
+        await self._confirm(interaction, "download", "画像取得エラー")
+
+    @discord.ui.button(label="AI解析エラー", emoji="🤖", style=discord.ButtonStyle.primary)
+    async def analysis(self, interaction, _):
+        await self._confirm(interaction, "analysis", "AI解析エラー")
+
+    @discord.ui.button(label="顔認証エラー", emoji="👤", style=discord.ButtonStyle.primary)
+    async def face(self, interaction, _):
+        await self._confirm(interaction, "face", "顔認証エラー")
+
+
+class PersonMasterModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="人物マスターを追加・更新", timeout=300)
+        self.name = discord.ui.TextInput(label="人物名", max_length=80)
+        self.group = discord.ui.TextInput(label="グループ", required=False, max_length=80, placeholder="乃木坂46 / その他")
+        self.generation = discord.ui.TextInput(label="期・区分", required=False, max_length=80, placeholder="5期生 / 卒業生")
+        self.active = discord.ui.TextInput(label="在籍状態", required=False, max_length=10, placeholder="1=在籍、0=卒業・その他", default="1")
+        for item in (self.name, self.group, self.generation, self.active):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = str(self.name.value).strip()
+        if not name:
+            await interaction.response.send_message("人物名を入力してください。", ephemeral=True)
+            return
+        active = 0 if str(self.active.value).strip() in {"0", "false", "卒業"} else 1
+        now = _now()
+        def save() -> None:
+            with closing(get_connection()) as con:
+                con.execute(
+                    """INSERT INTO photo_people(person_name,group_name,generation_name,is_active,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(person_name) DO UPDATE SET
+                         group_name=excluded.group_name,
+                         generation_name=excluded.generation_name,
+                         is_active=excluded.is_active,
+                         updated_at=excluded.updated_at""",
+                    (name, str(self.group.value).strip(), str(self.generation.value).strip(), active, now, now),
+                )
+                con.commit()
+        await asyncio.to_thread(save)
+        await asyncio.to_thread(write_audit, interaction.user.id, "person_master_upsert", target_type="person", target_id=name, detail=f"group={self.group.value}, generation={self.generation.value}, active={active}")
+        await interaction.response.send_message(f"✅ **{name}** の人物マスターを保存しました。", ephemeral=True)
+
+
+class AdminOperationsView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この管理画面は開いた管理者だけが操作できます。", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction, _):
+        await interaction.response.defer()
+        embed = await asyncio.to_thread(dashboard_embed)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    @discord.ui.button(label="前回の続き", emoji="⏯️", style=discord.ButtonStyle.success)
+    async def resume(self, interaction, _):
+        from admin_workflow import BlogDashboardView
+        await interaction.response.send_message(
+            "⏯️ **前回の続きから再開**\n投稿者を選ぶと、保存済みのページ・絞り込み・最後の記事へ戻れます。",
+            view=BlogDashboardView(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="連続人物確認", emoji="✅", style=discord.ButtonStyle.success)
+    async def review(self, interaction, _):
+        from control_panel import invoke_existing_command
+        await invoke_existing_command(interaction, "review_panel", "1", admin_required=True)
+
+    @discord.ui.button(label="エラー管理", emoji="⚠️", style=discord.ButtonStyle.danger)
+    async def errors(self, interaction, _):
+        await interaction.response.send_message("再試行するエラー種別を選んでください。", view=ErrorManagementView(self.owner_id), ephemeral=True)
+
+    @discord.ui.button(label="AI学習状況", emoji="🧠", style=discord.ButtonStyle.secondary)
+    async def ai(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(embed=await asyncio.to_thread(ai_quality_embed), ephemeral=True)
+
+    @discord.ui.button(label="監査ログ", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def audit(self, interaction, _):
+        rows = await asyncio.to_thread(list_audit, 20)
+        text = "\n".join(
+            f"`{r['id']}` <@{r['admin_user_id']}> **{r['action_type']}** {r['target_type']}:{r['target_id']}\n{str(r['detail'])[:180]}"
+            for r in rows
+        ) or "監査ログはまだありません。"
+        await interaction.response.send_message(embed=discord.Embed(title="📜 最近の管理操作", description=text[:4000], color=0x95A5A6), ephemeral=True)
+
+    @discord.ui.button(label="人物マスター", emoji="👥", style=discord.ButtonStyle.secondary)
+    async def people(self, interaction, _):
+        await interaction.response.send_modal(PersonMasterModal())
+
+    @discord.ui.button(label="健全性チェック", emoji="🩺", style=discord.ButtonStyle.secondary)
+    async def health(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(embed=await asyncio.to_thread(health_embed), ephemeral=True)
+
+
+async def send_admin_operations(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    embed = await asyncio.to_thread(dashboard_embed)
+    await interaction.followup.send(embed=embed, view=AdminOperationsView(interaction.user.id), ephemeral=True)
+
+
+def register_admin_operations_commands(bot: commands.Bot) -> None:
+    init_admin_operations_schema()
+
+    @bot.command(name="admin_dashboard")
+    @commands.is_owner()
+    async def admin_dashboard(ctx: commands.Context) -> None:
+        await ctx.send(embed=await asyncio.to_thread(dashboard_embed), view=AdminOperationsView(ctx.author.id))
+
+    @bot.command(name="admin_health")
+    @commands.is_owner()
+    async def admin_health(ctx: commands.Context) -> None:
+        await ctx.send(embed=await asyncio.to_thread(health_embed))
+
+    @bot.command(name="admin_audit")
+    @commands.is_owner()
+    async def admin_audit(ctx: commands.Context, limit: int = 20) -> None:
+        rows = await asyncio.to_thread(list_audit, limit)
+        text = "\n".join(f"{r['id']}: {r['action_type']} {r['target_type']}:{r['target_id']} - {str(r['detail'])[:120]}" for r in rows) or "ログなし"
+        await ctx.send(f"```\n{text[:1900]}\n```")
