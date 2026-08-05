@@ -36,6 +36,7 @@ from photo_ai_analyzer import (
     analyze_photo_image,
     get_photo_ai_status,
 )
+from ai_cost_control import get_ai_cost_status
 from photo_database import (
     get_photo_db_counts,
     get_photo_storage_stats,
@@ -2442,6 +2443,12 @@ async def ai_analysis_loop() -> None:
     status = get_photo_ai_status()
 
     if not status.get("enabled"):
+        return
+
+    # 節約モードで自動APIがOFFの間は、pending画像を毎分読み直さない。
+    # 状態は管理者ダッシュボードから確認し、手動解析時だけキューを処理する。
+    cost_status = get_ai_cost_status()
+    if not int(cost_status.get("auto_api_enabled", 0)) or int(cost_status.get("is_paused", 0)):
         return
 
     result = await run_ai_analysis_batch(
