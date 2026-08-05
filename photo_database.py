@@ -4261,6 +4261,83 @@ HIDDEN_REASON_LABELS = {
 }
 
 
+def get_photo_blog_for_admin_edit(blog_id: int) -> dict[str, Any] | None:
+    """管理者編集用に、除外状態を問わずブログ情報と関連画像数を返す。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT pb.*, COUNT(DISTINCT pi.id) AS image_count
+            FROM photo_blogs pb
+            LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+            WHERE pb.id = ?
+            GROUP BY pb.id
+            """,
+            (int(blog_id),),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_photo_blog_info_for_admin(
+    blog_id: int,
+    *,
+    group_name: str | None = None,
+    member_name: str | None = None,
+    title: str | None = None,
+    published_at: str | None = None,
+    restore_if_hidden: bool = False,
+) -> dict[str, Any] | None:
+    """ブログ情報を安全に更新し、変更前後と関連画像数を返す。
+
+    ``None`` の項目は変更しない。投稿者を設定して復元する場合は
+    ``restore_if_hidden=True`` を指定する。
+    """
+    before = get_photo_blog_for_admin_edit(int(blog_id))
+    if not before:
+        return None
+
+    assignments: list[str] = []
+    params: list[Any] = []
+    for column, value, max_len in (
+        ("group_name", group_name, 100),
+        ("member_name", member_name, 100),
+        ("title", title, 500),
+        ("published_at", published_at, 100),
+    ):
+        if value is not None:
+            assignments.append(f"{column} = ?")
+            params.append(str(value).strip()[:max_len])
+
+    if restore_if_hidden:
+        assignments.extend([
+            "is_hidden = 0",
+            "hidden_reason = ''",
+            "hidden_note = ''",
+            "hidden_at = ''",
+            "hidden_by = ''",
+        ])
+
+    if not assignments:
+        return {"before": before, "after": before, "image_count": int(before.get("image_count") or 0)}
+
+    assignments.append("updated_at = ?")
+    params.append(utc_now_text())
+    params.append(int(blog_id))
+
+    with closing(get_connection()) as connection:
+        connection.execute(
+            f"UPDATE photo_blogs SET {', '.join(assignments)} WHERE id = ?",
+            tuple(params),
+        )
+        connection.commit()
+
+    after = get_photo_blog_for_admin_edit(int(blog_id))
+    return {
+        "before": before,
+        "after": after or {},
+        "image_count": int((after or before).get("image_count") or 0),
+    }
+
+
 def hide_photo_blog(
     blog_id: int,
     reason: str,
