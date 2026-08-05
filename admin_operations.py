@@ -15,7 +15,11 @@ from typing import Any
 import discord
 from discord.ext import commands
 from embed_safety import safe_add_field
-from ai_cost_control import get_ai_cost_status, update_ai_cost_settings
+from ai_cost_control import (
+    get_ai_cost_status,
+    simulate_pending_api_usage,
+    update_ai_cost_settings,
+)
 
 from photo_database import (
     get_photo_blog_for_admin_edit,
@@ -726,6 +730,66 @@ def ai_savings_embed() -> discord.Embed:
     return embed
 
 
+def ai_simulation_embed(limit: int = 500) -> discord.Embed:
+    result = simulate_pending_api_usage(limit)
+    embed = discord.Embed(
+        title="🧮 API送信シミュレーション",
+        description=(
+            "APIは呼び出していません。未解析画像をDB上で分類した結果です。\n"
+            f"確認範囲: **{result['inspected']:,}件** / 未解析全体 **{result['total_pending']:,}件**"
+        ),
+        color=0x3498DB,
+    )
+    safe_add_field(
+        embed,
+        name="無料で処理できるもの",
+        value=(
+            f"キャッシュ再利用 **{result['cache_reuse']:,}件**\n"
+            f"ローカル顔判定 **{result['local_face_decision']:,}件**\n"
+            "※ローカル顔判定は人物確認用の別工程で、画像タグ解析の代替にはまだ含めていません。"
+        ),
+        inline=False,
+    )
+    safe_add_field(
+        embed,
+        name="API候補",
+        value=(
+            f"API送信候補 **{result['api_candidates']:,}件**\n"
+            f"現在の設定で送信可能 **{result['api_sendable_now']:,}件**\n"
+            f"設定・上限により停止 **{result['api_blocked']:,}件**"
+        ),
+        inline=True,
+    )
+    safe_add_field(
+        embed,
+        name="残り上限",
+        value=(
+            f"本日 **{result['daily_remaining']:,}枚**\n"
+            f"今月 **{result['monthly_remaining']:,}枚**"
+        ),
+        inline=True,
+    )
+    if result['no_hash']:
+        safe_add_field(
+            embed,
+            name="画像ハッシュ未作成",
+            value=f"**{result['no_hash']:,}件**はキャッシュ判定ができないためAPI候補として数えています。",
+            inline=False,
+        )
+    if result['reasons']:
+        safe_add_field(
+            embed,
+            name="現在送信しない理由",
+            value="\n".join(f"・{x}" for x in result['reasons']),
+            inline=False,
+        )
+    if result['truncated']:
+        embed.set_footer(text=f"安全のため先頭{result['limit']:,}件だけを確認しています。API送信はしていません。")
+    else:
+        embed.set_footer(text="この画面は確認専用です。API送信はしていません。")
+    return embed
+
+
 class AICostLimitModal(discord.ui.Modal):
     def __init__(self) -> None:
         super().__init__(title="AI API上限を変更", timeout=300)
@@ -776,6 +840,12 @@ class AISavingsView(discord.ui.View):
         await asyncio.to_thread(update_ai_cost_settings, is_paused=1, pause_reason='管理者が手動停止しました。')
         write_audit(interaction.user.id, "ai_pause", target_type="settings")
         await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+
+    @discord.ui.button(label="APIシミュレーション", emoji="🧮", style=discord.ButtonStyle.primary)
+    async def simulation(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        embed = await asyncio.to_thread(ai_simulation_embed, 500)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class AdminOperationsView(discord.ui.View):
