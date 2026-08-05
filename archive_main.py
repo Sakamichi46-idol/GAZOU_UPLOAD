@@ -64,6 +64,7 @@ from photo_archive_runner import (
 from photo_commands import register_photo_commands
 from community_features import register_community_commands, init_community_schema
 from user_experience import register_user_experience_commands, init_user_experience_schema
+from admin_operations import register_admin_operations_commands, init_admin_operations_schema
 from control_panel import (
     add_persistent_control_panel_views,
     register_control_panel,
@@ -87,6 +88,7 @@ bot = commands.Bot(
 register_photo_commands(bot)
 register_community_commands(bot)
 register_user_experience_commands(bot)
+register_admin_operations_commands(bot)
 register_control_panel(bot)
 
 # =========================
