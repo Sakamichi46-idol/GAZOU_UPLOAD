@@ -257,6 +257,22 @@ class AICenterView(discord.ui.View):
     async def sets(self, interaction, _):
         await interaction.response.send_message(embed=await asyncio.to_thread(person_sets_embed), ephemeral=True)
 
+    @discord.ui.button(label="保留理由", emoji="⏸️", style=discord.ButtonStyle.secondary)
+    async def holds(self, interaction, _):
+        await _send_ai_db_list(interaction, "holds")
+
+    @discord.ui.button(label="仮確定", emoji="🧪", style=discord.ButtonStyle.secondary)
+    async def provisional(self, interaction, _):
+        await _send_ai_db_list(interaction, "provisional")
+
+    @discord.ui.button(label="変更履歴", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def snapshots(self, interaction, _):
+        await _send_ai_db_list(interaction, "snapshots")
+
+    @discord.ui.button(label="AI判定履歴", emoji="📜", style=discord.ButtonStyle.secondary)
+    async def decisions(self, interaction, _):
+        await _send_ai_db_list(interaction, "decisions")
+
     @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.success)
     async def refresh(self, interaction, _):
         await interaction.response.edit_message(embed=await asyncio.to_thread(ai_center_embed), view=self)
@@ -265,3 +281,117 @@ class AICenterView(discord.ui.View):
 async def send_ai_center(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
     await interaction.followup.send(embed=await asyncio.to_thread(ai_center_embed), view=AICenterView(interaction.user.id), ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# AI育成センター Phase 2: DBだけで閲覧できる管理一覧
+# ---------------------------------------------------------------------------
+
+def _safe_json_list(value: object) -> list[str]:
+    try:
+        parsed = json.loads(str(value or "[]"))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x).strip() for x in parsed if str(x).strip()]
+
+
+def _paged_rows(table: str, columns: str, order_by: str, page: int, page_size: int = 20):
+    page_size = max(1, min(int(page_size), 25))
+    page = max(0, int(page))
+    with closing(get_connection()) as con:
+        total = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] or 0)
+        rows = con.execute(
+            f"SELECT {columns} FROM {table} ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (page_size, page * page_size),
+        ).fetchall()
+    return total, rows
+
+
+class AIDBListView(discord.ui.View):
+    """AI育成関連のDB一覧を25件上限で安全にページ表示する。"""
+
+    def __init__(self, owner_id: int, kind: str, page: int = 0) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.kind = str(kind)
+        self.page = max(0, int(page))
+        self.page_size = 20
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("この画面は開いた管理者だけが操作できます。", ephemeral=True)
+        return False
+
+    def _load(self):
+        init_advanced_admin_schema()
+        if self.kind == "sets":
+            return _paged_rows("photo_person_sets", "id,set_name,people_json,updated_at", "updated_at DESC", self.page, self.page_size)
+        if self.kind == "holds":
+            return _paged_rows("photo_review_hold_reasons", "image_id,reason_code,note,updated_at", "updated_at DESC", self.page, self.page_size)
+        if self.kind == "provisional":
+            return _paged_rows("photo_provisional_people", "image_id,person_name,source,confidence,created_at", "created_at DESC", self.page, self.page_size)
+        if self.kind == "snapshots":
+            return _paged_rows("photo_admin_change_snapshots", "id,action_type,target_type,target_id,restored_at,created_at", "id DESC", self.page, self.page_size)
+        with closing(get_connection()) as con:
+            exists = _table_exists(con, "photo_ai_decision_log")
+        if not exists:
+            return 0, []
+        return _paged_rows("photo_ai_decision_log", "id,image_id,decision,suggested_person,confirmed_person,created_at", "id DESC", self.page, self.page_size)
+
+    def embed(self) -> discord.Embed:
+        total, rows = self._load()
+        names = {
+            "sets": "👥 人物セット",
+            "holds": "⏸️ 保留理由",
+            "provisional": "🧪 仮確定",
+            "snapshots": "↩️ 変更スナップショット",
+            "decisions": "📜 AI判定履歴",
+        }
+        lines: list[str] = []
+        for row in rows:
+            values = tuple(row)
+            if self.kind == "sets":
+                lines.append(f"`#{values[0]}` **{values[1]}**\n{'、'.join(_safe_json_list(values[2])) or '人物なし'}")
+            elif self.kind == "holds":
+                lines.append(f"画像ID `{values[0]}`  **{values[1]}**\n{str(values[2] or 'メモなし')[:160]}")
+            elif self.kind == "provisional":
+                confidence = float(values[3] or 0)
+                lines.append(f"画像ID `{values[0]}`  **{values[1]}**\n出所: {values[2]} / 信頼値: {confidence:.3f}")
+            elif self.kind == "snapshots":
+                state = "復元済み" if str(values[4] or '') else "未復元"
+                lines.append(f"`#{values[0]}` **{values[1]}**  {state}\n{values[2]}:{values[3]}")
+            else:
+                lines.append(f"`#{values[0]}` 画像ID `{values[1]}` **{values[2]}**\nAI: {str(values[3] or '')[:100]}\n確定: {str(values[4] or '')[:100]}")
+        start = self.page * self.page_size + 1 if total else 0
+        end = min(total, (self.page + 1) * self.page_size)
+        e = discord.Embed(
+            title=names.get(self.kind, "AI管理一覧"),
+            description="\n\n".join(lines)[:4000] or "該当データはありません。",
+            color=0x5865F2,
+        )
+        e.set_footer(text=f"表示 {start}〜{end}件 / 全{total}件  |  {self.page + 1}/{max(1, (total + self.page_size - 1)//self.page_size)}ページ")
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = end >= total
+        return e
+
+    @discord.ui.button(label="前のページ", emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, _):
+        self.page = max(0, self.page - 1)
+        await interaction.response.edit_message(embed=await asyncio.to_thread(self.embed), view=self)
+
+    @discord.ui.button(label="次のページ", emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction, _):
+        self.page += 1
+        await interaction.response.edit_message(embed=await asyncio.to_thread(self.embed), view=self)
+
+    @discord.ui.button(label="AI育成センターへ", emoji="↩️", style=discord.ButtonStyle.primary)
+    async def back(self, interaction, _):
+        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_center_embed), view=AICenterView(self.owner_id))
+
+
+async def _send_ai_db_list(interaction: discord.Interaction, kind: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    view = AIDBListView(interaction.user.id, kind)
+    await interaction.followup.send(embed=await asyncio.to_thread(view.embed), view=view, ephemeral=True)
