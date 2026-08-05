@@ -750,6 +750,59 @@ def init_photo_db() -> None:
             "TEXT NOT NULL DEFAULT 'local'",
         )
 
+        ensure_column(
+            connection,
+            "photo_blogs",
+            "is_hidden",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+
+        ensure_column(
+            connection,
+            "photo_blogs",
+            "hidden_reason",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        ensure_column(
+            connection,
+            "photo_blogs",
+            "hidden_note",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        ensure_column(
+            connection,
+            "photo_blogs",
+            "hidden_at",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        ensure_column(
+            connection,
+            "photo_blogs",
+            "hidden_by",
+            "TEXT NOT NULL DEFAULT ''",
+        )
+
+        # 日向坂46で投稿者情報が欠けている既存レコードは、削除せず除外へ移す。
+        connection.execute(
+            """
+            UPDATE photo_blogs
+            SET is_hidden = 1,
+                hidden_reason = CASE WHEN TRIM(COALESCE(hidden_reason, '')) = ''
+                                     THEN 'UNKNOWN_MEMBER' ELSE hidden_reason END,
+                hidden_note = CASE WHEN TRIM(COALESCE(hidden_note, '')) = ''
+                                   THEN '日向坂46の投稿者不明レコードを自動除外' ELSE hidden_note END,
+                hidden_at = CASE WHEN TRIM(COALESCE(hidden_at, '')) = ''
+                                 THEN ? ELSE hidden_at END
+            WHERE group_name = '日向坂46'
+              AND TRIM(COALESCE(member_name, '')) IN ('', '不明', '投稿者不明')
+              AND COALESCE(is_hidden, 0) = 0
+            """,
+            (utc_now_text(),),
+        )
+
         # =========================
         # 検索高速化用インデックス
         # =========================
@@ -759,6 +812,13 @@ def init_photo_db() -> None:
             CREATE INDEX IF NOT EXISTS
             idx_photo_blogs_group
             ON photo_blogs(group_name)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_photo_blogs_hidden
+            ON photo_blogs(is_hidden, hidden_reason, group_name, member_name)
             """
         )
 
@@ -4042,6 +4102,7 @@ def get_person_reviews_by_status(
                 ON photo_ai_analysis.image_id = photo_images.id
             WHERE photo_review_queue.status = ?
               AND photo_review_queue.review_type = 'person_identity'
+              AND COALESCE(photo_blogs.is_hidden, 0) = 0
               {extra_filter}
             ORDER BY photo_blogs.id ASC, photo_images.image_index ASC, photo_review_queue.id ASC
             LIMIT ?
@@ -4183,6 +4244,157 @@ def get_previous_confirmed_people_in_blog(blog_id: int, image_index: int) -> lis
             (int(row['id']),),
         ).fetchall()
     return [str(item['person_name']).strip() for item in names if str(item['person_name']).strip()]
+
+
+# =========================
+# ブログ除外管理
+# =========================
+
+HIDDEN_REASON_LABELS = {
+    "UNKNOWN_MEMBER": "投稿者不明",
+    "INVALID_URL": "URL異常",
+    "NO_IMAGES": "画像なし",
+    "SCRAPE_ERROR": "取得・解析失敗",
+    "NOT_A_BLOG": "ブログ以外のデータ",
+    "DUPLICATE": "重複データ",
+    "MANUAL_HIDE": "管理者による除外",
+}
+
+
+def hide_photo_blog(
+    blog_id: int,
+    reason: str,
+    *,
+    hidden_by: str = "",
+    note: str = "",
+) -> bool:
+    """記事データを削除せず、管理者の人物確認対象から除外する。"""
+    clean_reason = str(reason or "MANUAL_HIDE").strip().upper()
+    if clean_reason not in HIDDEN_REASON_LABELS:
+        clean_reason = "MANUAL_HIDE"
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        cur = connection.execute(
+            """
+            UPDATE photo_blogs
+            SET is_hidden = 1,
+                hidden_reason = ?,
+                hidden_note = ?,
+                hidden_at = ?,
+                hidden_by = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (clean_reason, str(note or "")[:500], now, str(hidden_by or "")[:100], now, int(blog_id)),
+        )
+        connection.commit()
+        return int(cur.rowcount or 0) > 0
+
+
+def restore_hidden_photo_blog(blog_id: int) -> bool:
+    """除外済み記事を人物確認対象へ戻す。"""
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        cur = connection.execute(
+            """
+            UPDATE photo_blogs
+            SET is_hidden = 0,
+                hidden_reason = '',
+                hidden_note = '',
+                hidden_at = '',
+                hidden_by = '',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, int(blog_id)),
+        )
+        connection.commit()
+        return int(cur.rowcount or 0) > 0
+
+
+def list_hidden_photo_blogs(limit: int = 25, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+    safe_limit = max(1, min(int(limit), 25))
+    safe_offset = max(0, int(offset))
+    with closing(get_connection()) as connection:
+        total_row = connection.execute(
+            "SELECT COUNT(*) AS total FROM photo_blogs WHERE COALESCE(is_hidden, 0) = 1"
+        ).fetchone()
+        rows = connection.execute(
+            """
+            SELECT pb.*,
+                   COUNT(DISTINCT pi.id) AS image_count,
+                   SUM(CASE WHEN pi.download_status = 'failed' THEN 1 ELSE 0 END) AS download_errors,
+                   SUM(CASE WHEN pi.analysis_status = 'failed' THEN 1 ELSE 0 END) AS analysis_errors
+            FROM photo_blogs pb
+            LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+            WHERE COALESCE(pb.is_hidden, 0) = 1
+            GROUP BY pb.id
+            ORDER BY CASE WHEN pb.hidden_at = '' THEN 1 ELSE 0 END, pb.hidden_at DESC, pb.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (safe_limit, safe_offset),
+        ).fetchall()
+    return rows_to_dicts(rows), int(total_row["total"] if total_row else 0)
+
+
+def get_hidden_photo_blog(blog_id: int) -> dict[str, Any] | None:
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT pb.*,
+                   COUNT(DISTINCT pi.id) AS image_count,
+                   SUM(CASE WHEN pi.download_status = 'failed' THEN 1 ELSE 0 END) AS download_errors,
+                   SUM(CASE WHEN pi.analysis_status = 'failed' THEN 1 ELSE 0 END) AS analysis_errors
+            FROM photo_blogs pb
+            LEFT JOIN photo_images pi ON pi.blog_id = pb.id
+            WHERE pb.id = ? AND COALESCE(pb.is_hidden, 0) = 1
+            GROUP BY pb.id
+            """,
+            (int(blog_id),),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def queue_hidden_blog_reanalysis(blog_id: int) -> dict[str, int]:
+    """除外状態を保ったまま、取得・AI解析を再試行待ちへ戻す。"""
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        download = connection.execute(
+            """
+            UPDATE photo_images
+            SET download_status = CASE
+                    WHEN download_status IN ('failed', 'pending') THEN 'pending'
+                    ELSE download_status END,
+                download_error = CASE WHEN download_status = 'failed' THEN '' ELSE download_error END,
+                updated_at = ?
+            WHERE blog_id = ? AND download_status NOT IN ('invalid_url', 'permanent_failed')
+            """,
+            (now, int(blog_id)),
+        )
+        analysis = connection.execute(
+            """
+            UPDATE photo_images
+            SET analysis_status = 'pending', analysis_error = '', updated_at = ?
+            WHERE blog_id = ? AND download_status = 'completed'
+            """,
+            (now, int(blog_id)),
+        )
+        connection.commit()
+    return {"download": max(0, int(download.rowcount or 0)), "analysis": max(0, int(analysis.rowcount or 0))}
+
+
+def delete_hidden_photo_blog(blog_id: int) -> bool:
+    """除外済み記事だけを完全削除する。画像・関連行も外部キーで削除される。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            "SELECT id FROM photo_blogs WHERE id = ? AND COALESCE(is_hidden, 0) = 1",
+            (int(blog_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        cur = connection.execute("DELETE FROM photo_blogs WHERE id = ?", (int(blog_id),))
+        connection.commit()
+        return int(cur.rowcount or 0) > 0
 
 # =========================
 # 単体実行テスト
@@ -4670,7 +4882,7 @@ def get_blog_authors_for_admin(group_name: str = '', limit: int = 500) -> list[d
     """
     group_name = str(group_name or '').strip()
     params: list[Any] = []
-    where = "WHERE TRIM(COALESCE(pb.member_name, '')) <> '' AND TRIM(COALESCE(pb.member_name, '')) NOT IN ('不明', '投稿者不明')"
+    where = "WHERE COALESCE(pb.is_hidden, 0) = 0 AND TRIM(COALESCE(pb.member_name, '')) <> '' AND TRIM(COALESCE(pb.member_name, '')) NOT IN ('不明', '投稿者不明')"
     if group_name:
         where += " AND pb.group_name = ?"
         params.append(group_name)
@@ -4755,7 +4967,7 @@ def get_blogs_for_admin_filtered(
     """
     safe_limit = max(1, min(int(limit), 25))
     safe_offset = max(0, int(offset))
-    filters = ["pb.group_name = ?", "pb.member_name = ?"]
+    filters = ["COALESCE(pb.is_hidden, 0) = 0", "pb.group_name = ?", "pb.member_name = ?"]
     params: list[Any] = [str(group_name), str(member_name)]
 
     if year:
@@ -5025,6 +5237,7 @@ def get_latest_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     """最新記事を人物確認進捗付きで返す。"""
     safe_limit = max(1, min(int(limit), 25))
     sql = _blog_admin_progress_select() + """
+        WHERE COALESCE(pb.is_hidden, 0) = 0
         GROUP BY pb.id
         ORDER BY
             CASE WHEN pb.published_at = '' THEN 1 ELSE 0 END,
@@ -5041,6 +5254,7 @@ def get_unprocessed_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     """人物確認が未完了の記事を返す。"""
     safe_limit = max(1, min(int(limit), 25))
     sql = _blog_admin_progress_select() + """
+        WHERE COALESCE(pb.is_hidden, 0) = 0
         GROUP BY pb.id
         HAVING COUNT(DISTINCT pi.id) > 0
            AND COUNT(DISTINCT CASE
@@ -5062,6 +5276,7 @@ def get_error_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     """画像取得・AI解析・顔認証にエラーがある記事を返す。"""
     safe_limit = max(1, min(int(limit), 25))
     sql = _blog_admin_progress_select() + """
+        WHERE COALESCE(pb.is_hidden, 0) = 0
         GROUP BY pb.id
         HAVING COUNT(DISTINCT CASE
                 WHEN pi.download_status = 'failed'
