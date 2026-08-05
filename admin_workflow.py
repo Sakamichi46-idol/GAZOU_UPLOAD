@@ -1335,7 +1335,7 @@ class BlogArticleView(AdminWorkflowView):
         for image_id in ids:
             try:
                 if mode == "ai":
-                    result = await analyze_photo_image(image_id)
+                    result = await analyze_photo_image(image_id, manual_api=True)
                     if result.get("status") == "review":
                         review += 1
                     elif result.get("status") == "completed":
