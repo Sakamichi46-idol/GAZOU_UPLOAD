@@ -197,3 +197,98 @@ def finish_api_attempt(attempt_id: int, *, status: str, reason: str = "") -> Non
             (str(status)[:40], str(reason)[:500], int(attempt_id)),
         )
         con.commit()
+
+
+def simulate_pending_api_usage(limit: int = 500) -> dict[str, Any]:
+    """未解析画像をAPIへ送らずに分類する。
+
+    キャッシュ再利用可能数と、実際にAPI送信候補になる枚数をSQLiteだけで計算する。
+    ローカル顔認識は人物確認用の別処理なので、この画像タグ解析シミュレーションには
+    含めず、誤解を避けるため0件として明示する。
+    """
+    init_ai_cost_control_schema()
+    safe_limit = max(1, min(int(limit or 500), 5000))
+    status = get_ai_cost_status()
+    with closing(get_connection()) as con:
+        rows = con.execute(
+            """
+            SELECT i.id, TRIM(COALESCE(i.image_hash,'')) AS image_hash
+            FROM photo_images i
+            JOIN photo_blogs b ON b.id=i.blog_id
+            WHERE i.download_status='completed'
+              AND i.analysis_status='pending'
+              AND (COALESCE(i.local_path,'')<>'' OR COALESCE(i.bucket_key,'')<>'')
+              AND COALESCE(b.is_hidden,0)=0
+            ORDER BY i.id ASC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+        total_pending = int(con.execute(
+            """SELECT COUNT(*) FROM photo_images i
+               JOIN photo_blogs b ON b.id=i.blog_id
+               WHERE i.download_status='completed'
+                 AND i.analysis_status='pending'
+                 AND (COALESCE(i.local_path,'')<>'' OR COALESCE(i.bucket_key,'')<>'')
+                 AND COALESCE(b.is_hidden,0)=0"""
+        ).fetchone()[0] or 0)
+
+        cache_count = 0
+        no_hash_count = 0
+        for row in rows:
+            image_id = int(row[0])
+            image_hash = str(row[1] or '')
+            if not image_hash:
+                no_hash_count += 1
+                continue
+            reusable = con.execute(
+                """SELECT 1
+                   FROM photo_images source
+                   JOIN photo_ai_analysis a ON a.image_id=source.id
+                   WHERE source.id<>? AND source.image_hash=?
+                     AND source.analysis_status IN ('completed','review')
+                   LIMIT 1""",
+                (image_id, image_hash),
+            ).fetchone()
+            if reusable:
+                cache_count += 1
+
+    inspected = len(rows)
+    api_candidates = max(inspected - cache_count, 0)
+    available_allowance = min(
+        int(status.get('daily_remaining', 0)),
+        int(status.get('monthly_remaining', 0)),
+    )
+    is_available = (
+        bool(int(status.get('auto_api_enabled', 0)))
+        and not bool(int(status.get('is_paused', 0)))
+        and available_allowance > 0
+    )
+    sendable_now = min(api_candidates, available_allowance) if is_available else 0
+    blocked = api_candidates - sendable_now
+
+    reasons: list[str] = []
+    if not int(status.get('auto_api_enabled', 0)):
+        reasons.append('自動API解析がOFFです。')
+    if int(status.get('is_paused', 0)):
+        reasons.append(str(status.get('pause_reason') or 'API利用が一時停止中です。'))
+    if int(status.get('daily_remaining', 0)) <= 0:
+        reasons.append('本日分の上限に達しています。')
+    if int(status.get('monthly_remaining', 0)) <= 0:
+        reasons.append('今月分の上限に達しています。')
+
+    return {
+        'total_pending': total_pending,
+        'inspected': inspected,
+        'limit': safe_limit,
+        'cache_reuse': cache_count,
+        'local_face_decision': 0,
+        'api_candidates': api_candidates,
+        'api_sendable_now': sendable_now,
+        'api_blocked': blocked,
+        'no_hash': no_hash_count,
+        'daily_remaining': int(status.get('daily_remaining', 0)),
+        'monthly_remaining': int(status.get('monthly_remaining', 0)),
+        'reasons': reasons,
+        'truncated': total_pending > inspected,
+    }
