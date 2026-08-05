@@ -7,6 +7,7 @@ from typing import Any
 
 import discord
 from discord.ext import commands
+from embed_safety import safe_add_field, safe_embed, safe_text
 
 from photo_ai_analyzer import analyze_photo_image
 from local_face_recognition import detect_faces_for_image
@@ -118,18 +119,19 @@ def _article_summary(blog: dict[str, Any]) -> str:
 
 def _article_embed(blog: dict[str, Any], *, title_prefix: str = "📖 ブログ記事") -> discord.Embed:
     title = str(blog.get("title") or "無題")
-    embed = discord.Embed(
-        title=f"{title_prefix}: {title}"[:256],
+    embed = safe_embed(
+        title=f"{title_prefix}: {title}",
         description=_article_summary(blog),
         color=discord.Color.red() if int(blog.get("error_count") or 0) else discord.Color.green(),
+        context=f"admin_workflow.article.blog_id={blog.get('id')}",
     )
-    embed.add_field(name="グループ", value=str(blog.get("group_name") or "不明"), inline=True)
-    embed.add_field(name="投稿者", value=str(blog.get("member_name") or "不明"), inline=True)
-    embed.add_field(name="投稿日", value=str(blog.get("published_at") or "不明"), inline=False)
+    safe_add_field(embed, name="グループ", value=str(blog.get("group_name") or "不明"), inline=True, context=f"article.{blog.get('id')}.group")
+    safe_add_field(embed, name="投稿者", value=str(blog.get("member_name") or "不明"), inline=True, context=f"article.{blog.get('id')}.member")
+    safe_add_field(embed, name="投稿日", value=str(blog.get("published_at") or "不明"), inline=False, context=f"article.{blog.get('id')}.published_at")
     if blog.get("last_reviewed_at"):
-        embed.add_field(name="最終確認日時", value=str(blog["last_reviewed_at"]), inline=False)
+        safe_add_field(embed, name="最終確認日時", value=str(blog["last_reviewed_at"]), inline=False, context=f"article.{blog.get('id')}.last_reviewed_at")
     if blog.get("blog_url"):
-        embed.add_field(name="ブログ", value=f"[元記事を開く]({blog['blog_url']})", inline=False)
+        safe_add_field(embed, name="ブログ", value=f"[元記事を開く]({blog['blog_url']})", inline=False, context=f"article.{blog.get('id')}.url")
     return embed
 
 
