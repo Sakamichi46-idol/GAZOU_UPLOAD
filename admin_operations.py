@@ -15,6 +15,7 @@ from typing import Any
 import discord
 from discord.ext import commands
 from embed_safety import safe_add_field
+from ai_cost_control import get_ai_cost_status, update_ai_cost_settings
 
 from photo_database import (
     get_photo_blog_for_admin_edit,
@@ -75,6 +76,45 @@ def init_admin_operations_schema() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_photo_ai_decision_time
               ON photo_ai_decision_log(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS photo_admin_change_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_user_id INTEGER NOT NULL DEFAULT 0,
+                action_type TEXT NOT NULL,
+                target_type TEXT NOT NULL DEFAULT '',
+                target_id TEXT NOT NULL DEFAULT '',
+                snapshot_json TEXT NOT NULL DEFAULT '{}',
+                restored_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_photo_admin_snapshot_time
+              ON photo_admin_change_snapshots(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS photo_person_sets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                set_name TEXT NOT NULL UNIQUE,
+                people_json TEXT NOT NULL DEFAULT '[]',
+                created_by INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_review_hold_reasons (
+                image_id INTEGER PRIMARY KEY,
+                reason_code TEXT NOT NULL DEFAULT 'LATER',
+                note TEXT NOT NULL DEFAULT '',
+                updated_by INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS photo_provisional_people (
+                image_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'local_ai',
+                confidence REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(image_id, person_name)
+            );
             """
         )
         con.commit()
@@ -654,6 +694,90 @@ class HiddenBlogsView(discord.ui.View):
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
 
+def ai_savings_embed() -> discord.Embed:
+    status = get_ai_cost_status()
+    embed = discord.Embed(
+        title="💰 AI節約モード",
+        description=(
+            "有料APIは補助機能として扱い、キャッシュとローカル処理を優先します。\n"
+            f"自動API解析: **{'ON' if int(status.get('auto_api_enabled', 0)) else 'OFF'}**\n"
+            f"一時停止: **{'はい' if int(status.get('is_paused', 0)) else 'いいえ'}**"
+        ),
+        color=0x57F287 if not int(status.get('is_paused', 0)) else 0xED4245,
+    )
+    safe_add_field(
+        embed, name="本日",
+        value=f"API送信 **{int(status.get('daily_used', 0))}枚** / 上限 **{int(status.get('daily_image_limit', 0))}枚**\n残り **{int(status.get('daily_remaining', 0))}枚**",
+        inline=True,
+    )
+    safe_add_field(
+        embed, name="今月",
+        value=f"API送信 **{int(status.get('monthly_used', 0))}枚** / 上限 **{int(status.get('monthly_image_limit', 0))}枚**\n残り **{int(status.get('monthly_remaining', 0))}枚**",
+        inline=True,
+    )
+    safe_add_field(
+        embed, name="再利用実績",
+        value=f"キャッシュ再利用 **{int(status.get('cache_reuse_total', 0)):,}件**\nAPI記録 **{int(status.get('api_calls_total', 0)):,}件**",
+        inline=True,
+    )
+    if status.get('pause_reason'):
+        safe_add_field(embed, name="停止理由", value=str(status.get('pause_reason')), inline=False)
+    embed.set_footer(text="人物候補とタグは1回の画像解析で同時取得し、タグ専用API呼び出しは行いません。")
+    return embed
+
+
+class AICostLimitModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="AI API上限を変更", timeout=300)
+        status = get_ai_cost_status()
+        self.daily = discord.ui.TextInput(label="1日の画像上限", default=str(status.get('daily_image_limit', 20)), max_length=8)
+        self.monthly = discord.ui.TextInput(label="1か月の画像上限", default=str(status.get('monthly_image_limit', 300)), max_length=8)
+        self.add_item(self.daily); self.add_item(self.monthly)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            daily = max(int(str(self.daily.value).strip()), 0)
+            monthly = max(int(str(self.monthly.value).strip()), 0)
+        except ValueError:
+            await interaction.response.send_message("⚠️ 上限は0以上の整数で入力してください。", ephemeral=True)
+            return
+        await asyncio.to_thread(update_ai_cost_settings, daily_image_limit=daily, monthly_image_limit=monthly)
+        write_audit(interaction.user.id, "ai_cost_limit_update", target_type="settings", detail=f"daily={daily}, monthly={monthly}")
+        await interaction.response.send_message(embed=await asyncio.to_thread(ai_savings_embed), ephemeral=True)
+
+
+class AISavingsView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=600); self.owner_id = int(owner_id)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id: return True
+        await interaction.response.send_message("この画面は開いた管理者だけが操作できます。", ephemeral=True); return False
+
+    @discord.ui.button(label="自動APIを切替", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def toggle_auto(self, interaction, _):
+        current = await asyncio.to_thread(get_ai_cost_status)
+        new_value = 0 if int(current.get('auto_api_enabled', 0)) else 1
+        await asyncio.to_thread(update_ai_cost_settings, auto_api_enabled=new_value)
+        write_audit(interaction.user.id, "ai_auto_api_toggle", target_type="settings", detail=f"enabled={new_value}")
+        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+
+    @discord.ui.button(label="日・月上限", emoji="🧮", style=discord.ButtonStyle.primary)
+    async def limits(self, interaction, _):
+        await interaction.response.send_modal(AICostLimitModal())
+
+    @discord.ui.button(label="停止解除", emoji="▶️", style=discord.ButtonStyle.success)
+    async def resume(self, interaction, _):
+        await asyncio.to_thread(update_ai_cost_settings, is_paused=0, pause_reason='')
+        write_audit(interaction.user.id, "ai_pause_clear", target_type="settings")
+        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+
+    @discord.ui.button(label="手動停止", emoji="⏸️", style=discord.ButtonStyle.danger)
+    async def pause(self, interaction, _):
+        await asyncio.to_thread(update_ai_cost_settings, is_paused=1, pause_reason='管理者が手動停止しました。')
+        write_audit(interaction.user.id, "ai_pause", target_type="settings")
+        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+
+
 class AdminOperationsView(discord.ui.View):
     def __init__(self, owner_id: int) -> None:
         super().__init__(timeout=900)
@@ -693,6 +817,11 @@ class AdminOperationsView(discord.ui.View):
     async def ai(self, interaction, _):
         await interaction.response.defer(ephemeral=True)
         await interaction.followup.send(embed=await asyncio.to_thread(ai_quality_embed), ephemeral=True)
+
+    @discord.ui.button(label="AI節約設定", emoji="💰", style=discord.ButtonStyle.success)
+    async def ai_savings(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(embed=await asyncio.to_thread(ai_savings_embed), view=AISavingsView(self.owner_id), ephemeral=True)
 
     @discord.ui.button(label="監査ログ", emoji="📜", style=discord.ButtonStyle.secondary)
     async def audit(self, interaction, _):
