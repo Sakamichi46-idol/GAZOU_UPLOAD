@@ -13,7 +13,8 @@ import discord
 
 from person_labels import format_people_for_users
 from bucket_storage import bucket_is_configured, create_presigned_get_url
-from community_features import FeedbackModal, record_usage_event
+from community_features import FeedbackModal, CollectionAddModal, record_usage_event
+from user_experience import add_watch_later, record_recent_view, related_rows, SimplePhotoListView
 from photo_database import (
     search_photo_images,
     search_photo_images_by_author,
@@ -244,6 +245,11 @@ class DetailResultButton(discord.ui.Button):
             image_id=int(self.parent_view.results[result_index].get("id") or 0),
             query_text=self.parent_view.query,
         )
+        await asyncio.to_thread(
+            record_recent_view,
+            interaction.user.id,
+            int(self.parent_view.results[result_index].get("id") or 0),
+        )
         view = PhotoSearchDetailView(
             owner_id=self.parent_view.owner_id,
             results=self.parent_view.results,
@@ -419,6 +425,47 @@ class PhotoSearchDetailView(discord.ui.View):
         await interaction.response.send_modal(
             FeedbackModal(category="人物名・写真情報の間違い", image_id=image_id)
         )
+
+    @discord.ui.button(label="コレクションに追加", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
+    async def collection_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        await interaction.response.send_modal(CollectionAddModal(image_id))
+
+    @discord.ui.button(label="あとで見る", emoji="🔖", style=discord.ButtonStyle.secondary, row=2)
+    async def watch_later_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        added = await asyncio.to_thread(add_watch_later, interaction.user.id, image_id)
+        await interaction.response.send_message(
+            "🔖 あとで見るへ追加しました。" if added else "ℹ️ すでにあとで見るへ追加済みです。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="関連写真", emoji="🔗", style=discord.ButtonStyle.secondary, row=2)
+    async def related_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        rows = await asyncio.to_thread(related_rows, image_id, 9)
+        if not rows:
+            await interaction.response.send_message("関連写真が見つかりませんでした。", ephemeral=True)
+            return
+        view = SimplePhotoListView(interaction.user.id, rows, title="🔗 関連写真")
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="写真情報をコピー", emoji="📋", style=discord.ButtonStyle.secondary, row=3)
+    async def copy_info_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        result = self.results[self.index]
+        text = (
+            f"画像ID: {result.get('id') or '不明'}\n"
+            f"ブログ: {result.get('title') or '無題'}\n"
+            f"投稿者: {result.get('member_name') or '不明'}\n"
+            f"人物: {format_people_for_users(str(result.get('confirmed_people') or result.get('candidate_people') or '')) or '未確定'}\n"
+            f"URL: {result.get('blog_url') or ''}"
+        )
+        await interaction.response.send_message(f"```text\n{text[:1800]}\n```", ephemeral=True)
+
+    @discord.ui.button(label="人物・タグを提案", emoji="💡", style=discord.ButtonStyle.secondary, row=3)
+    async def suggestion_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        image_id = int(self.results[self.index].get("id") or 0)
+        await interaction.response.send_modal(FeedbackModal(category="人物・タグの提案", image_id=image_id))
 
     @discord.ui.button(label="検索結果へ戻る", emoji="↩️", style=discord.ButtonStyle.primary, row=1)
     async def back_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
