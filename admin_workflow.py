@@ -311,7 +311,7 @@ class BlogDashboardView(AdminWorkflowView):
 
     @discord.ui.button(label="最新記事", emoji="📅", style=discord.ButtonStyle.primary)
     async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        blogs = await asyncio.to_thread(get_latest_blogs_for_admin, 25)
+        blogs = await asyncio.to_thread(get_latest_blogs_for_admin, 500)
         await _show_blog_list(interaction, "📅 最新記事", blogs)
 
     @discord.ui.button(label="投稿者から選ぶ", emoji="👤", style=discord.ButtonStyle.primary)
@@ -324,12 +324,12 @@ class BlogDashboardView(AdminWorkflowView):
 
     @discord.ui.button(label="未解析記事", emoji="🆕", style=discord.ButtonStyle.success)
     async def unprocessed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        blogs = await asyncio.to_thread(get_unprocessed_blogs_for_admin, 25)
+        blogs = await asyncio.to_thread(get_unprocessed_blogs_for_admin, 500)
         await _show_blog_list(interaction, "🆕 人物確認が未完了の記事", blogs)
 
     @discord.ui.button(label="エラー記事", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        blogs = await asyncio.to_thread(get_error_blogs_for_admin, 25)
+        blogs = await asyncio.to_thread(get_error_blogs_for_admin, 500)
         await _show_blog_list(interaction, "⚠️ エラー記事", blogs)
 
 
@@ -337,19 +337,26 @@ async def _show_blog_list(interaction: discord.Interaction, heading: str, blogs:
     if not blogs:
         await interaction.response.edit_message(content=f"{heading}\n対象記事はありません。", embed=None, view=BlogDashboardView())
         return
+    view = ProgressBlogSelectView(blogs, heading)
     await interaction.response.edit_message(
-        content=f"{heading}\n記事を選択してください。各項目に人物確認の進捗を表示しています。",
+        content=view.text(),
         embed=None,
-        view=ProgressBlogSelectView(blogs, heading),
+        view=view,
     )
 
 
 class ProgressBlogSelect(discord.ui.Select):
-    def __init__(self, blogs: list[dict[str, Any]], heading: str):
+    PAGE_SIZE = 25
+
+    def __init__(self, parent: "ProgressBlogSelectView"):
+        blogs = parent.blogs
+        heading = parent.heading
         self.blogs = {str(blog["id"]): blog for blog in blogs}
         self.heading = heading
+        start = parent.page * self.PAGE_SIZE
+        page_blogs = blogs[start:start + self.PAGE_SIZE]
         options: list[discord.SelectOption] = []
-        for blog in blogs[:25]:
+        for blog in page_blogs:
             percent = int(blog.get("progress_percent") or 0)
             total = int(blog.get("progress_total") or blog.get("image_count") or 0)
             completed = int(blog.get("progress_completed") or 0)
@@ -384,11 +391,37 @@ class ProgressBlogSelect(discord.ui.Select):
 
 
 class ProgressBlogSelectView(AdminWorkflowView):
-    def __init__(self, blogs: list[dict[str, Any]], heading: str):
-        super().__init__()
-        self.add_item(ProgressBlogSelect(blogs, heading))
+    PAGE_SIZE = 25
 
-    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    def __init__(self, blogs: list[dict[str, Any]], heading: str, page: int = 0):
+        super().__init__()
+        self.blogs = list(blogs)
+        self.heading = heading
+        self.page_count = max(1, (len(self.blogs) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        self.add_item(ProgressBlogSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def text(self) -> str:
+        start = self.page * self.PAGE_SIZE + 1 if self.blogs else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.blogs))
+        return (
+            f"{self.heading}\n記事を選択してください。各項目に人物確認の進捗を表示しています。\n"
+            f"表示 **{start}〜{end}件目 / 全{len(self.blogs)}件**（{self.page + 1}/{self.page_count}ページ）"
+        )
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ProgressBlogSelectView(self.blogs, self.heading, self.page - 1)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = ProgressBlogSelectView(self.blogs, self.heading, self.page + 1)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
             content="📖 **ブログ単位解析**\n記事の探し方を選択してください。",
