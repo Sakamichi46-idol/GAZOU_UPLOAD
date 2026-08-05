@@ -1210,7 +1210,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
         for item in targets:
             target_id = int(item["id"])
             await asyncio.to_thread(reset_image_analysis_status, target_id)
-            result = await analyze_photo_image(target_id)
+            result = await analyze_photo_image(target_id, manual_api=True)
             status = str(result.get("status") or "failed")
 
             if status == "completed":
@@ -1240,7 +1240,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
 
         await asyncio.to_thread(reset_image_analysis_status, image_id)
         await ctx.send(f"🤖 画像ID **{image_id}** を再解析します。")
-        result = await analyze_photo_image(image_id)
+        result = await analyze_photo_image(image_id, manual_api=True)
         status = str(result.get("status") or "failed")
         await ctx.send(f"✅ 画像ID **{image_id}** の解析結果: **{status}**")
 
