@@ -38,6 +38,7 @@ from discord.ext import commands
 from discord.ext.commands.view import StringView
 
 from community_features import FeedbackModal
+from user_experience import HelpHomeView, PersonProfileModal, help_home_embed
 from runtime_guard import user_operation
 
 ADMIN_ROLE_ID = _env_int("PHOTO_BOT_ADMIN_ROLE_ID", 0, minimum=0)
@@ -494,84 +495,45 @@ class UserPanelView(discord.ui.View):
         await interaction.response.send_modal(FeedbackModal())
 
     @discord.ui.button(
+        label="おすすめ・探索",
+        emoji="✨",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:explore",
+    )
+    async def explore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "user_explore")
+
+    @discord.ui.button(
+        label="最近見た",
+        emoji="🕘",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:recently_viewed",
+    )
+    async def recently_viewed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await invoke_existing_command(interaction, "recently_viewed", "20")
+
+    @discord.ui.button(
+        label="人物プロフィール",
+        emoji="👤",
+        style=discord.ButtonStyle.secondary,
+        custom_id="photo:user:profile",
+    )
+    async def profile(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonProfileModal())
+
+    @discord.ui.button(
         label="使い方",
         emoji="❓",
         style=discord.ButtonStyle.secondary,
         custom_id="photo:user:help",
     )
     async def help(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        embed = discord.Embed(
-            title="❓ 一般ユーザーパネルの使い方",
-            description=(
-                "各ボタンの操作結果は、基本的に操作した本人だけに表示されます。\n"
-                "写真や検索内容が公開チャンネルへ流れることはありません。"
-            ),
+        await interaction.response.send_message(
+            embed=help_home_embed(),
+            view=HelpHomeView(interaction.user.id),
+            ephemeral=True,
         )
-        embed.add_field(
-            name="📮 不具合・要望",
-            value="匿名または記名で、不具合・人物名の間違い・機能要望を管理者へ送れます。写真に関する場合は画像IDも入力できます。",
-            inline=False,
-        )
-        embed.add_field(
-            name="🔍 写真検索",
-            value=(
-                "最初にブログ・Instagram・両方から検索対象を選び、人物名・投稿者・タイトル・キャプションなどで検索します。\n"
-                "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
-                "一覧の選択メニューから写真の詳細を開き、お気に入り登録できます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="👤 人物で探す",
-            value=(
-                "最初にブログ・Instagram・両方から検索対象を選び、人物名で写真を検索します。\n"
-                "検索結果は最大20件まで取得され、1ページに最大9枚表示されます。\n"
-                "一覧の選択メニューから詳細を開き、お気に入り登録できます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🏷️ タグで探す",
-            value=(
-                "カテゴリーとタグを順番に選び、条件に合う写真を探します。\n"
-                "結果は1ページに最大9枚表示され、選択メニューから詳細を確認できます。\n"
-                "写真の詳細画面から、そのままお気に入り登録できます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🖼️ 画像ID",
-            value=(
-                "画像IDを入力して、特定の写真を直接表示します。\n"
-                "`125`、`ID 125`、`画像ID：125` のように入力できます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="⭐ お気に入り",
-            value=(
-                "登録した写真を1枚ずつ表示します。\n"
-                "前へ・次へで移動でき、表示中の写真だけを個別に削除できます。\n"
-                "お気に入りデータはユーザーごとに保存されます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="🕒 最近の写真",
-            value="新しく保存された写真を、最近のものから順に表示します。",
-            inline=False,
-        )
-        embed.add_field(
-            name="📋 人物一覧",
-            value="写真データベースに登録されている人物名の一覧を表示します。",
-            inline=False,
-        )
-        embed.set_footer(text="この説明画面も、操作した本人にだけ表示されます。")
 
-        if interaction.response.is_done():
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        else:
-            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class AdminQuickView(discord.ui.View):
