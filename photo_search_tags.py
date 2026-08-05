@@ -190,7 +190,7 @@ def match_canonical_tag(query: str) -> list[tuple[str, str]]:
                 exact.append((category, label))
             elif clean in normalize_tag_text(label):
                 partial.append((category, label))
-    return (exact + partial)[:25]
+    return exact + partial
 
 
 def build_curated_index(raw_tag_ids: dict[str, set[int]]) -> dict[str, dict[str, set[int]]]:
