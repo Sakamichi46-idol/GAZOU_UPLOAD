@@ -374,9 +374,40 @@ class FeedbackTicketSelect(discord.ui.Select):
 
 
 class FeedbackAdminListView(discord.ui.View):
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    PAGE_SIZE = 25
+
+    def __init__(self, rows: list[dict[str, Any]], page: int = 0) -> None:
         super().__init__(timeout=None)
-        self.add_item(FeedbackTicketSelect(rows))
+        self.rows = list(rows)
+        self.page_count = max(1, (len(self.rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        start = self.page * self.PAGE_SIZE
+        self.add_item(FeedbackTicketSelect(self.rows[start:start + self.PAGE_SIZE]))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def embed(self) -> discord.Embed:
+        start = self.page * self.PAGE_SIZE + 1 if self.rows else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.rows))
+        return discord.Embed(
+            title="📬 報告・要望箱",
+            description=(
+                f"未対応 **{len(self.rows)}件**\n"
+                f"表示 **{start}〜{end}件目**（{self.page + 1}/{self.page_count}ページ）\n"
+                "報告を選ぶと詳細と対応状態を変更できます。"
+            ),
+            color=0xE67E22,
+        )
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = FeedbackAdminListView(self.rows, self.page - 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = FeedbackAdminListView(self.rows, self.page + 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
 
 
 def get_ai_learning_stats(limit: int = 25) -> dict[str, Any]:
@@ -661,13 +692,9 @@ def register_community_commands(bot: commands.Bot) -> None:
     @bot.command(name="feedback_admin")
     @commands.is_owner()
     async def feedback_admin(ctx: commands.Context) -> None:
-        rows = await asyncio.to_thread(_feedback_rows, "open", 25)
-        embed = discord.Embed(
-            title="📬 報告・要望箱",
-            description=f"未対応 **{len(rows)}件**（最新25件）\n報告を選ぶと詳細と対応状態を変更できます。",
-            color=0xE67E22,
-        )
-        await ctx.send(embed=embed, view=FeedbackAdminListView(rows))
+        rows = await asyncio.to_thread(_feedback_rows, "open", 500)
+        view = FeedbackAdminListView(rows)
+        await ctx.send(embed=view.embed(), view=view)
 
     @bot.command(name="ai_learning_status")
     @commands.is_owner()
