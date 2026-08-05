@@ -67,6 +67,15 @@ def init_community_schema() -> None:
                 FOREIGN KEY(collection_id) REFERENCES user_photo_collections(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS user_collection_shares (
+                share_token TEXT PRIMARY KEY,
+                collection_id INTEGER NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY(collection_id) REFERENCES user_photo_collections(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS photo_usage_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 discord_user_hash TEXT NOT NULL,
@@ -195,9 +204,11 @@ class CollectionCreateModal(discord.ui.Modal):
 
 
 class CollectionAddModal(discord.ui.Modal):
-    def __init__(self) -> None:
+    def __init__(self, image_id: int | None = None) -> None:
         super().__init__(title="写真をコレクションへ追加", timeout=300)
-        self.image_id = discord.ui.TextInput(label="写真ID", placeholder="例：733", max_length=20)
+        self.image_id = discord.ui.TextInput(
+            label="写真ID", placeholder="例：733", default=str(image_id or ""), max_length=20
+        )
         self.name = discord.ui.TextInput(label="コレクション名", placeholder="例：ライブ", max_length=60)
         self.add_item(self.image_id)
         self.add_item(self.name)
@@ -231,6 +242,10 @@ class CollectionHubView(discord.ui.View):
     @discord.ui.button(label="写真を追加", emoji="📷", style=discord.ButtonStyle.primary)
     async def add(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(CollectionAddModal())
+
+    @discord.ui.button(label="共有コード", emoji="🔗", style=discord.ButtonStyle.secondary)
+    async def share(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CollectionShareModal())
 
 
 class FeedbackStatusSelect(discord.ui.Select):
@@ -421,19 +436,96 @@ def _search_history_rows(user_id: int, limit: int = 15) -> list[dict[str, Any]]:
         ).fetchall()
         return [dict(r) for r in rows]
 
-def _popular_rows(limit: int = 10) -> list[dict[str, Any]]:
+def _popular_rows(limit: int = 10, period: str = "all") -> list[dict[str, Any]]:
     init_community_schema()
+    period = str(period or "all").lower()
+    cutoff_clause = ""
+    params: list[Any] = []
+    if period == "week":
+        cutoff_clause = "AND e.created_at>=?"
+        params.append((datetime.now(timezone.utc) - timedelta(days=7)).isoformat())
+    elif period == "month":
+        cutoff_clause = "AND e.created_at>=?"
+        params.append((datetime.now(timezone.utc) - timedelta(days=30)).isoformat())
+    params.append(max(1, min(limit, 25)))
     with closing(get_connection()) as con:
         rows = con.execute(
-            """SELECT e.image_id,COUNT(*) AS score,b.title,b.member_name
-               FROM photo_usage_events e
-               JOIN photo_images i ON i.id=e.image_id
-               JOIN photo_blogs b ON b.id=i.blog_id
-               WHERE e.image_id IS NOT NULL AND e.event_type IN ('detail','favorite')
-               GROUP BY e.image_id ORDER BY score DESC,e.image_id DESC LIMIT ?""",
-            (max(1,min(limit,25)),),
+            f"""SELECT e.image_id, COUNT(*) AS score, b.title, b.member_name,
+                       b.group_name, b.blog_url, i.image_url, i.bucket_public_url
+                FROM photo_usage_events e
+                JOIN photo_images i ON i.id=e.image_id
+                JOIN photo_blogs b ON b.id=i.blog_id
+                WHERE e.image_id IS NOT NULL
+                  AND e.event_type IN ('detail','favorite','collection')
+                  {cutoff_clause}
+                GROUP BY e.image_id
+                ORDER BY score DESC,e.image_id DESC LIMIT ?""",
+            tuple(params),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def _create_collection_share(user_id: int, collection_name: str) -> str:
+    import secrets
+    init_community_schema()
+    clean = str(collection_name or "").strip()[:60]
+    with closing(get_connection()) as con:
+        row = con.execute(
+            "SELECT id FROM user_photo_collections WHERE discord_user_id=? AND collection_name=?",
+            (str(user_id), clean),
+        ).fetchone()
+        if not row:
+            raise ValueError("指定したコレクションが見つかりません。")
+        token = secrets.token_urlsafe(8)
+        con.execute(
+            "INSERT INTO user_collection_shares(share_token,collection_id,owner_user_id,created_at,is_active) VALUES(?,?,?,?,1)",
+            (token, int(row[0]), str(user_id), _now()),
+        )
+        con.commit()
+        return token
+
+
+def _shared_collection_rows(token: str, limit: int = 25) -> tuple[str, list[dict[str, Any]]]:
+    init_community_schema()
+    with closing(get_connection()) as con:
+        head = con.execute(
+            """SELECT c.collection_name FROM user_collection_shares s
+               JOIN user_photo_collections c ON c.id=s.collection_id
+               WHERE s.share_token=? AND s.is_active=1""", (str(token),)
+        ).fetchone()
+        if not head:
+            return "", []
+        rows = con.execute(
+            """SELECT i.id,b.title,b.member_name FROM user_collection_shares s
+               JOIN user_photo_collection_items ci ON ci.collection_id=s.collection_id
+               JOIN photo_images i ON i.id=ci.image_id
+               JOIN photo_blogs b ON b.id=i.blog_id
+               WHERE s.share_token=? AND s.is_active=1
+               ORDER BY ci.created_at DESC LIMIT ?""",
+            (str(token), max(1,min(limit,25))),
+        ).fetchall()
+        return str(head[0]), [dict(r) for r in rows]
+
+
+class CollectionShareModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="コレクションを共有", timeout=300)
+        self.name = discord.ui.TextInput(label="コレクション名", max_length=60)
+        self.add_item(self.name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            token = await asyncio.to_thread(_create_collection_share, interaction.user.id, str(self.name.value))
+        except ValueError as exc:
+            await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "🔗 共有コードを発行しました。共有相手は次のコマンドで閲覧できます。\n"
+            f"`!collection_shared {token}`\n"
+            "共有画面は閲覧専用で、元のコレクションを変更できません。",
+            ephemeral=True,
+        )
+
 
 def register_community_commands(bot: commands.Bot) -> None:
     init_community_schema()
@@ -485,17 +577,35 @@ def register_community_commands(bot: commands.Bot) -> None:
         )
 
     @bot.command(name="popular_photos")
-    async def popular_photos(ctx: commands.Context, limit: int = 10) -> None:
-        rows = await asyncio.to_thread(_popular_rows, limit)
+    async def popular_photos(ctx: commands.Context, period: str = "all", limit: int = 10) -> None:
+        if str(period).isdigit():
+            limit, period = int(period), "all"
+        period = str(period).lower()
+        if period not in {"week", "month", "all"}:
+            await ctx.send("期間は `week` / `month` / `all` から選んでください。")
+            return
+        rows = await asyncio.to_thread(_popular_rows, limit, period)
         if not rows:
             await ctx.send("📈 人気データはまだありません。")
             return
         await ctx.send(
-            "📈 **人気写真**\n"
+            f"📈 **人気写真（{'今週' if period=='week' else '今月' if period=='month' else '全期間'}）**\n"
             + "\n".join(
                 f"{n}. 画像ID {r['image_id']}（{r['score']}） {r['member_name']} / {r['title']}"[:190]
                 for n, r in enumerate(rows, 1)
             )
+        )
+
+
+    @bot.command(name="collection_shared")
+    async def collection_shared(ctx: commands.Context, token: str) -> None:
+        name, rows = await asyncio.to_thread(_shared_collection_rows, token, 25)
+        if not rows:
+            await ctx.send("⚠️ 共有コードが無効、またはコレクションが空です。")
+            return
+        await ctx.send(
+            f"🔗 **共有コレクション：{name}**\n" +
+            "\n".join(f"・画像ID {r['id']}：{r['member_name']} / {r['title']}"[:190] for r in rows)
         )
 
     @bot.command(name="feedback_admin")
