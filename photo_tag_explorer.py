@@ -504,11 +504,12 @@ class PersonNameModal(discord.ui.Modal, title="人物名で検索"):
 class PersonMatchSelect(discord.ui.Select):
     def __init__(self, parent: "PersonMatchView"):
         self.parent_view = parent
+        page_matches = parent.page_matches()
         super().__init__(
-            placeholder="人物を選択（複数可）",
+            placeholder=f"人物を選択（{parent.page + 1}/{parent.page_count}ページ）",
             min_values=1,
-            max_values=len(parent.matches),
-            options=[discord.SelectOption(label=_short(name, 100), value=name) for name in parent.matches],
+            max_values=max(1, len(page_matches)),
+            options=[discord.SelectOption(label=_short(name, 100), value=name) for name in page_matches],
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -521,17 +522,44 @@ class PersonMatchSelect(discord.ui.Select):
 
 
 class PersonMatchView(OwnedView):
-    def __init__(self, state: ExplorerState, matches: list[str]):
+    PAGE_SIZE = 25
+
+    def __init__(self, state: ExplorerState, matches: list[str], page: int = 0):
         super().__init__(state, timeout=180)
-        self.matches = matches[:25]
+        self.matches = list(matches)
+        self.page_count = max(1, (len(self.matches) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
         self.add_item(PersonMatchSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def page_matches(self) -> list[str]:
+        start = self.page * self.PAGE_SIZE
+        return self.matches[start:start + self.PAGE_SIZE]
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=f"候補から人物を選んでください。表示 {max(1, (self.page - 1) * self.PAGE_SIZE + 1)}〜{min(self.page * self.PAGE_SIZE, len(self.matches))}人目 / 全{len(self.matches)}人",
+            view=PersonMatchView(self.state, self.matches, self.page - 1),
+        )
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        next_page = self.page + 1
+        start = next_page * self.PAGE_SIZE + 1
+        end = min((next_page + 1) * self.PAGE_SIZE, len(self.matches))
+        await interaction.response.edit_message(
+            content=f"候補から人物を選んでください。表示 {start}〜{end}人目 / 全{len(self.matches)}人",
+            view=PersonMatchView(self.state, self.matches, next_page),
+        )
 
 
 class SearchTagMatchSelect(discord.ui.Select):
     def __init__(self, parent: "SearchTagMatchView"):
         self.parent_view = parent
         options = []
-        for index, (category, label) in enumerate(parent.matches):
+        for index, (category, label) in enumerate(parent.page_matches()):
             emoji, category_label = CATEGORY_DEFS[category]
             options.append(discord.SelectOption(
                 label=_short(label, 85),
@@ -548,7 +576,7 @@ class SearchTagMatchSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         for value in self.values:
-            category, label = self.parent_view.matches[int(value)]
+            category, label = self.parent_view.page_matches()[int(value)]
             if label in self.parent_view.state.index.get(category, {}):
                 self.parent_view.state.selections[category].add(label)
         await interaction.response.send_message(
@@ -559,10 +587,34 @@ class SearchTagMatchSelect(discord.ui.Select):
 
 
 class SearchTagMatchView(OwnedView):
-    def __init__(self, state: ExplorerState, matches: list[tuple[str, str]]):
+    PAGE_SIZE = 25
+
+    def __init__(self, state: ExplorerState, matches: list[tuple[str, str]], page: int = 0):
         super().__init__(state, timeout=180)
-        self.matches = matches[:25]
+        self.matches = list(matches)
+        self.page_count = max(1, (len(self.matches) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
         self.add_item(SearchTagMatchSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def page_matches(self) -> list[tuple[str, str]]:
+        start = self.page * self.PAGE_SIZE
+        return self.matches[start:start + self.PAGE_SIZE]
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=f"候補からタグを選んでください。（{self.page}/{self.page_count}ページ）",
+            view=SearchTagMatchView(self.state, self.matches, self.page - 1),
+        )
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=f"候補からタグを選んでください。（{self.page + 2}/{self.page_count}ページ）",
+            view=SearchTagMatchView(self.state, self.matches, self.page + 1),
+        )
 
 
 class SearchTagModal(discord.ui.Modal, title="検索タグを入力"):
@@ -608,19 +660,20 @@ class ConditionRemoveSelect(discord.ui.Select):
     def __init__(self, parent: "ConditionRemoveView"):
         self.parent_view = parent
         options = []
-        self.keys: list[tuple[str, str]] = []
+        all_keys: list[tuple[str, str]] = []
         for category, tags in parent.state.selections.items():
-            emoji, label = CATEGORY_DEFS[category]
             for tag in sorted(tags):
-                self.keys.append((category, tag))
-                options.append(discord.SelectOption(
-                    label=_short(tag, 85),
-                    description=f"{label}から解除"[:100],
-                    emoji=emoji,
-                    value=str(len(self.keys)-1),
-                ))
-        options = options[:25]
-        self.keys = self.keys[:25]
+                all_keys.append((category, tag))
+        start = parent.page * parent.PAGE_SIZE
+        self.keys = all_keys[start:start + parent.PAGE_SIZE]
+        for index, (category, tag) in enumerate(self.keys):
+            emoji, label = CATEGORY_DEFS[category]
+            options.append(discord.SelectOption(
+                label=_short(tag, 85),
+                description=f"{label}から解除"[:100],
+                emoji=emoji,
+                value=str(index),
+            ))
         super().__init__(
             placeholder="解除する条件を選択",
             min_values=1,
@@ -640,11 +693,32 @@ class ConditionRemoveSelect(discord.ui.Select):
 
 
 class ConditionRemoveView(OwnedView):
-    def __init__(self, state: ExplorerState):
-        super().__init__(state)
-        self.add_item(ConditionRemoveSelect(self))
+    PAGE_SIZE = 25
 
-    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    def __init__(self, state: ExplorerState, page: int = 0):
+        super().__init__(state)
+        self.total = sum(len(tags) for tags in state.selections.values())
+        self.page_count = max(1, (self.total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        self.add_item(ConditionRemoveSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=build_explorer_embed(self.state),
+            view=ConditionRemoveView(self.state, self.page - 1),
+        )
+
+    @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=build_explorer_embed(self.state),
+            view=ConditionRemoveView(self.state, self.page + 1),
+        )
+
+    @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         view = ExplorerView(self.state)
         await interaction.response.edit_message(embed=build_explorer_embed(self.state), view=view)
