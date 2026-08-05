@@ -726,6 +726,11 @@ class AdminPanelView(discord.ui.View):
         LOGGER.exception("管理者パネルの操作でエラーが発生しました", exc_info=error)
         await _reply(interaction, "⚠️ 管理者パネルの操作中にエラーが発生しました。もう一度お試しください。")
 
+    @discord.ui.button(label="運用ダッシュボード", emoji="🗂️", style=discord.ButtonStyle.success, custom_id="photo:admin:dashboard")
+    async def dashboard(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from admin_operations import send_admin_operations
+        await send_admin_operations(interaction)
+
     @discord.ui.button(label="統合ステータス", emoji="📊", style=discord.ButtonStyle.primary, custom_id="photo:admin:status")
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "status", admin_required=True)
