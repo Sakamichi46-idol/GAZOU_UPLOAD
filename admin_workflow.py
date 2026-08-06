@@ -74,7 +74,9 @@ class AdminWorkflowView(discord.ui.View):
         item: discord.ui.Item[discord.ui.View],
     ) -> None:
         LOGGER.exception("管理者ワークフローの操作でエラーが発生しました", exc_info=error)
-        text = "⚠️ 管理画面の操作中にエラーが発生しました。もう一度お試しください。"
+        from admin_quality import record_admin_error
+        error_id = record_admin_error(error, area="admin_workflow", item_name=getattr(item, "custom_id", "") or getattr(item, "label", ""), user_id=interaction.user.id)
+        text = f"⚠️ 管理画面の操作中にエラーが発生しました。\nエラーID: `{error_id}`"
         if interaction.response.is_done():
             await interaction.followup.send(text, ephemeral=True)
         else:
