@@ -30,14 +30,16 @@ OPTIONS_PER_PAGE = 25
 CATEGORY_DEFS = SEARCH_CATEGORY_DEFS
 
 RAW_CATEGORY_KEYS = {
-    "person", "clothing", "expression", "location", "composition",
-    "pose", "event", "season", "object", "other",
+    "person", "hair", "clothing", "expression", "location", "composition",
+    "pose", "event", "season", "object", "animal", "food", "accessory", "shooting", "other",
 }
 
 CATEGORY_ALIASES = {
     "background": "location",
     "weather": "season",
-    "person_count": "composition",
+    "person_count": "shooting",
+    "composition": "shooting",
+    "object": "accessory",
     "manual": "other",
     "": "other",
 }
@@ -69,10 +71,12 @@ def _all_image_ids() -> set[int]:
 
 
 def _load_tag_index() -> dict[str, dict[str, set[int]]]:
-    """確認済み人物と、人間向けに整理した検索タグの索引を作る。"""
-    index: dict[str, dict[str, set[int]]] = {
-        category: {} for category in CATEGORY_DEFS
-    }
+    """人物と承認済み代表タグの検索索引を作る。
+
+    タグマスターのキャッシュが空の場合だけ非破壊で再構築する。
+    手動タグはAIタグより優先され、低信頼・却下・blockedタグは除外される。
+    """
+    index: dict[str, dict[str, set[int]]] = {category: {} for category in CATEGORY_DEFS}
 
     with closing(get_connection()) as connection:
         people = connection.execute(
@@ -83,35 +87,31 @@ def _load_tag_index() -> dict[str, dict[str, set[int]]]:
               AND TRIM(person_name) != ''
             """
         ).fetchall()
-        ai_tags = connection.execute(
+
+        from tag_master import bootstrap_from_existing, rebuild_cache
+        bootstrap_from_existing(connection)
+        cache_count = int(connection.execute("SELECT COUNT(*) FROM tag_search_cache").fetchone()[0])
+        if cache_count <= 0:
+            rebuild_cache(connection)
+
+        tag_rows = connection.execute(
             """
-            SELECT image_id, tag
-            FROM photo_ai_tags
-            WHERE TRIM(tag) != ''
-            """
-        ).fetchall()
-        manual_tags = connection.execute(
-            """
-            SELECT image_id, tag
-            FROM photo_manual_tags
-            WHERE TRIM(tag) != ''
+            SELECT c.image_id, m.canonical_tag, m.category
+            FROM tag_search_cache c
+            JOIN tag_master m ON m.id = c.canonical_tag_id
+            WHERE m.status = 'approved' AND m.searchable = 1
             """
         ).fetchall()
 
     for image_id, person_name in people:
         tag = str(person_name).strip()
-        # 名前不明の内部ラベルは一般ユーザーの検索候補には出さない。
         if not tag or is_unknown_other_label(tag):
             continue
         index["person"].setdefault(tag, set()).add(int(image_id))
 
-    raw_tag_ids: dict[str, set[int]] = {}
-    for image_id, tag_value in [*ai_tags, *manual_tags]:
-        tag = str(tag_value).strip()
-        raw_tag_ids.setdefault(tag, set()).add(int(image_id))
-
-    for category, tags in build_curated_index(raw_tag_ids).items():
-        index[category].update(tags)
+    for image_id, canonical_tag, category in tag_rows:
+        normalized_category = _normalized_category(str(category or ""))
+        index.setdefault(normalized_category, {}).setdefault(str(canonical_tag), set()).add(int(image_id))
 
     return index
 
