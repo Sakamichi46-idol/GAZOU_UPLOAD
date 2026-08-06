@@ -273,9 +273,10 @@ class AICenterView(discord.ui.View):
     async def decisions(self, interaction, _):
         await _send_ai_db_list(interaction, "decisions")
 
-    @discord.ui.button(label="AI候補確認", emoji="🤖", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="AI顔候補確認", emoji="🤖", style=discord.ButtonStyle.primary)
     async def candidate_review(self, interaction, _):
-        await send_ai_candidate_review(interaction)
+        from face_candidate_center import send_face_candidate_center
+        await send_face_candidate_center(interaction)
 
     @discord.ui.button(label="仮確定を本確定", emoji="✅", style=discord.ButtonStyle.success)
     async def promote(self, interaction, _):
