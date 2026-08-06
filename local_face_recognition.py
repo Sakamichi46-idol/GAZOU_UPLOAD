@@ -282,10 +282,13 @@ def _reference_embeddings(exclude_face_id: int, group_name: str = "") -> list[di
                    photo_people.group_name
             FROM photo_faces
             JOIN photo_people ON photo_people.id = photo_faces.confirmed_person_id
+            LEFT JOIN photo_face_learning_registry learning
+              ON learning.face_id = photo_faces.id
             WHERE photo_faces.model_name = ?
               AND photo_faces.id <> ?
               AND photo_faces.face_embedding <> ''
               AND photo_faces.confirmation_status IN ('confirmed','manually_confirmed','auto_seeded')
+              AND COALESCE(learning.is_active, 1) = 1
               {group_sql}
             """,
             tuple(params),
