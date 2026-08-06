@@ -66,6 +66,7 @@ from photo_face_cluster_view import send_face_cluster_review
 from photo_id_view import send_photo_by_id
 from photo_favorites import send_favorite_gallery
 from tag_export import build_all_tags_export_zip
+from tag_master_admin import send_tag_master_panel
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -327,6 +328,12 @@ def register_photo_commands(bot: commands.Bot) -> None:
     async def photo_tags_command(ctx: commands.Context) -> None:
         """ボタンと選択メニューで写真タグを絞り込む。"""
         await send_photo_tag_explorer(ctx)
+
+    @bot.command(name="tag_master", aliases=["tag_manager", "tag_admin"])
+    @commands.is_owner()
+    async def tag_master_command(ctx: commands.Context) -> None:
+        """代表タグ・同義語・承認状態・検索索引を管理する。"""
+        await send_tag_master_panel(ctx)
 
     @bot.command(name="export_all_tags", aliases=["all_tags_export", "tag_export"])
     @commands.is_owner()
