@@ -181,13 +181,28 @@ class CategoryAdminView(AdminWorkflowView):
 
     @discord.ui.button(label="タグ管理", emoji="🏷️", style=discord.ButtonStyle.secondary)
     async def tags(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        from control_panel import invoke_existing_command
-
-        await invoke_existing_command(interaction, "photo_tags", admin_required=True)
+        await interaction.response.send_message("🏷️ タグ管理", view=TagAdminView(), ephemeral=True)
 
     @discord.ui.button(label="状態・修復", emoji="🛠️", style=discord.ButtonStyle.secondary)
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message("🛠️ 状態・修復", view=StatusAdminView(), ephemeral=True)
+
+
+class TagAdminView(AdminWorkflowView):
+    @discord.ui.button(label="タグ検索", emoji="🔎", style=discord.ButtonStyle.primary)
+    async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from control_panel import invoke_existing_command
+        await invoke_existing_command(interaction, "photo_tags", admin_required=True)
+
+    @discord.ui.button(label="タグマスター", emoji="🏷️", style=discord.ButtonStyle.success)
+    async def master(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from control_panel import invoke_existing_command
+        await invoke_existing_command(interaction, "tag_master", admin_required=True)
+
+    @discord.ui.button(label="全タグ出力", emoji="📄", style=discord.ButtonStyle.secondary)
+    async def export(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from control_panel import invoke_existing_command
+        await invoke_existing_command(interaction, "export_all_tags", admin_required=True)
 
 
 class PhotoAdminView(AdminWorkflowView):
