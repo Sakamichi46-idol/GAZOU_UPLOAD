@@ -1459,6 +1459,10 @@ async def on_ready() -> None:
                 "写真検索DB初期化完了"
             )
 
+            from schema_migrations import run_migrations
+            migration_result = await asyncio.to_thread(run_migrations)
+            print("DBマイグレーション:", migration_result)
+
         except Exception as error:
 
             print(
