@@ -1065,6 +1065,10 @@ def init_photo_db() -> None:
             (now_for_repair, now_for_repair, now_for_repair),
         )
 
+        # タグマスターは既存タグを物理的に書き換えず、別名・承認状態を管理する。
+        from tag_master import bootstrap_from_existing
+        bootstrap_from_existing(connection)
+
         connection.commit()
 
     print(
@@ -2078,6 +2082,8 @@ def clear_ai_tags(
         get_connection()
     ) as connection:
 
+        from tag_master import archive_ai_tags
+        archive_ai_tags(connection, image_id, action="reanalysis")
         connection.execute(
             """
             DELETE FROM photo_ai_tags
@@ -2088,6 +2094,8 @@ def clear_ai_tags(
             ),
         )
 
+        from tag_master import refresh_image_cache
+        refresh_image_cache(connection, image_id)
         connection.commit()
 
 
@@ -2099,65 +2107,44 @@ def save_ai_tag(
     model_name: str = "",
     raw_value: str = "",
 ) -> None:
-    """
-    AIが判定したタグを保存する。
-    """
-
-    tag = str(
-        tag
-    ).strip()
-
-    category = str(
-        category
-    ).strip()
-
+    """AIが判定したタグを正規化して保存する。"""
+    tag = str(tag or "").strip()
+    category = str(category or "").strip()
     if not tag:
-
         return
-
-    confidence = clamp_confidence(
-        confidence
-    )
-
+    confidence = clamp_confidence(confidence)
     now = utc_now_text()
 
-    with closing(
-        get_connection()
-    ) as connection:
-
+    with closing(get_connection()) as connection:
+        from tag_master import prepare_tag, refresh_image_cache
+        prepared = prepare_tag(connection, tag, category, source="ai", confidence=confidence)
+        if prepared["blocked"]:
+            refresh_image_cache(connection, image_id)
+            connection.commit()
+            return
+        if not raw_value:
+            raw_value = tag
+        canonical_tag = str(prepared["canonical_tag"])
+        normalized_category = str(prepared["category"])
         connection.execute(
             """
             INSERT INTO photo_ai_tags (
-                image_id,
-                category,
-                tag,
-                confidence,
-                model_name,
-                raw_value,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-
+                image_id, category, tag, confidence, model_name,
+                raw_value, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_id, category, tag)
             DO UPDATE SET
-                confidence = excluded.confidence,
-                model_name = excluded.model_name,
-                raw_value = excluded.raw_value,
-                updated_at = excluded.updated_at
+                confidence=excluded.confidence,
+                model_name=excluded.model_name,
+                raw_value=excluded.raw_value,
+                updated_at=excluded.updated_at
             """,
             (
-                image_id,
-                category,
-                tag,
-                confidence,
-                model_name,
-                raw_value,
-                now,
-                now,
+                image_id, normalized_category, canonical_tag, confidence,
+                model_name, raw_value, now, now,
             ),
         )
-
+        refresh_image_cache(connection, image_id)
         connection.commit()
 
 
@@ -2172,58 +2159,39 @@ def save_manual_tag(
     created_by: str = "",
     note: str = "",
 ) -> None:
-    """
-    人間が設定したタグを保存する。
-    """
-
-    tag = str(
-        tag
-    ).strip()
-
-    category = str(
-        category
-    ).strip()
-
+    """管理者が設定したタグを代表タグへ正規化して保存する。"""
+    tag = str(tag or "").strip()
+    category = str(category or "").strip()
     if not tag:
-
         return
-
     now = utc_now_text()
 
-    with closing(
-        get_connection()
-    ) as connection:
-
+    with closing(get_connection()) as connection:
+        from tag_master import prepare_tag, refresh_image_cache
+        prepared = prepare_tag(connection, tag, category, source="manual")
+        if prepared["blocked"]:
+            refresh_image_cache(connection, image_id)
+            connection.commit()
+            return
+        canonical_tag = str(prepared["canonical_tag"])
+        normalized_category = str(prepared["category"])
         connection.execute(
             """
             INSERT INTO photo_manual_tags (
-                image_id,
-                category,
-                tag,
-                created_by,
-                note,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-
+                image_id, category, tag, created_by, note, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(image_id, category, tag)
             DO UPDATE SET
-                created_by = excluded.created_by,
-                note = excluded.note,
-                updated_at = excluded.updated_at
+                created_by=excluded.created_by,
+                note=excluded.note,
+                updated_at=excluded.updated_at
             """,
             (
-                image_id,
-                category,
-                tag,
-                created_by,
-                note,
-                now,
-                now,
+                image_id, normalized_category, canonical_tag,
+                created_by, note, now, now,
             ),
         )
-
+        refresh_image_cache(connection, image_id)
         connection.commit()
 
 
