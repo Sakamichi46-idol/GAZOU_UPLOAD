@@ -82,28 +82,8 @@ def get_connection() -> sqlite3.Connection:
     SQLite接続を作成する。
     """
 
-    connection = sqlite3.connect(
-        PHOTO_DB_PATH,
-        timeout=30,
-    )
-
-    connection.row_factory = (
-        sqlite3.Row
-    )
-
-    connection.execute(
-        "PRAGMA foreign_keys = ON"
-    )
-
-    connection.execute(
-        "PRAGMA journal_mode = WAL"
-    )
-
-    connection.execute(
-        "PRAGMA synchronous = NORMAL"
-    )
-
-    return connection
+    from db_runtime import connect
+    return connect(PHOTO_DB_PATH)
 
 
 
@@ -2633,6 +2613,14 @@ def confirm_face_person(
         )
 
         connection.commit()
+
+    # 重い特徴量品質更新はDiscord応答経路から分離する。
+    try:
+        from face_learning_queue import enqueue_face_learning
+        enqueue_face_learning(int(face_id))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("顔学習キュー登録に失敗しました face_id=%s", face_id)
 
 
 def clear_face_confirmation(
