@@ -224,6 +224,12 @@ class PhotoAdminView(AdminWorkflowView):
     async def face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ImageIdModal("face_scan", "写真1枚を顔認証"))
 
+    @discord.ui.button(label="全タグ一覧を出力", emoji="📤", style=discord.ButtonStyle.secondary)
+    async def export_tags(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from control_panel import invoke_existing_command
+
+        await invoke_existing_command(interaction, "export_all_tags", admin_required=True)
+
 
 class ReviewAdminView(AdminWorkflowView):
     def __init__(self):
