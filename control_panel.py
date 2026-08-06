@@ -212,12 +212,14 @@ async def invoke_existing_command(
     except commands.CommandError as error:
         ctx.command_failed = True
         await bot.on_command_error(ctx, error)
-    except Exception:
+    except Exception as error:
         ctx.command_failed = True
         LOGGER.exception("一般／管理パネルからのコマンド実行中に予期しないエラーが発生しました: %s", command_name)
+        from admin_quality import record_admin_error
+        error_id = record_admin_error(error, area="panel_command", item_name=command_name, user_id=interaction.user.id)
         await _reply(
             interaction,
-            "⚠️ 操作中に予期しないエラーが発生しました。時間を置いてもう一度お試しください。",
+            f"⚠️ 操作中に予期しないエラーが発生しました。\nエラーID: `{error_id}`",
         )
 
 
@@ -665,7 +667,9 @@ class AdminQuickView(discord.ui.View):
         item: discord.ui.Item[discord.ui.View],
     ) -> None:
         LOGGER.exception("管理者クイックメニューの操作でエラーが発生しました", exc_info=error)
-        await _reply(interaction, "⚠️ 管理操作中にエラーが発生しました。もう一度お試しください。")
+        from admin_quality import record_admin_error
+        error_id = record_admin_error(error, area="admin_quick", item_name=getattr(item, "custom_id", "") or getattr(item, "label", ""), user_id=interaction.user.id)
+        await _reply(interaction, f"⚠️ 管理操作中にエラーが発生しました。\nエラーID: `{error_id}`")
 
     @discord.ui.button(label="写真巡回を1回", emoji="📷", style=discord.ButtonStyle.primary)
     async def photo_run(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -724,7 +728,9 @@ class AdminPanelView(discord.ui.View):
         item: discord.ui.Item[discord.ui.View],
     ) -> None:
         LOGGER.exception("管理者パネルの操作でエラーが発生しました", exc_info=error)
-        await _reply(interaction, "⚠️ 管理者パネルの操作中にエラーが発生しました。もう一度お試しください。")
+        from admin_quality import record_admin_error
+        error_id = record_admin_error(error, area="admin_panel", item_name=getattr(item, "custom_id", "") or getattr(item, "label", ""), user_id=interaction.user.id)
+        await _reply(interaction, f"⚠️ 管理者パネルの操作中にエラーが発生しました。\nエラーID: `{error_id}`")
 
     @discord.ui.button(label="運用ダッシュボード", emoji="🗂️", style=discord.ButtonStyle.success, custom_id="photo:admin:dashboard")
     async def dashboard(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -770,6 +776,11 @@ class AdminPanelView(discord.ui.View):
     @discord.ui.button(label="運営・AI", emoji="🧠", style=discord.ButtonStyle.secondary, custom_id="photo:admin:operations")
     async def operations(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await invoke_existing_command(interaction, "operations_dashboard", admin_required=True)
+
+    @discord.ui.button(label="使い方・設定", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="photo:admin:help")
+    async def admin_help(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from admin_quality import send_admin_help
+        await send_admin_help(interaction)
 
     @discord.ui.button(label="全コマンド", emoji="⌨️", style=discord.ButtonStyle.danger, custom_id="photo:admin:all_commands")
     async def all_commands(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -863,7 +874,8 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
                 f"Bot所有者、または **{ADMIN_ROLE_NAME}** ロール専用です。\n"
                 "「選択式管理」では用途別に操作でき、\n"
                 "「全コマンド」では既存コマンドを先頭の `!` なしで実行できます。\n"
-                "この常設パネルは時間が経過しても操作できます。"
+                "この常設パネルは時間が経過しても操作できます。\n"
+                "操作方法・診断・状態修復は「⚙️ 使い方・設定」から確認できます。"
             ),
             color=0xE67E22,
         )
@@ -885,6 +897,8 @@ async def send_control_panels(channel: discord.abc.Messageable) -> list[discord.
 
 def register_control_panel(bot: commands.Bot) -> None:
     install_admin_role_owner_bridge(bot)
+    from admin_quality import init_admin_quality_schema
+    init_admin_quality_schema()
 
     @bot.command(name="panel_setup", aliases=["panel_refresh"])
     @commands.is_owner()
