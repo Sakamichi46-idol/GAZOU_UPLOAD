@@ -17,6 +17,9 @@ SEARCH_CATEGORY_DEFS: "OrderedDict[str, tuple[str, str]]" = OrderedDict([
     ("event", ("🎉", "イベント")),
     ("food", ("🍰", "食べ物・飲み物")),
     ("shooting", ("📷", "撮影・構図")),
+    ("pose", ("🕺", "ポーズ")),
+    ("season", ("🌤️", "季節・天気")),
+    ("animal", ("🐾", "動物")),
     ("other", ("✨", "その他")),
 ])
 
