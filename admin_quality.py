@@ -181,6 +181,26 @@ class AdminHelpView(discord.ui.View):
         report = await _to_thread(run_static_regression_tests)
         await interaction.response.send_message(embed=regression_embed(report), ephemeral=True)
 
+    @discord.ui.button(label="検証付きバックアップ", emoji="💾", style=discord.ButtonStyle.success, row=2)
+    async def verified_backup(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        from maintenance_suite import create_verified_backup
+        result = await _to_thread(create_verified_backup)
+        embed = discord.Embed(title="💾 検証付きDBバックアップ", color=0x57F287)
+        embed.add_field(name="保存先", value=f"`{result['path']}`", inline=False)
+        embed.add_field(name="サイズ", value=f"{int(result['size']):,} bytes", inline=True)
+        embed.add_field(name="整合性", value="✅ 正常", inline=True)
+        embed.add_field(name="テーブル数", value=str(result['verify']['tables']), inline=True)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    @discord.ui.button(label="採用機能一覧", emoji="📋", style=discord.ButtonStyle.secondary, row=2)
+    async def feature_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from maintenance_suite import feature_checklist
+        rows = await _to_thread(feature_checklist)
+        icons = {'implemented':'✅','partial':'🟡','planned':'❌'}
+        text = "\n".join(f"{icons.get(str(r['status']),'•')} {r['label']}" for r in rows)
+        await interaction.response.send_message(embed=discord.Embed(title="📋 採用済み機能チェックリスト", description=text[:4000], color=0x5865F2), ephemeral=True)
+
 
 async def _to_thread(func, *args):
     import asyncio
