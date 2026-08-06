@@ -23,6 +23,8 @@ def _now() -> str:
 
 
 def init_advanced_admin_schema() -> None:
+    from past_face_learning import init_past_face_learning_schema
+    init_past_face_learning_schema()
     with closing(get_connection()) as con:
         con.executescript(
             """
@@ -285,6 +287,15 @@ class AICenterView(discord.ui.View):
     @discord.ui.button(label="直前変更を取り消す", emoji="↩️", style=discord.ButtonStyle.danger)
     async def undo(self, interaction, _):
         await interaction.response.send_message("取り消す変更を選んでください。", view=SnapshotRestoreView(interaction.user.id), ephemeral=True)
+
+    @discord.ui.button(label="過去確定顔を反映", emoji="🧠", style=discord.ButtonStyle.primary)
+    async def past_learning(self, interaction, _):
+        from past_face_learning import PastFaceLearningView, past_learning_home_embed
+        await interaction.response.send_message(
+            embed=past_learning_home_embed(),
+            view=PastFaceLearningView(interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.success)
     async def refresh(self, interaction, _):
