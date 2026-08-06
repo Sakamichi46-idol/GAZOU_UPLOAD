@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import os
 import sqlite3
 from contextlib import closing
@@ -64,6 +65,7 @@ from photo_face_review_view import (
 from photo_face_cluster_view import send_face_cluster_review
 from photo_id_view import send_photo_by_id
 from photo_favorites import send_favorite_gallery
+from tag_export import build_all_tags_export_zip
 from local_face_recognition import (
     FaceEngineUnavailable,
     MAX_BATCH_SCAN,
@@ -74,6 +76,9 @@ from local_face_recognition import (
     scan_faces_batch,
     suggest_face_candidates,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -322,6 +327,32 @@ def register_photo_commands(bot: commands.Bot) -> None:
     async def photo_tags_command(ctx: commands.Context) -> None:
         """ボタンと選択メニューで写真タグを絞り込む。"""
         await send_photo_tag_explorer(ctx)
+
+    @bot.command(name="export_all_tags", aliases=["all_tags_export", "tag_export"])
+    @commands.is_owner()
+    async def export_all_tags_command(ctx: commands.Context) -> None:
+        """DBにあるAIタグ・手動タグを、省略なしのZIPファイルで返す。"""
+        try:
+            zip_bytes, filename, stats = await asyncio.to_thread(build_all_tags_export_zip)
+        except Exception as error:
+            LOGGER.exception("全タグ一覧の出力に失敗しました", exc_info=error)
+            await ctx.send("⚠️ 全タグ一覧ファイルの作成に失敗しました。Railwayログを確認してください。")
+            return
+
+        if stats["unique_tags"] <= 0:
+            await ctx.send("🏷️ 現在、出力できるタグは登録されていません。")
+            return
+
+        file = discord.File(io.BytesIO(zip_bytes), filename=filename)
+        await ctx.send(
+            "🏷️ **全タグ一覧を出力しました。**\n"
+            f"重複なしのタグ名: **{stats['unique_tags']}件**\n"
+            f"出所・カテゴリー別の集計行: **{stats['summary_rows']}件** "
+            f"（AI {stats['ai_rows']} / 手動 {stats['manual_rows']}）\n"
+            "ZIP内に `all_tags.txt` と `all_tags.csv` が入っています。",
+            file=file,
+        )
+
 
     async def _send_text_lines_chunked(
         ctx: commands.Context,
