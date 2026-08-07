@@ -36,6 +36,14 @@ def _reviewer(user: discord.abc.User) -> str:
     name = _text(getattr(user, "display_name", "")) or _text(getattr(user, "name", ""))
     return f"{name} ({user.id})"
 
+def _score_source_label(value: Any) -> str:
+    return {
+        "local_face": "ローカル類似度",
+        "openai": "OpenAI候補",
+        "combined": "統合判定",
+    }.get(_text(value), _text(value) or "出所不明")
+
+
 
 def _order_sql(sort_mode: str) -> str:
     return {
@@ -78,7 +86,7 @@ def query_candidate_reviews(
         rows = con.execute(
             f"""
             SELECT r.id AS review_id,r.face_id,f.image_id,f.face_index,
-                   top.person_id,top.confidence,p.person_name,
+                   top.person_id,top.confidence,top.score_source,p.person_name,
                    p.group_name AS person_group_name,
                    b.group_name,b.member_name,b.title,b.published_at,b.blog_url
             FROM photo_face_reviews r
@@ -164,7 +172,7 @@ def center_embed(state: CandidateState) -> discord.Embed:
     for item in rows[:12]:
         lines.append(
             f"・顔ID **{item['face_id']}** — **{item['person_name']}** "
-            f"{float(item.get('confidence') or 0) * 100:.1f}%"
+            f"{float(item.get('confidence') or 0) * 100:.1f}%（{_score_source_label(item.get('score_source'))}）"
         )
     safe_add_field(e, name="このページの先頭候補", value="\n".join(lines) or "対象なし", inline=False)
     e.set_footer(text="複数選択後に『選択を一括採用』を押すと、変更前確認を経て確定します。")
