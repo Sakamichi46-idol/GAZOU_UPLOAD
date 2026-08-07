@@ -23,3 +23,23 @@ def migrate_batch(limit:int|None=None)->dict:
             con.execute('INSERT INTO tag_migration_state(source,last_id,processed,updated_at) VALUES(?,?,?,?) ON CONFLICT(source) DO UPDATE SET last_id=excluded.last_id,processed=excluded.processed,updated_at=excluded.updated_at',(source,last_id,processed,_now()))
             result[source]={'batch':len(rows),'processed':processed,'last_id':last_id,'done':len(rows)<batch}
         con.commit(); return result
+
+def migration_stats()->dict:
+    with closing(get_connection()) as con:
+        init_schema(con)
+        con.execute("CREATE TABLE IF NOT EXISTS tag_migration_state(source TEXT PRIMARY KEY,last_id INTEGER NOT NULL DEFAULT 0,processed INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL)")
+        result={}
+        for source,table in [('ai','photo_ai_tags'),('manual','photo_manual_tags')]:
+            state=con.execute('SELECT last_id,processed,updated_at FROM tag_migration_state WHERE source=?',(source,)).fetchone()
+            total=int(con.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])
+            processed=int(state['processed']) if state else 0
+            result[source]={'processed':processed,'total':total,'remaining':max(0,total-processed),'updated_at':str(state['updated_at']) if state else ''}
+        return result
+
+def reset_migration(source:str='all')->int:
+    with closing(get_connection()) as con:
+        if source in {'ai','manual'}:
+            cur=con.execute('DELETE FROM tag_migration_state WHERE source=?',(source,))
+        else:
+            cur=con.execute('DELETE FROM tag_migration_state')
+        con.commit(); return int(cur.rowcount)
