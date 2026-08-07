@@ -820,6 +820,20 @@ def init_photo_db() -> None:
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS photo_ai_priority_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                mode TEXT NOT NULL DEFAULT 'oldest',
+                updated_by INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        cursor.execute(
+            "INSERT OR IGNORE INTO photo_ai_priority_settings(id,mode,updated_by,updated_at) VALUES(1,'oldest',0,'')"
+        )
+
+        cursor.execute(
+            """
             CREATE INDEX IF NOT EXISTS
             idx_photo_blogs_member
             ON photo_blogs(member_name)
@@ -1616,7 +1630,20 @@ def get_pending_analysis_images(
                 (photo_images.local_path != '' OR photo_images.bucket_key != '')
 
             ORDER BY
-                photo_images.id ASC
+                CASE COALESCE((SELECT mode FROM photo_ai_priority_settings WHERE id=1), 'oldest')
+                    WHEN 'reviewed_first' THEN CASE WHEN EXISTS(SELECT 1 FROM photo_review_queue q WHERE q.image_id=photo_images.id AND q.status='completed') THEN 0 ELSE 1 END
+                    ELSE 0
+                END ASC,
+                CASE COALESCE((SELECT mode FROM photo_ai_priority_settings WHERE id=1), 'oldest')
+                    WHEN 'newest' THEN photo_images.id
+                    WHEN 'new_blog_first' THEN photo_blogs.id
+                    ELSE 0
+                END DESC,
+                CASE COALESCE((SELECT mode FROM photo_ai_priority_settings WHERE id=1), 'oldest')
+                    WHEN 'oldest' THEN photo_images.id
+                    WHEN 'reviewed_first' THEN photo_images.id
+                    ELSE 0
+                END ASC
 
             LIMIT ?
             """,
