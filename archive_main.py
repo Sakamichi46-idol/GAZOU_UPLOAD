@@ -1555,6 +1555,10 @@ async def on_ready() -> None:
             "(!photo_archive_start で開始)"
         )
 
+    if not face_learning_loop.is_running():
+        face_learning_loop.start()
+        print("顔学習キューを自動開始しました。")
+
     if AUTO_START_AI_ANALYSIS:
 
         if not ai_analysis_loop.is_running():
@@ -2436,6 +2440,25 @@ async def photo_archive_loop_error(
         "写真アーカイブ巡回タスクエラー:",
         error,
     )
+
+
+@tasks.loop(seconds=60)
+async def face_learning_loop() -> None:
+    """確定済み顔のローカル学習キューを少量ずつ処理する。外部APIは使わない。"""
+    from face_learning_queue import process_batch
+    result = await asyncio.to_thread(process_batch)
+    if result.get("found", 0):
+        print("顔学習キュー処理:", result)
+
+
+@face_learning_loop.before_loop
+async def before_face_learning_loop() -> None:
+    await bot.wait_until_ready()
+
+
+@face_learning_loop.error
+async def face_learning_loop_error(error: BaseException) -> None:
+    print("顔学習キューエラー:", error)
 
 
 @tasks.loop(
