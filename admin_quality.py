@@ -178,8 +178,15 @@ class AdminHelpView(discord.ui.View):
 
     @discord.ui.button(label="状態別テスト", emoji="🧪", style=discord.ButtonStyle.secondary, row=1)
     async def state_tests(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        report = await _to_thread(run_static_regression_tests)
-        await interaction.response.send_message(embed=regression_embed(report), ephemeral=True)
+        static_report = await _to_thread(run_static_regression_tests)
+        from integration_tests import run as run_integration_tests
+        integration_report = await _to_thread(run_integration_tests)
+        combined = {
+            "ok": bool(static_report.get("ok") and integration_report.get("ok")),
+            "total": int(static_report.get("total", 0)) + int(integration_report.get("total", 0)),
+            "failed": list(static_report.get("failed", [])) + list(integration_report.get("failed", [])),
+        }
+        await interaction.response.send_message(embed=regression_embed(combined), ephemeral=True)
 
     @discord.ui.button(label="検証付きバックアップ", emoji="💾", style=discord.ButtonStyle.success, row=2)
     async def verified_backup(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -192,6 +199,33 @@ class AdminHelpView(discord.ui.View):
         embed.add_field(name="整合性", value="✅ 正常", inline=True)
         embed.add_field(name="テーブル数", value=str(result['verify']['tables']), inline=True)
         await interaction.edit_original_response(embed=embed, view=self)
+
+    @discord.ui.button(label="復元診断", emoji="🧯", style=discord.ButtonStyle.secondary, row=2)
+    async def restore_diagnosis(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        from maintenance_suite import diagnose_restore
+        result = await _to_thread(diagnose_restore)
+        embed = discord.Embed(title="🧯 バックアップ復元診断", color=0xFEE75C if result.get("ok") else 0xED4245)
+        if not result.get("ok"):
+            embed.description = "\n".join(result.get("issues", ["復元診断に失敗しました。"]))
+        else:
+            backup = result["backup"]
+            embed.add_field(name="復元候補", value=f"`{backup['name']}`", inline=False)
+            lines = [f"{name}: 現在 {v['current']:,} / バックアップ {v['backup']:,}" for name,v in result['differences'].items()]
+            embed.add_field(name="主要件数比較", value="\n".join(lines)[:1024] or "比較対象なし", inline=False)
+            embed.set_footer(text="このボタンは診断のみで、実際の復元は行いません。")
+        await interaction.edit_original_response(embed=embed, view=self)
+
+    @discord.ui.button(label="学習・タグ進捗", emoji="📈", style=discord.ButtonStyle.secondary, row=3)
+    async def worker_status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from face_learning_queue import queue_stats
+        from tag_migration_worker import migration_stats
+        faces = await _to_thread(queue_stats)
+        tags = await _to_thread(migration_stats)
+        embed = discord.Embed(title="📈 バックグラウンド処理状況", color=0x5865F2)
+        embed.add_field(name="顔学習キュー", value="\n".join(f"{k}: {v:,}" for k,v in faces.items()), inline=False)
+        embed.add_field(name="タグ移行", value="\n".join(f"{k}: {v['processed']:,}/{v['total']:,}（残り{v['remaining']:,}）" for k,v in tags.items()), inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="採用機能一覧", emoji="📋", style=discord.ButtonStyle.secondary, row=2)
     async def feature_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
