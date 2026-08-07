@@ -2589,7 +2589,8 @@ def confirm_face_person(
         get_connection()
     ) as connection:
 
-        connection.execute(
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
             """
             UPDATE photo_faces
 
@@ -2611,7 +2612,9 @@ def confirm_face_person(
                 face_id,
             ),
         )
-
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise ValueError(f"顔ID {face_id} が見つかりません。")
         connection.commit()
 
     # 重い特徴量品質更新はDiscord応答経路から分離する。
