@@ -6,6 +6,21 @@ ROOT=Path(__file__).resolve().parent
 
 MOJIBAKE_MARKERS=("ã","ã","ð","â","ï¸","æ¤","ç®")
 
+def check_face_candidate_diagnostics() -> list[str]:
+    errors: list[str] = []
+    local_text = Path(__file__).with_name("local_face_recognition.py").read_text(encoding="utf-8")
+    diag_text = Path(__file__).with_name("face_candidate_diagnostics.py").read_text(encoding="utf-8")
+    ai_text = Path(__file__).with_name("ai_center.py").read_text(encoding="utf-8")
+    if "def diagnose_face_candidates(" not in local_text:
+        errors.append("diagnose_face_candidates がありません")
+    if "DEFAULT_MATCH_THRESHOLD" not in diag_text or "diagnose_recent" not in diag_text:
+        errors.append("顔候補診断モジュールが不完全です")
+    if 'label="顔候補診断"' not in ai_text:
+        errors.append("AI管理に顔候補診断ボタンがありません")
+    if "OpenAI APIを使わず" not in diag_text:
+        errors.append("API不使用の診断表示がありません")
+    return errors
+
 
 def run()->dict:
     checks=[]
@@ -152,6 +167,13 @@ def run()->dict:
         'face_candidate_failure_isolated',
         'AI解析後のローカル顔候補更新に失敗:' in analyzer and 'summary["error"]' in analyzer,
         'ローカル顔候補生成失敗をAI解析本体から分離',
+    ))
+
+    diag_errors = check_face_candidate_diagnostics()
+    checks.append((
+        'face_candidate_diagnostics',
+        not diag_errors,
+        '顔候補診断: ' + ('OK' if not diag_errors else ' / '.join(diag_errors)),
     ))
 
     failed=[c for c in checks if not c[1]]
