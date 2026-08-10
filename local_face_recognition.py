@@ -18,6 +18,11 @@ from typing import Any, Iterator
 from urllib.parse import urlparse
 
 from bucket_storage import bucket_is_configured, download_to_file
+from face_candidate_scoring import (
+    INTEGRATED_CANDIDATE_THRESHOLD,
+    score_candidate,
+    save_score_detail,
+)
 from photo_database import (
     add_face_review,
     confirm_face_person,
@@ -31,7 +36,6 @@ from photo_database import (
 
 MODEL_NAME = "opencv-haar-gray32-v1"
 EMBEDDING_SIZE = 32
-DEFAULT_MATCH_THRESHOLD = 0.72
 MIN_FACE_SIZE = 48
 MAX_BATCH_SCAN = 1000
 
@@ -271,6 +275,17 @@ def detect_faces_for_image(image_id: int) -> dict[str, Any]:
 
 
 def _reference_embeddings(exclude_face_id: int, group_name: str = "") -> list[dict[str, Any]]:
+    """Return diverse, quality-first local references.
+
+    Per-person and per-blog caps prevent a single photo session from dominating
+    candidate similarity. Inactive learning-registry rows are excluded.
+    """
+    # 古いDBでも安全に品質レジストリを使えるよう、参照前にスキーマだけ保証する。
+    try:
+        from past_face_learning import init_past_face_learning_schema
+        init_past_face_learning_schema()
+    except Exception:
+        pass
     params: list[Any] = [MODEL_NAME, int(exclude_face_id)]
     group_sql = ""
     if group_name:
@@ -281,9 +296,12 @@ def _reference_embeddings(exclude_face_id: int, group_name: str = "") -> list[di
             f"""
             SELECT photo_faces.id AS face_id, photo_faces.face_embedding,
                    photo_people.id AS person_id, photo_people.person_name,
-                   photo_people.group_name
+                   photo_people.group_name, photo_images.blog_id,
+                   COALESCE(learning.quality_score, 0.65) AS learning_quality,
+                   COALESCE(learning.is_active, 1) AS learning_active
             FROM photo_faces
             JOIN photo_people ON photo_people.id = photo_faces.confirmed_person_id
+            JOIN photo_images ON photo_images.id = photo_faces.image_id
             LEFT JOIN photo_face_learning_registry learning
               ON learning.face_id = photo_faces.id
             WHERE photo_faces.model_name = ?
@@ -292,10 +310,29 @@ def _reference_embeddings(exclude_face_id: int, group_name: str = "") -> list[di
               AND photo_faces.confirmation_status IN ('confirmed','manually_confirmed','auto_seeded')
               AND COALESCE(learning.is_active, 1) = 1
               {group_sql}
+            ORDER BY photo_people.id, COALESCE(learning.quality_score,0.65) DESC, photo_faces.id DESC
             """,
             tuple(params),
         ).fetchall()
-        return [dict(row) for row in rows]
+
+    # Keep enough diversity while avoiding thousands of near-identical references.
+    per_person: dict[int, int] = {}
+    per_blog: dict[tuple[int, int], int] = {}
+    result: list[dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        person_id = int(row["person_id"])
+        blog_id = int(row.get("blog_id") or 0)
+        if per_person.get(person_id, 0) >= 500:
+            continue
+        key = (person_id, blog_id)
+        if blog_id and per_blog.get(key, 0) >= 20:
+            continue
+        per_person[person_id] = per_person.get(person_id, 0) + 1
+        if blog_id:
+            per_blog[key] = per_blog.get(key, 0) + 1
+        result.append(row)
+    return result
 
 
 
@@ -341,7 +378,7 @@ def _save_candidate_diagnostic(
                 updated_at=excluded.updated_at
             """,
             (
-                int(face_id), int(image_id), float(DEFAULT_MATCH_THRESHOLD), int(reference_count),
+                int(face_id), int(image_id), float(INTEGRATED_CANDIDATE_THRESHOLD), int(reference_count),
                 int(best.get("person_id")) if best.get("person_id") is not None else None,
                 str(best.get("person_name") or ""), float(best.get("confidence") or 0),
                 json.dumps(top, ensure_ascii=False), str(reason), now,
@@ -351,7 +388,7 @@ def _save_candidate_diagnostic(
 
 
 def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict[str, Any]]:
-    """Compare detected faces with confirmed local references using cosine similarity."""
+    """Compare faces with local references and rank by integrated local score."""
     _, np = _load_dependencies()
     image = get_photo_image(int(image_id))
     if not image:
@@ -361,9 +398,9 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
         raise ValueError("先に !face_scan 画像ID を実行してください。")
 
     group_name = str(image.get("group_name") or "")
+    blog_member_name = str(image.get("member_name") or "")
     result: list[dict[str, Any]] = []
     for face in faces:
-        # すでに本確定・自動シード済みの顔は、再び確認待ちへ戻さない。
         if face.get("confirmed_person_id") is not None:
             continue
         encoded = str(face.get("face_embedding") or "")
@@ -371,39 +408,53 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
             continue
         target = _decode_embedding(encoded, np)
         references = _reference_embeddings(int(face["id"]), group_name)
-        best_by_person_all: dict[int, dict[str, Any]] = {}
+        best_raw_by_person: dict[int, dict[str, Any]] = {}
         for reference in references:
             try:
                 vector = _decode_embedding(str(reference["face_embedding"]), np)
             except Exception:
                 continue
             similarity = float(np.dot(target, vector))
-            # 正規化済みベクトルのコサイン類似度を0〜1へ丸める。
-            confidence = max(0.0, min(similarity, 1.0))
+            similarity = max(0.0, min(similarity, 1.0))
             person_id = int(reference["person_id"])
-            current = best_by_person_all.get(person_id)
-            if current is None or confidence > float(current["confidence"]):
-                best_by_person_all[person_id] = {
+            current = best_raw_by_person.get(person_id)
+            if current is None or similarity > float(current["face_similarity"]):
+                best_raw_by_person[person_id] = {
                     "person_id": person_id,
                     "person_name": str(reference["person_name"]),
-                    "confidence": confidence,
+                    "face_similarity": similarity,
                 }
 
-        ranked_all = sorted(
-            best_by_person_all.values(),
-            key=lambda item: item["confidence"],
-            reverse=True,
-        )
+        scored_all: list[dict[str, Any]] = []
+        for item in best_raw_by_person.values():
+            detail = score_candidate(
+                face_id=int(face["id"]),
+                person_id=int(item["person_id"]),
+                person_name=str(item["person_name"]),
+                face_similarity=float(item["face_similarity"]),
+                blog_member_name=blog_member_name,
+            )
+            save_score_detail(detail)
+            scored_all.append({
+                "person_id": int(item["person_id"]),
+                "person_name": str(item["person_name"]),
+                "confidence": float(detail["integrated_score"]),
+                "face_similarity": float(detail["face_similarity"]),
+                "confidence_band": str(detail["confidence_band"]),
+                "reason": str(detail["reason"]),
+            })
+
+        ranked_all = sorted(scored_all, key=lambda item: item["confidence"], reverse=True)
         candidates = [
             item for item in ranked_all
-            if float(item["confidence"]) >= DEFAULT_MATCH_THRESHOLD
+            if float(item["confidence"]) >= INTEGRATED_CANDIDATE_THRESHOLD
         ][:max(1, min(limit_per_face, 10))]
 
         if not references:
             diagnostic_reason = "参照顔なし"
         elif not ranked_all:
             diagnostic_reason = "有効な参照顔なし"
-        elif float(ranked_all[0]["confidence"]) < DEFAULT_MATCH_THRESHOLD:
+        elif float(ranked_all[0]["confidence"]) < INTEGRATED_CANDIDATE_THRESHOLD:
             diagnostic_reason = "候補しきい値未満"
         elif candidates:
             diagnostic_reason = "候補登録"
@@ -413,22 +464,22 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
             int(image_id), int(face["id"]), ranked_all, diagnostic_reason, len(references)
         )
 
-        # 最新の確定顔を学習元として再計算するため、古い候補をいったん削除する。
-        # これにより手動確定・一括確定した顔が、次回の候補生成へ確実に反映される。
         with closing(get_connection()) as connection:
-            connection.execute(
-                "DELETE FROM photo_face_candidates WHERE face_id = ?",
-                (int(face["id"]),),
-            )
+            connection.execute("DELETE FROM photo_face_candidates WHERE face_id = ?", (int(face["id"]),))
             connection.commit()
 
         for rank, candidate in enumerate(candidates, 1):
+            raw = json.dumps({
+                "integrated_score": candidate["confidence"],
+                "face_similarity": candidate.get("face_similarity", 0),
+                "band": candidate.get("confidence_band", ""),
+                "reason": candidate.get("reason", ""),
+            }, ensure_ascii=False)
             save_face_candidate(
                 int(face["id"]), int(candidate["person_id"]), float(candidate["confidence"]),
-                candidate_rank=rank, model_name=MODEL_NAME,
-                raw_value=f"cosine-derived:{candidate['confidence']:.6f}",
+                candidate_rank=rank, model_name="local-integrated-v1", raw_value=raw,
             )
-        add_face_review(int(face["id"]), "ローカル顔候補を確認してください。", candidates)
+        add_face_review(int(face["id"]), "ローカル統合顔候補を確認してください。", candidates)
         result.append({"face_id": int(face["id"]), "candidates": candidates})
     return result
 
@@ -504,21 +555,36 @@ def diagnose_face_candidates(image_id: int, top_n: int = 3, *, scan_if_missing: 
                 vector = _decode_embedding(str(reference["face_embedding"]), np)
             except Exception:
                 continue
-            similarity = float(np.dot(target, vector))
-            confidence = max(0.0, min(similarity, 1.0))
+            similarity = max(0.0, min(float(np.dot(target, vector)), 1.0))
             person_id = int(reference["person_id"])
             current = best_by_person.get(person_id)
-            if current is None or confidence > float(current["confidence"]):
+            if current is None or similarity > float(current["face_similarity"]):
                 best_by_person[person_id] = {
                     "person_id": person_id,
                     "person_name": str(reference["person_name"]),
-                    "confidence": confidence,
+                    "face_similarity": similarity,
                 }
 
+        scored = []
+        blog_member_name = str(image.get("member_name") or "")
+        for item in best_by_person.values():
+            detail = score_candidate(
+                face_id=face_id,
+                person_id=int(item["person_id"]),
+                person_name=str(item["person_name"]),
+                face_similarity=float(item["face_similarity"]),
+                blog_member_name=blog_member_name,
+            )
+            scored.append({
+                "person_id": int(item["person_id"]),
+                "person_name": str(item["person_name"]),
+                "confidence": float(detail["integrated_score"]),
+                "face_similarity": float(detail["face_similarity"]),
+                "confidence_band": str(detail["confidence_band"]),
+                "reason": str(detail["reason"]),
+            })
         ranked = sorted(
-            best_by_person.values(),
-            key=lambda item: float(item["confidence"]),
-            reverse=True,
+            scored, key=lambda item: float(item["confidence"]), reverse=True
         )[:max(1, min(int(top_n), 10))]
         registered = get_face_candidates(face_id)
         registered_count = len(registered)
@@ -528,7 +594,7 @@ def diagnose_face_candidates(image_id: int, top_n: int = 3, *, scan_if_missing: 
             reason = "人物確定済み"
         elif not ranked:
             reason = "有効な参照顔なし"
-        elif float(ranked[0]["confidence"]) < DEFAULT_MATCH_THRESHOLD:
+        elif float(ranked[0]["confidence"]) < INTEGRATED_CANDIDATE_THRESHOLD:
             reason = "候補しきい値未満"
             summary["below_threshold"] += 1
         elif registered_count:
@@ -564,7 +630,7 @@ def diagnose_face_candidates(image_id: int, top_n: int = 3, *, scan_if_missing: 
         "image_id": image_id,
         "group_name": group_name,
         "analysis_status": str(image.get("analysis_status") or ""),
-        "threshold": float(DEFAULT_MATCH_THRESHOLD),
+        "threshold": float(INTEGRATED_CANDIDATE_THRESHOLD),
         "scanned_now": scanned_now,
         "summary": summary,
         "faces": result_faces,
