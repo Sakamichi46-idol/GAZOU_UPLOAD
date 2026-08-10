@@ -567,7 +567,7 @@ def phase3_preflight(
         or 3
     )
 
-    skip_api = False
+    local_face_complete = False
     reason = ""
 
     if (
@@ -575,17 +575,16 @@ def phase3_preflight(
         and face_score >= threshold
         and local_tag_count >= min_tags
     ):
-        skip_api = True
-
+        local_face_complete = True
         reason = (
-            "節約モード: "
-            f"ローカル顔候補{face_score:.3f}、"
-            f"ローカルタグ{local_tag_count}件"
+            "人物判定はローカルで十分: "
+            f"顔候補{face_score:.3f}、ローカル補助タグ{local_tag_count}件。"
+            "画像内容タグはOpenAIで生成します。"
         )
 
     decision = (
-        "local_complete"
-        if skip_api
+        "local_face_complete_tag_api"
+        if local_face_complete
         else "api_needed"
     )
 
@@ -652,10 +651,11 @@ def phase3_preflight(
             person,
         "local_face_score":
             face_score,
-        "skip_api":
-            skip_api,
-        "reason":
-            reason,
+        # 互換キーは残すが、タグ生成を維持するため画像全体APIはスキップしない。
+        "skip_api": False,
+        "local_face_complete": local_face_complete,
+        "tag_api_required": True,
+        "reason": reason,
     }
 
 
@@ -714,7 +714,7 @@ def cache_diagnostics() -> dict[str, Any]:
                 COUNT(*),
                 SUM(
                     CASE
-                        WHEN decision='local_complete'
+                        WHEN decision IN ('local_complete','local_face_complete_tag_api')
                         THEN 1
                         ELSE 0
                     END
@@ -1042,6 +1042,15 @@ def refresh_quality_scores() -> dict[str, int]:
             )
 
         con.commit()
+
+    # 品質再計算を検索へ即時反映。手動タグは常に優先し、AIタグだけ品質閾値を使う。
+    try:
+        from tag_master import rebuild_cache
+        with closing(get_connection()) as cache_con:
+            rebuild_cache(cache_con)
+            cache_con.commit()
+    except Exception as exc:
+        print("タグ品質の検索キャッシュ反映に失敗:", type(exc).__name__, exc)
 
     return {
         "tags": len(tags),
