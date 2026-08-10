@@ -13,7 +13,7 @@ def check_face_candidate_diagnostics() -> list[str]:
     ai_text = Path(__file__).with_name("ai_center.py").read_text(encoding="utf-8")
     if "def diagnose_face_candidates(" not in local_text:
         errors.append("diagnose_face_candidates がありません")
-    if "DEFAULT_MATCH_THRESHOLD" not in diag_text or "diagnose_recent" not in diag_text:
+    if "INTEGRATED_CANDIDATE_THRESHOLD" not in diag_text or "diagnose_recent" not in diag_text:
         errors.append("顔候補診断モジュールが不完全です")
     if 'label="顔候補診断"' not in ai_text:
         errors.append("AI管理に顔候補診断ボタンがありません")
@@ -21,7 +21,7 @@ def check_face_candidate_diagnostics() -> list[str]:
         errors.append("API不使用の診断表示がありません")
     if "await interaction.response.defer" not in ai_text.split("async def face_diagnostics", 1)[1].split("@discord.ui.button", 1)[0]:
         errors.append("AI管理の顔候補診断callbackがimport前にdeferしていません")
-    if "from local_face_recognition import DEFAULT_MATCH_THRESHOLD, diagnose_face_candidates" in diag_text:
+    if "from local_face_recognition import diagnose_face_candidates" in diag_text.split("def _load_face_diagnostics", 1)[0]:
         errors.append("顔候補診断がlocal_face_recognitionをトップレベルimportしています")
     if "def _load_face_diagnostics" not in diag_text:
         errors.append("顔認識の遅延importヘルパーがありません")
