@@ -2764,9 +2764,28 @@ def get_face_candidates(
             ),
         )
 
-        return rows_to_dicts(
+        items = rows_to_dicts(
             cursor.fetchall()
         )
+
+    # 統合スコアの内訳があれば候補へ付加する。古いDBでも表示を壊さない。
+    try:
+        from face_candidate_scoring import get_face_score_details
+        details = get_face_score_details(int(face_id))
+        for item in items:
+            detail = details.get(int(item.get("person_id") or 0), {})
+            if detail:
+                item["score_detail"] = detail
+                item["face_similarity"] = float(detail.get("face_similarity") or 0)
+                item["person_quality"] = float(detail.get("person_quality") or 0)
+                item["reference_count"] = int(detail.get("reference_count") or 0)
+                item["acceptance_rate"] = float(detail.get("acceptance_rate") or 0)
+                item["author_match"] = bool(detail.get("author_match"))
+                item["confidence_band"] = str(detail.get("confidence_band") or "")
+                item["score_reason"] = str(detail.get("reason") or "")
+    except Exception:
+        pass
+    return items
 
 
 # =========================
@@ -2999,6 +3018,16 @@ def complete_face_review(
         )
 
         connection.commit()
+
+    # 管理者の本確定結果を誤学習防止ポリシー経由で参照顔へ反映する。
+    try:
+        from face_candidate_scoring import register_confirmed_face_learning
+        register_confirmed_face_learning(int(face_id), int(person_id), source="manual_review")
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "確定顔の安全学習反映に失敗しました face_id=%s", face_id
+        )
 
 
 def skip_face_review(
@@ -4989,6 +5018,17 @@ def complete_face_reviews_bulk(
             completed += 1
 
         connection.commit()
+
+    # 一括確定も同じ誤学習防止ポリシーを通す。
+    try:
+        from face_candidate_scoring import register_confirmed_face_learning
+        for item in items:
+            register_confirmed_face_learning(
+                int(item["face_id"]), int(item["person_id"]), source="bulk_manual_review"
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("一括確定顔の安全学習反映に失敗しました")
 
     return completed
 
