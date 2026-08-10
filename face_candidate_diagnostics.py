@@ -11,15 +11,19 @@ from embed_safety import safe_add_field
 from photo_database import get_connection
 
 
-def _load_face_diagnostics() -> tuple[float, Callable[..., dict[str, Any]]]:
+def _load_face_diagnostics() -> tuple[float, Callable[..., dict[str, Any]], Callable[..., list[dict[str, Any]]]]:
     """顔認識本体は診断実行時だけ読み込む。
 
     AI管理画面を開く段階ではOpenCV等の重い依存を読み込まない。
     """
     from face_candidate_scoring import INTEGRATED_CANDIDATE_THRESHOLD
-    from local_face_recognition import diagnose_face_candidates
+    from local_face_recognition import diagnose_face_candidates, suggest_face_candidates
 
-    return float(INTEGRATED_CANDIDATE_THRESHOLD), diagnose_face_candidates
+    return (
+        float(INTEGRATED_CANDIDATE_THRESHOLD),
+        diagnose_face_candidates,
+        suggest_face_candidates,
+    )
 
 
 def _recent_analyzed_image_ids(limit: int = 20) -> list[int]:
@@ -42,7 +46,7 @@ def _recent_analyzed_image_ids(limit: int = 20) -> list[int]:
 
 
 def diagnose_recent(limit: int = 20) -> dict[str, Any]:
-    threshold, diagnose_face_candidates = _load_face_diagnostics()
+    threshold, diagnose_face_candidates, _ = _load_face_diagnostics()
     image_ids = _recent_analyzed_image_ids(limit)
     rows: list[dict[str, Any]] = []
     reasons: Counter[str] = Counter()
@@ -76,12 +80,112 @@ def diagnose_recent(limit: int = 20) -> dict[str, Any]:
 
 
 def diagnose_single(image_id: int) -> dict[str, Any]:
-    _, diagnose_face_candidates = _load_face_diagnostics()
+    _, diagnose_face_candidates, _ = _load_face_diagnostics()
     return diagnose_face_candidates(
         int(image_id),
         top_n=3,
         scan_if_missing=True,
     )
+
+
+def regenerate_single(image_id: int) -> dict[str, Any]:
+    """保存済み顔特徴量から正式候補を再生成し、再診断結果を返す。
+
+    OpenAI APIは使用しない。人物確定済みの顔は
+    ``suggest_face_candidates`` 側で自動的に除外される。
+    """
+    _, diagnose_face_candidates, suggest_face_candidates = _load_face_diagnostics()
+    image_id = int(image_id)
+
+    # まず診断して、顔自体が未スキャンならローカル顔スキャンまで済ませる。
+    before = diagnose_face_candidates(
+        image_id,
+        top_n=3,
+        scan_if_missing=True,
+    )
+
+    if int(before.get("summary", {}).get("detected_faces", 0) or 0) > 0:
+        suggest_face_candidates(image_id)
+
+    after = diagnose_face_candidates(
+        image_id,
+        top_n=3,
+        scan_if_missing=False,
+    )
+    after["regenerated"] = True
+    return after
+
+
+def _needs_regeneration(result: dict[str, Any]) -> bool:
+    """しきい値を通ったのに正式候補が未登録の顔があるか判定する。"""
+    threshold = float(result.get("threshold") or 0)
+    for face in result.get("faces", []):
+        if face.get("confirmed"):
+            continue
+        if int(face.get("registered_count", 0) or 0) > 0:
+            continue
+        candidates = face.get("top_candidates") or []
+        if candidates and float(candidates[0].get("confidence") or 0) >= threshold:
+            return True
+    return False
+
+
+class SingleDiagnosticResultView(discord.ui.View):
+    def __init__(self, owner_id: int, image_id: int, can_regenerate: bool):
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.image_id = int(image_id)
+        self.regenerate.disabled = not bool(can_regenerate)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この画面は開いた管理者だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="この画像の候補を再生成",
+        emoji="🔄",
+        style=discord.ButtonStyle.success,
+    )
+    async def regenerate(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await asyncio.to_thread(regenerate_single, self.image_id)
+        except Exception as exc:
+            await interaction.followup.send(
+                (
+                    "⚠️ 顔候補の再生成に失敗しました。\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = _single_embed(result)
+        if int(result.get("summary", {}).get("registered_candidates", 0) or 0) > 0:
+            embed.description += "\n✅ 正式候補を再生成し、AI候補確認へ登録しました。"
+        else:
+            embed.description += (
+                "\nℹ️ 再生成を実行しましたが、現在の条件では正式候補は登録されませんでした。"
+            )
+
+        await interaction.followup.send(
+            embed=embed,
+            view=SingleDiagnosticResultView(
+                self.owner_id,
+                self.image_id,
+                _needs_regeneration(result),
+            ),
+            ephemeral=True,
+        )
 
 
 def _single_embed(result: dict[str, Any]) -> discord.Embed:
@@ -239,6 +343,11 @@ class FaceDiagnosticIdModal(
 
         await interaction.followup.send(
             embed=_single_embed(result),
+            view=SingleDiagnosticResultView(
+                interaction.user.id,
+                image_id,
+                _needs_regeneration(result),
+            ),
             ephemeral=True,
         )
 
