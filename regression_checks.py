@@ -98,7 +98,7 @@ def run()->dict:
     checks.append(('insights_panel_entry','photo:admin:ai_insights' in panel,'管理者トップからAIダッシュボードへ接続'))
     checks.append(('priority_queue_order','photo_ai_priority_settings' in db and "reviewed_first" in db,'解析優先順位を未解析キューへ反映'))
 
-    phase3=(ROOT/'phase3_ai_center.py').read_text(encoding='utf-8') if (ROOT/'phase3_ai_center.py').exists() else ''
+    phase3=(ROOT/'ai_center.py').read_text(encoding='utf-8') if (ROOT/'ai_center.py').exists() else ''
     analyzer=(ROOT/'photo_ai_analyzer.py').read_text(encoding='utf-8')
     checks.append(('phase3_panel_entry','photo:admin:phase3_ai' in panel,'管理者トップからPhase 3 AI管理へ接続'))
     checks.append(('phase3_profiles',all(x in phase3 for x in ('節約モード','標準モード','高精度モード')),'AI設定プロファイル'))
