@@ -1463,6 +1463,11 @@ async def on_ready() -> None:
             migration_result = await asyncio.to_thread(run_migrations)
             print("DBマイグレーション:", migration_result)
 
+            from phase3_ai_center import init_phase3_schema, start_phase3_schedule_worker
+            await asyncio.to_thread(init_phase3_schema)
+            start_phase3_schedule_worker()
+            print("Phase 3 AI管理初期化完了")
+
         except Exception as error:
 
             print(
