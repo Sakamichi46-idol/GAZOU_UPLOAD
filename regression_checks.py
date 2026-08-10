@@ -98,6 +98,19 @@ def run()->dict:
     checks.append(('insights_panel_entry','photo:admin:ai_insights' in panel,'管理者トップからAIダッシュボードへ接続'))
     checks.append(('priority_queue_order','photo_ai_priority_settings' in db and "reviewed_first" in db,'解析優先順位を未解析キューへ反映'))
 
+    phase3=(ROOT/'phase3_ai_center.py').read_text(encoding='utf-8') if (ROOT/'phase3_ai_center.py').exists() else ''
+    analyzer=(ROOT/'photo_ai_analyzer.py').read_text(encoding='utf-8')
+    checks.append(('phase3_panel_entry','photo:admin:phase3_ai' in panel,'管理者トップからPhase 3 AI管理へ接続'))
+    checks.append(('phase3_profiles',all(x in phase3 for x in ('節約モード','標準モード','高精度モード')),'AI設定プロファイル'))
+    checks.append(('phase3_two_stage','phase3_preflight' in analyzer and 'local_two_stage' in analyzer,'ローカル→OpenAI二段階判定'))
+    checks.append(('phase3_hash_cache','record_cache_event(image_id, "image_hash"' in analyzer,'画像ハッシュキャッシュ診断'))
+    checks.append(('phase3_prompt_model','effective_model' in analyzer and 'effective_prompt' in analyzer,'モデル・プロンプト動的管理'))
+    checks.append(('phase3_schedule','start_phase3_schedule_worker' in (ROOT/'archive_main.py').read_text(encoding='utf-8'),'解析予約ワーカー'))
+    checks.append(('phase3_quality',all(x in phase3 for x in ('phase3_tag_quality','phase3_person_quality','phase3_photo_quality')),'タグ・人物・写真品質'))
+    checks.append(('phase3_recommendations','phase3_recommendations' in phase3 and 'おすすめ写真' in phase3,'おすすめ写真'))
+    checks.append(('phase3_tag_search','TagSearchModal' in phase3 and 'similar_tags' in phase3,'タグ候補・類似タグ検索'))
+    checks.append(('phase3_utf8',not any(marker in phase3 for marker in MOJIBAKE_MARKERS),'Phase3日本語文字化けなし'))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
