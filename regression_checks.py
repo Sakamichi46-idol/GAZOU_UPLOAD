@@ -117,8 +117,19 @@ def run()->dict:
     analyzer=(ROOT/'photo_ai_analyzer.py').read_text(encoding='utf-8')
     checks.append(('phase3_panel_entry','photo:admin:phase3_ai' in panel,'管理者トップからPhase 3 AI管理へ接続'))
     checks.append(('phase3_profiles',all(x in phase3 for x in ('節約モード','標準モード','高精度モード')),'AI設定プロファイル'))
-    checks.append(('phase3_two_stage','phase3_preflight' in analyzer and 'local_two_stage' in analyzer,'ローカル→OpenAI二段階判定'))
+    checks.append(('phase3_two_stage','phase3_preflight' in analyzer and 'local_face_complete' in analyzer and '画像内容タグはOpenAI' in analyzer,'人物ローカル判定＋OpenAIタグ生成の二段階判定'))
     checks.append(('phase3_hash_cache','record_cache_event(image_id, "image_hash"' in analyzer,'画像ハッシュキャッシュ診断'))
+    scoring=(ROOT/'face_candidate_scoring.py').read_text(encoding='utf-8') if (ROOT/'face_candidate_scoring.py').exists() else ''
+    local_face=(ROOT/'local_face_recognition.py').read_text(encoding='utf-8') if (ROOT/'local_face_recognition.py').exists() else ''
+    face_center=(ROOT/'face_candidate_center.py').read_text(encoding='utf-8') if (ROOT/'face_candidate_center.py').exists() else ''
+    face_review=(ROOT/'photo_face_review_view.py').read_text(encoding='utf-8') if (ROOT/'photo_face_review_view.py').exists() else ''
+    tag_master_text=(ROOT/'tag_master.py').read_text(encoding='utf-8') if (ROOT/'tag_master.py').exists() else ''
+    checks.append(('integrated_face_scoring', all(x in scoring for x in ('face_similarity','person_quality','reference_count','acceptance_rate','integrated_score')), '顔類似度・人物品質・参照数・採用率の統合スコア'))
+    checks.append(('candidate_reason_display', 'score_reason' in face_review and '統合' in face_center, '顔候補の判定理由を確認画面へ表示'))
+    checks.append(('safe_confirmed_learning', all(x in scoring for x in ('重複特徴量','同一ブログの参照上限','人物ごとの参照上限','品質不足')), '確定結果の誤学習防止'))
+    checks.append(('learning_hook_single_bulk', 'register_confirmed_face_learning' in db and 'bulk_manual_review' in db, '単体・一括確定を安全学習へ接続'))
+    checks.append(('reference_diversity', 'per_person' in local_face and 'per_blog' in local_face, '人物・ブログ単位で参照顔の偏りを抑制'))
+    checks.append(('tag_quality_search_policy', 'phase3_tag_quality' in tag_master_text and 'quality_score, 0.75' in tag_master_text, 'タグ品質をAIタグ検索キャッシュへ反映'))
     checks.append(('phase3_prompt_model','effective_model' in analyzer and 'effective_prompt' in analyzer,'モデル・プロンプト動的管理'))
 
     # photo_ai_analyzer から ai_center へ依存する主要関数は、
