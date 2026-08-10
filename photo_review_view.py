@@ -33,6 +33,7 @@ from sakamichi_members import SAKAMICHI_MEMBERS, iter_members
 from advanced_admin_features import (
     HOLD_REASON_LABELS, create_people_snapshot, save_hold_reason, save_provisional_people, load_person_sets,
 )
+from operation_locks import resource_lock
 
 REVIEW_EMBED_COLOR = discord.Color.blue()
 SUCCESS_EMBED_COLOR = discord.Color.green()
@@ -256,10 +257,28 @@ async def _finish_review_message(
     source_message: discord.Message | None,
     text: str,
 ) -> None:
-    """人物確認メッセージを消し、本人だけに短時間の完了通知を出す。"""
+    """人物確定後の画面を共通終了する。
+
+    元の人物確認カードと、人物選択・最終確認など現在操作中の
+    エフェメラル応答の両方を消す。成功通知だけを数秒表示する。
+    これにより確定経路によってメッセージが残る差をなくす。
+    """
     if not interaction.response.is_done():
         await interaction.response.defer()
+
     await _delete_message_safely(source_message)
+
+    # interaction が元カード自身の場合も、既に source_message.delete() 済みなら
+    # NotFound になるだけなので安全。人物選択など別エフェメラルからの確定時は、
+    # こちらで現在の操作画面も確実に消す。
+    try:
+        await interaction.delete_original_response()
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+        try:
+            await interaction.edit_original_response(content=None, embed=None, view=None)
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            pass
+
     try:
         notice = await interaction.followup.send(
             text,
@@ -420,36 +439,47 @@ class ReviewSession:
 
         reviewer = get_reviewer_name(interaction.user)
         await interaction.response.defer(ephemeral=True)
-        count = await asyncio.to_thread(
-            set_confirmed_blog_people,
-            self.current_blog_id,
-            names,
-            confirmed_by=reviewer,
-            note="Discordレビュー画面からブログ単位で一括確定",
-            statuses=(self.queue_status,),
-        )
-
-        for image_id, message in list(self.message_by_image_id.items()):
+        try:
+            count = await asyncio.to_thread(
+                _commit_blog_people_with_snapshots,
+                self.current_blog_id,
+                names,
+                interaction.user.id,
+                reviewer,
+                self.queue_status,
+            )
+        except Exception as exc:
             try:
-                embed = discord.Embed(
-                    title="✅ ブログ単位で一括確定",
-                    description=f"このブログの対象画像を **{format_people_for_users('、'.join(names))}** で確定しました。",
-                    color=SUCCESS_EMBED_COLOR,
+                await interaction.followup.send(
+                    f"⚠️ ブログ一括確定に失敗しました: {exc}", ephemeral=True
                 )
-                safe_add_field(embed, name="画像ID", value=str(image_id), inline=True)
-                safe_add_field(embed, name="確定人物", value=format_people_for_users("、".join(names)), inline=False)
-                await message.edit(embed=embed, view=None, attachments=[])
-            except (discord.HTTPException, discord.NotFound):
+            except discord.HTTPException:
                 pass
+            return 0
+
+        # 確定済みレビューは残さず消す。大量確定後に古いエフェメラルが
+        # 画面へ残り続けるのを防ぐ。
+        for message in list(self.message_by_image_id.values()):
+            await _delete_message_safely(message)
 
         self.active_image_ids.clear()
         self.completed_image_ids.clear()
         self.message_by_image_id.clear()
         self.current_blog_id = None
-        await interaction.followup.send(
-            f"✅ このブログの **{count}件** を **{format_people_for_users('、'.join(names))}** で一括確定しました。",
-            ephemeral=True,
-        )
+
+        try:
+            await interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            pass
+        try:
+            notice = await interaction.followup.send(
+                f"✅ このブログの **{count}件** を **{format_people_for_users('、'.join(names))}** で一括確定しました。",
+                ephemeral=True,
+                wait=True,
+            )
+            asyncio.create_task(_delete_message_later(notice))
+        except discord.HTTPException:
+            pass
 
         if self.continuous:
             await self.start_batch()
@@ -576,6 +606,8 @@ class SelectionState:
     member_page: int = 0
     remove_page: int = 0
     unknown_other_people: int = 0
+    commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    committed: bool = False
 
     def add_names(self, names: list[str]) -> None:
         for name in names:
@@ -785,6 +817,61 @@ class RemoveSelect(discord.ui.Select):
         await interaction.response.edit_message(content=selection_text(self.state), view=SelectedPeopleView(self.state))
 
 
+async def _commit_selection_state(
+    interaction: discord.Interaction,
+    state: SelectionState,
+    names: list[str],
+    *,
+    note: str,
+) -> bool:
+    """階層式人物選択の全確定経路を直列化して完了する。
+
+    同じエフェメラルでボタンを連打しても1回だけDB更新し、
+    成功後は人物選択画面と元の人物確認カードを削除する。
+    """
+    image_id = int(state.review["image_id"])
+    async with state.commit_lock:
+        if state.committed:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "✅ この写真はすでに確定済みです。", ephemeral=True
+                )
+            return False
+
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+
+        normalized = normalize_people_for_storage(names)
+        try:
+            await asyncio.to_thread(
+                _commit_selected_people,
+                image_id,
+                normalized,
+                interaction.user.id,
+                get_reviewer_name(interaction.user),
+                note,
+            )
+        except Exception as exc:
+            if interaction.response.is_done():
+                try:
+                    await interaction.followup.send(
+                        f"⚠️ 人物確定に失敗しました: {exc}", ephemeral=True
+                    )
+                except discord.HTTPException:
+                    pass
+            return False
+
+        state.committed = True
+        await _finish_selection_message(
+            interaction,
+            state.source_message,
+            build_people_confirmation_text(image_id, normalized),
+        )
+        if state.session:
+            await state.session.mark_done(image_id, interaction)
+        return True
+
+
 class SelectedPeopleView(OwnedView):
     def __init__(self, state: SelectionState):
         super().__init__(state)
@@ -814,10 +901,6 @@ class SelectedPeopleView(OwnedView):
 
     @discord.ui.button(label="この内容で確定", emoji="✅", style=discord.ButtonStyle.success, row=1)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        # SelectedPeopleView 自身は image_id を持たないため、必ず SelectionState の
-        # review から取得する。以前 self.image_id を参照していたため、ボタン押下後に
-        # AttributeError となり、Discord 上では「押せない」ように見える不具合があった。
-        image_id = int(self.state.review["image_id"])
         names = list(self.state.selected_names)
         if self.state.unknown_other_people:
             names.append(make_unknown_other_label(self.state.unknown_other_people))
@@ -828,24 +911,12 @@ class SelectedPeopleView(OwnedView):
                 ephemeral=True,
             )
             return
-
-        await interaction.response.defer()
-        reviewer = get_reviewer_name(interaction.user)
-        await asyncio.to_thread(
-            _commit_selected_people,
-            image_id,
-            names,
-            interaction.user.id,
-            reviewer,
-            "階層式レビュー画面から複数人を確定",
-        )
-        await _finish_selection_message(
+        await _commit_selection_state(
             interaction,
-            self.state.source_message,
-            build_people_confirmation_text(image_id, names),
+            self.state,
+            names,
+            note="階層式レビュー画面から複数人を確定",
         )
-        if self.state.session:
-            await self.state.session.mark_done(image_id, interaction)
 
     @discord.ui.button(label="名前不明を1人追加", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
     async def add_unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -859,44 +930,21 @@ class SelectedPeopleView(OwnedView):
 
     @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=3)
     async def nobody(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        image_id = int(self.state.review["image_id"])
-        await asyncio.to_thread(
-            _commit_selected_people,
-            image_id,
-            [],
-            interaction.user.id,
-            get_reviewer_name(interaction.user),
-            "人物なし",
-        )
-        await _finish_selection_message(
+        await _commit_selection_state(
             interaction,
-            self.state.source_message,
-            f"✅ 写真ID **{image_id}** を人物なしで確定しました。",
+            self.state,
+            [],
+            note="人物なし",
         )
-        if self.state.session:
-            await self.state.session.mark_done(image_id, interaction)
 
     @discord.ui.button(label="その他（名前不明）1人", emoji="❓", style=discord.ButtonStyle.secondary, row=3)
     async def unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        image_id = int(self.state.review["image_id"])
-        names = [make_unknown_other_label(1)]
-        await asyncio.to_thread(
-            _commit_selected_people,
-            image_id,
-            names,
-            interaction.user.id,
-            get_reviewer_name(interaction.user),
-            "その他の人物（名前不明）1人",
-        )
-        await _finish_selection_message(
+        await _commit_selection_state(
             interaction,
-            self.state.source_message,
-            f"✅ 写真ID **{image_id}** をその他（名前不明）1人で確定しました。",
+            self.state,
+            [make_unknown_other_label(1)],
+            note="その他の人物（名前不明）1人",
         )
-        if self.state.session:
-            await self.state.session.mark_done(image_id, interaction)
 
 
 def _commit_selected_people(
@@ -911,13 +959,49 @@ def _commit_selected_people(
     スナップショット作成と人物確定の呼び出し順を全経路で揃え、
     「通常確定だけUndoできるが人物なしは戻せない」といった差を防ぐ。
     """
-    create_people_snapshot(int(image_id), int(admin_user_id), "person_review_confirm")
-    set_confirmed_image_people(
-        int(image_id),
-        list(names),
-        confirmed_by=reviewer,
-        note=note,
-    )
+    with resource_lock("image_people_confirm", int(image_id), int(admin_user_id), ttl_seconds=120):
+        create_people_snapshot(int(image_id), int(admin_user_id), "person_review_confirm")
+        set_confirmed_image_people(
+            int(image_id),
+            list(names),
+            confirmed_by=reviewer,
+            note=note,
+        )
+
+
+def _commit_blog_people_with_snapshots(
+    blog_id: int,
+    names: list[str],
+    admin_user_id: int,
+    reviewer: str,
+    queue_status: str,
+) -> int:
+    """ブログ単位確定も排他・Undo可能な同じ規則で処理する。"""
+    status = "skipped" if queue_status == "skipped" else "pending"
+    with resource_lock("blog_people_confirm", int(blog_id), int(admin_user_id), ttl_seconds=180):
+        with closing(get_connection()) as con:
+            rows = con.execute(
+                """
+                SELECT q.image_id
+                  FROM photo_review_queue q
+                  JOIN photo_images i ON i.id=q.image_id
+                 WHERE i.blog_id=?
+                   AND q.review_type='person_identity'
+                   AND q.status=?
+                 ORDER BY i.image_index, i.id
+                """,
+                (int(blog_id), status),
+            ).fetchall()
+        image_ids = [int(row[0]) for row in rows]
+        for image_id in image_ids:
+            create_people_snapshot(image_id, int(admin_user_id), "blog_person_review_confirm")
+        return set_confirmed_blog_people(
+            int(blog_id),
+            list(names),
+            confirmed_by=reviewer,
+            note="Discordレビュー画面からブログ単位で一括確定",
+            statuses=(status,),
+        )
 
 
 class BlogBulkConfirmView(discord.ui.View):
@@ -1045,6 +1129,8 @@ class PersonReviewView(discord.ui.View):
         self.session = session
         self.image_id = int(review["image_id"])
         self.message: discord.Message | None = None
+        self._commit_lock = asyncio.Lock()
+        self._committed = False
         self.source_message_id = 0
         self.candidates = build_candidate_names(review)
         self.quick_people = get_quick_people_cached(
@@ -1124,34 +1210,45 @@ class PersonReviewView(discord.ui.View):
         *,
         note: str,
     ) -> None:
-        if not interaction.response.is_done():
-            await interaction.response.defer()
-        names = normalize_people_for_storage(names)
-        await asyncio.to_thread(
-            set_confirmed_image_people,
-            self.image_id,
-            names,
-            confirmed_by=get_reviewer_name(interaction.user),
-            note=note,
-        )
-        confirmation_text = build_people_confirmation_text(self.image_id, names)
-        source_message = self.message
-        if interaction.message and interaction.message.id == self.source_message_id:
-            source_message = interaction.message
+        async with self._commit_lock:
+            if self._committed:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "✅ この写真はすでに確定済みです。", ephemeral=True
+                    )
+                return
+
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+
+            names = normalize_people_for_storage(names)
+            try:
+                await asyncio.to_thread(
+                    _commit_selected_people,
+                    self.image_id,
+                    names,
+                    interaction.user.id,
+                    get_reviewer_name(interaction.user),
+                    note,
+                )
+            except Exception as exc:
+                try:
+                    await interaction.followup.send(
+                        f"⚠️ 人物確定に失敗しました: {exc}", ephemeral=True
+                    )
+                except discord.HTTPException:
+                    pass
+                return
+
+            self._committed = True
+            confirmation_text = build_people_confirmation_text(self.image_id, names)
             await _finish_review_message(
                 interaction,
-                source_message,
+                self.message or interaction.message,
                 confirmation_text,
             )
-        else:
-            await _delete_message_safely(source_message)
-            await interaction.edit_original_response(
-                content=confirmation_text,
-                view=None,
-            )
-            asyncio.create_task(_delete_original_response_later(interaction))
-        if self.session:
-            await self.session.mark_done(self.image_id, interaction)
+            if self.session:
+                await self.session.mark_done(self.image_id, interaction)
 
     @discord.ui.button(label="候補をすべて採用", emoji="✅", style=discord.ButtonStyle.success, row=0)
     async def accept_candidate(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
