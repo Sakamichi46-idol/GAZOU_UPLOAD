@@ -69,11 +69,52 @@ def init_ai_cost_control_schema() -> None:
         con.commit()
 
 
+def _env_nonnegative_int(name: str) -> int | None:
+    """Return a non-negative integer from an environment variable.
+
+    None means the variable is not set, so the DB value remains effective.
+    Invalid values are ignored instead of crashing the bot at startup.
+    """
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return None
+    try:
+        return max(int(str(raw).strip()), 0)
+    except (TypeError, ValueError):
+        print(f"AI cost control: invalid {name}={raw!r}; using DB setting instead.")
+        return None
+
+
 def get_ai_cost_settings() -> dict[str, Any]:
+    """Return effective AI cost settings.
+
+    Railway Variables are authoritative for the daily/monthly image limits when
+    they are present.  This makes PHOTO_AI_DAILY_IMAGE_LIMIT and
+    PHOTO_AI_MONTHLY_IMAGE_LIMIT usable even after the settings row already
+    exists in SQLite.  If either Variable is removed, the saved DB value is
+    used again.
+    """
     init_ai_cost_control_schema()
     with closing(get_connection()) as con:
         row = con.execute("SELECT * FROM photo_ai_cost_settings WHERE id=1").fetchone()
-        return dict(row) if row else {}
+        settings = dict(row) if row else {}
+
+    env_daily = _env_nonnegative_int("PHOTO_AI_DAILY_IMAGE_LIMIT")
+    env_monthly = _env_nonnegative_int("PHOTO_AI_MONTHLY_IMAGE_LIMIT")
+
+    if env_daily is not None:
+        settings["daily_image_limit"] = env_daily
+        settings["daily_limit_source"] = "environment"
+    else:
+        settings["daily_limit_source"] = "database"
+
+    if env_monthly is not None:
+        settings["monthly_image_limit"] = env_monthly
+        settings["monthly_limit_source"] = "environment"
+    else:
+        settings["monthly_limit_source"] = "database"
+
+    return settings
 
 
 def update_ai_cost_settings(**values: Any) -> dict[str, Any]:
