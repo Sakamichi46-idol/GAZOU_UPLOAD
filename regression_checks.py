@@ -27,6 +27,10 @@ def check_face_candidate_diagnostics() -> list[str]:
         errors.append("顔認識の遅延importヘルパーがありません")
     if "await interaction.edit_original_response" not in diag_text:
         errors.append("defer後の診断メニュー表示がedit_original_responseを使っていません")
+    if "def regenerate_single(" not in diag_text or "この画像の候補を再生成" not in diag_text:
+        errors.append("しきい値通過・未登録画像の候補再生成機能がありません")
+    if "suggest_face_candidates" not in diag_text:
+        errors.append("診断画面から正式候補を再生成できません")
     return errors
 
 
