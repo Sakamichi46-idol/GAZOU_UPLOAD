@@ -2558,13 +2558,31 @@ class Phase3AIViewFull(
         interaction,
         _,
     ):
-        from face_candidate_diagnostics import (
-            send_face_candidate_diagnostics,
-        )
+        # Discordへ最優先で応答する。
+        # face_candidate_diagnostics / local_face_recognition のimportやDB処理が
+        # 遅くても「アプリケーションが応答しませんでした」にならないようにする。
+        if not interaction.response.is_done():
+            await interaction.response.defer(
+                ephemeral=True,
+                thinking=True,
+            )
 
-        await send_face_candidate_diagnostics(
-            interaction
-        )
+        try:
+            from face_candidate_diagnostics import (
+                send_face_candidate_diagnostics,
+            )
+
+            await send_face_candidate_diagnostics(
+                interaction
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                (
+                    "⚠️ 顔候補診断画面を開けませんでした。\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                ),
+                ephemeral=True,
+            )
 
     @discord.ui.button(
         label="解析予約ON/OFF",
