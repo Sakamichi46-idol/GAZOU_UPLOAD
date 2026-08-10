@@ -25,7 +25,9 @@ def run()->dict:
     selected_block = text.split('class SelectedPeopleView', 1)[1].split('class BlogBulkConfirmView', 1)[0]
     checks.append((
         'selected_people_confirm_image_id',
-        'create_people_snapshot, self.image_id' not in selected_block and 'image_id = int(self.state.review["image_id"])' in selected_block,
+        'create_people_snapshot, self.image_id' not in selected_block
+        and 'image_id = int(state.review["image_id"])' in text
+        and '_commit_selection_state' in selected_block,
         '階層式人物確定はSelectionState.reviewのimage_idを使用',
     ))
     checks.append((
@@ -40,7 +42,35 @@ def run()->dict:
     ))
     db=(ROOT/'photo_database.py').read_text(encoding='utf-8')
     checks.append(('review_upsert','ON CONFLICT' in db and 'photo_review_queue' in db,'確認キューUPSERT'))
+    checks.append((
+        'person_confirm_ephemeral_cleanup',
+        'await interaction.delete_original_response()' in text and '_finish_review_message' in text and '_finish_selection_message' in text,
+        '人物確定後に元レビューと操作中エフェメラルを削除',
+    ))
+    checks.append((
+        'person_confirm_double_tap_guard',
+        'commit_lock: asyncio.Lock' in text and 'self._commit_lock = asyncio.Lock()' in text and 'state.committed' in text and 'self._committed' in text,
+        '階層式・通常レビューの二重確定防止',
+    ))
+    checks.append((
+        'person_confirm_resource_lock',
+        'resource_lock("image_people_confirm"' in text and 'resource_lock("blog_people_confirm"' in text,
+        '画像単位・ブログ単位のDB排他ロック',
+    ))
+    checks.append((
+        'person_confirm_snapshot_all_paths',
+        '_commit_selection_state' in text and '_commit_selected_people' in text and 'create_people_snapshot' in text,
+        '通常・人物なし・名前不明・人物セットを共通スナップショット経路へ統一',
+    ))
+    checks.append((
+        'bulk_confirm_ephemeral_cleanup',
+        '_commit_blog_people_with_snapshots' in text and 'for message in list(self.message_by_image_id.values())' in text,
+        'ブログ一括確定後もレビュー用エフェメラルを削除',
+    ))
     checks.append(('embed_safety',(ROOT/'embed_safety.py').exists(),'Embed安全化'))
+    lock_text=(ROOT/'operation_locks.py').read_text(encoding='utf-8') if (ROOT/'operation_locks.py').exists() else ''
+    checks.append(('operation_lock_non_reentrant', 'すでに処理中です' in lock_text and 'INSERT OR REPLACE' not in lock_text, '同一管理者の二重操作も拒否'))
+    checks.append(('operation_lock_bootstrap', 'CREATE TABLE IF NOT EXISTS photo_operation_locks' in lock_text, '旧DBでもロック表を自己補完'))
 
     # 過去に実際に発生した文字化けを再発させない。
     bad=[]
