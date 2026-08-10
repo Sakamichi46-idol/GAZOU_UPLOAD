@@ -73,10 +73,20 @@ def build_face_review_embed(
     safe_add_field(embed, name="タイトル", value=_short(review.get("title")) or "タイトルなし", inline=False)
 
     if candidates:
-        lines = [
-            f"{index}. **{item.get('person_name', '不明')}** — {float(item.get('confidence') or 0) * 100:.1f}%"
-            for index, item in enumerate(candidates, 1)
-        ]
+        lines = []
+        for index, item in enumerate(candidates, 1):
+            integrated = float(item.get("confidence") or 0)
+            raw = float(item.get("face_similarity") or 0)
+            band = _text(item.get("confidence_band"))
+            reason = _text(item.get("score_reason"))
+            line = f"{index}. **{item.get('person_name', '不明')}** — 統合 {integrated * 100:.1f}%"
+            if raw:
+                line += f" / 顔 {raw * 100:.1f}%"
+            if band:
+                line += f" / {band}"
+            lines.append(line)
+            if reason:
+                lines.append(f"   └ {reason}")
         candidate_text = "\n".join(lines)
     else:
         candidate_text = "一致閾値を超えた候補はありません。メンバー選択または投稿者ボタンを使ってください。"
@@ -138,7 +148,7 @@ class CandidateSelect(discord.ui.Select):
                 discord.SelectOption(
                     label=_short(item.get("person_name"), 100) or "不明",
                     value=str(int(item["person_id"])),
-                    description=f"ローカル類似度 {confidence * 100:.1f}%",
+                    description=(f"統合 {confidence*100:.1f}% / 顔 {float(item.get('face_similarity') or 0)*100:.1f}%")[:100],
                 )
             )
         super().__init__(
