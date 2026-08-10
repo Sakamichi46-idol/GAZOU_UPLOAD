@@ -8,16 +8,8 @@ from typing import Any
 import discord
 
 from embed_safety import safe_add_field
+from local_face_recognition import DEFAULT_MATCH_THRESHOLD, diagnose_face_candidates
 from photo_database import get_connection
-
-
-def _load_face_diagnostics():
-    """重い顔認識モジュールは、実際に診断するときだけ読み込む。"""
-    from local_face_recognition import (
-        DEFAULT_MATCH_THRESHOLD,
-        diagnose_face_candidates,
-    )
-    return float(DEFAULT_MATCH_THRESHOLD), diagnose_face_candidates
 
 
 def _recent_analyzed_image_ids(limit: int = 20) -> list[int]:
@@ -40,7 +32,6 @@ def _recent_analyzed_image_ids(limit: int = 20) -> list[int]:
 
 
 def diagnose_recent(limit: int = 20) -> dict[str, Any]:
-    threshold, diagnose_face_candidates = _load_face_diagnostics()
     image_ids = _recent_analyzed_image_ids(limit)
     rows: list[dict[str, Any]] = []
     reasons: Counter[str] = Counter()
@@ -58,7 +49,7 @@ def diagnose_recent(limit: int = 20) -> dict[str, Any]:
         "images": rows,
         "errors": errors,
         "reasons": dict(reasons),
-        "threshold": threshold,
+        "threshold": float(DEFAULT_MATCH_THRESHOLD),
     }
 
 
@@ -141,15 +132,7 @@ class FaceDiagnosticIdModal(discord.ui.Modal, title="顔候補診断：画像ID�
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            def run_diagnosis():
-                _, diagnose_face_candidates = _load_face_diagnostics()
-                return diagnose_face_candidates(
-                    image_id,
-                    3,
-                    scan_if_missing=True,
-                )
-
-            result = await asyncio.to_thread(run_diagnosis)
+            result = await asyncio.to_thread(diagnose_face_candidates, image_id, 3, scan_if_missing=True)
         except Exception as exc:
             await interaction.followup.send(f"⚠️ 診断に失敗しました: {type(exc).__name__}: {exc}", ephemeral=True)
             return
@@ -181,22 +164,13 @@ class FaceCandidateDiagnosticView(discord.ui.View):
 async def send_face_candidate_diagnostics(
     interaction: discord.Interaction,
 ) -> None:
-    """顔候補診断の入口。ここでは診断・顔認識・DB集計を実行しない。"""
-    deferred_here = False
-    if not interaction.response.is_done():
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
-        )
-        deferred_here = True
-
     embed = discord.Embed(
         title="🔍 顔候補診断",
         description=(
             "診断方法を選んでください。\n\n"
             "・**直近20枚を診断**：最近AI解析した画像をまとめて確認します。\n"
             "・**画像IDを指定**：1枚だけ詳しく確認します。\n\n"
-            "この画面を開くだけでは顔認識・DB集計を実行しません。\n"
+            "この画面を開くだけでは重い診断処理を実行しません。"
             "診断はローカル処理のみで、OpenAI APIは使用しません。"
         ),
         color=0x5865F2,
@@ -204,18 +178,19 @@ async def send_face_candidate_diagnostics(
     embed.set_footer(
         text="診断を実行したい方法を下のボタンから選んでください。"
     )
-    view = FaceCandidateDiagnosticView(interaction.user.id)
 
-    # defer済みのInteractionはedit_original_responseが最も確実。
-    # ai_center側でdefer済みの場合も、この経路で「考え中」をメニューへ置換する。
-    try:
-        await interaction.edit_original_response(
+    view = FaceCandidateDiagnosticView(
+        interaction.user.id
+    )
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
             embed=embed,
             view=view,
+            ephemeral=True,
         )
-    except Exception:
-        # 何らかの理由で元応答を編集できない場合だけfollowupへ退避する。
-        await interaction.followup.send(
+    else:
+        await interaction.response.send_message(
             embed=embed,
             view=view,
             ephemeral=True,
