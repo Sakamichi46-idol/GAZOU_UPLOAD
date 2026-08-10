@@ -827,7 +827,7 @@ def request_photo_analysis(
 
     client = get_openai_client()
 
-    from phase3_ai_center import effective_model, effective_prompt
+    from ai_center import effective_model, effective_prompt
     active_model = effective_model(PHOTO_AI_MODEL)
     active_prompt, active_prompt_version = effective_prompt(SYSTEM_PROMPT)
 
@@ -1465,7 +1465,7 @@ def analyze_photo_image_sync(
                     f"source_image_id={source_image_id}",
                 )
                 try:
-                    from phase3_ai_center import record_cache_event
+                    from ai_center import record_cache_event
                     record_cache_event(image_id, "image_hash", True, True, f"source_image_id={source_image_id}")
                 except Exception:
                     pass
@@ -1477,7 +1477,7 @@ def analyze_photo_image_sync(
                     "api_sent": False,
                 }
 
-        from phase3_ai_center import phase3_preflight, record_cache_event
+        from ai_center import phase3_preflight, record_cache_event
         preflight = phase3_preflight(image_id, image_hash)
         if preflight.get("skip_api") and not manual_api:
             update_image_analysis_status(image_id, "review", str(preflight.get("reason") or "ローカル判定で完結"))
