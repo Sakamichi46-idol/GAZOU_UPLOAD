@@ -20,9 +20,9 @@ PROFILE_STANDARD = "standard"
 PROFILE_ACCURACY = "accuracy"
 
 PROFILE_LABELS = {
-    PROFILE_SAVER: "ð° ç¯ç´ã¢ã¼ã",
-    PROFILE_STANDARD: "âï¸ æ¨æºã¢ã¼ã",
-    PROFILE_ACCURACY: "ð¯ é«ç²¾åº¦ã¢ã¼ã",
+    PROFILE_SAVER: "💰 節約モード",
+    PROFILE_STANDARD: "⚖️ 標準モード",
+    PROFILE_ACCURACY: "🎯 高精度モード",
 }
 
 
@@ -218,8 +218,7 @@ def update_settings(**values: Any) -> dict[str, Any]:
         return get_settings()
 
     sql = ",".join(
-        f"{key}=?"
-        for key, _ in pairs
+        f"{key}=?" for key, _ in pairs
     )
 
     with closing(get_connection()) as con:
@@ -230,11 +229,7 @@ def update_settings(**values: Any) -> dict[str, Any]:
                 updated_at=?
             WHERE id=1
             """,
-            tuple(
-                value
-                for _, value in pairs
-            )
-            + (_now(),),
+            tuple(value for _, value in pairs) + (_now(),),
         )
 
         con.commit()
@@ -242,9 +237,7 @@ def update_settings(**values: Any) -> dict[str, Any]:
     return get_settings()
 
 
-def effective_model(
-    default_model: str,
-) -> str:
+def effective_model(default_model: str) -> str:
     settings = get_settings()
 
     return (
@@ -262,9 +255,7 @@ def effective_prompt(
     settings = get_settings()
 
     version = str(
-        settings.get(
-            "current_prompt_version"
-        )
+        settings.get("current_prompt_version")
         or "default"
     )
 
@@ -287,12 +278,10 @@ def effective_prompt(
     return default_prompt, "default"
 
 
-def _normalize_local_tag(
-    text: str,
-) -> str:
+def _normalize_local_tag(text: str) -> str:
     return " ".join(
         str(text or "")
-        .replace("ã", " ")
+        .replace("　", " ")
         .split()
     ).strip()
 
@@ -301,8 +290,8 @@ def derive_local_tags(
     image_id: int,
 ) -> list[tuple[str, str, float]]:
     """
-    ç»åèªä½ãAIã¸éããã
-    DBã®ãã­ã°æå ±ã ãããç¢ºå®ãªã¿ã°ãä½ãã
+    画像自体をAIへ送らず、
+    DBのブログ情報だけから確実なタグを作る。
     """
 
     with closing(get_connection()) as con:
@@ -346,8 +335,8 @@ def derive_local_tags(
         member
         and member
         not in {
-            "ä¸æ",
-            "æç¨¿èä¸æ",
+            "不明",
+            "投稿者不明",
         }
     ):
         tags.append(
@@ -369,7 +358,7 @@ def derive_local_tags(
             tags.append(
                 (
                     "date",
-                    f"{year}å¹´",
+                    f"{year}年",
                     1.0,
                 )
             )
@@ -380,7 +369,7 @@ def derive_local_tags(
             tags.append(
                 (
                     "date",
-                    f"{month_number}æ",
+                    f"{month_number}月",
                     1.0,
                 )
             )
@@ -390,24 +379,24 @@ def derive_local_tags(
                 1,
                 2,
             ):
-                season = "å¬"
+                season = "冬"
 
             elif month_number in (
                 3,
                 4,
                 5,
             ):
-                season = "æ¥"
+                season = "春"
 
             elif month_number in (
                 6,
                 7,
                 8,
             ):
-                season = "å¤"
+                season = "夏"
 
             else:
-                season = "ç§"
+                season = "秋"
 
             tags.append(
                 (
@@ -418,14 +407,14 @@ def derive_local_tags(
             )
 
     keyword_map = {
-        "ã©ã¤ã": "ã©ã¤ã",
-        "ã³ã³ãµã¼ã": "ã©ã¤ã",
-        "ãã¢ã¼": "ã©ã¤ã",
-        "ã¯ãªã¹ãã¹": "ã¯ãªã¹ãã¹",
-        "ãã­ã¦ã£ã³": "ãã­ã¦ã£ã³",
-        "èªçæ¥": "èªçæ¥",
-        "çèª": "èªçæ¥",
-        "æµ´è¡£": "æµ´è¡£",
+        "ライブ": "ライブ",
+        "コンサート": "ライブ",
+        "ツアー": "ライブ",
+        "クリスマス": "クリスマス",
+        "ハロウィン": "ハロウィン",
+        "誕生日": "誕生日",
+        "生誕": "誕生日",
+        "浴衣": "浴衣",
     }
 
     for keyword, tag in keyword_map.items():
@@ -490,8 +479,8 @@ def get_best_local_face(
     image_id: int,
 ) -> tuple[str, float]:
     """
-    ä¿å­æ¸ã¿ã­ã¼ã«ã«é¡åè£ã®ãã¡ã
-    ç»ååã§æãé«ãåè£ãè¿ãã
+    保存済みローカル顔候補のうち、
+    画像内で最も高い候補を返す。
     """
 
     with closing(get_connection()) as con:
@@ -540,8 +529,8 @@ def phase3_preflight(
     image_hash: str = "",
 ) -> dict[str, Any]:
     """
-    APIã®åã«ã­ã¼ã«ã«æå ±ãéãã
-    ç¯ç´ã¢ã¼ããªãAPIçç¥å¯å¦ãæ±ºããã
+    APIの前にローカル情報を集め、
+    節約モードならAPI省略可否を決める。
     """
 
     init_phase3_schema()
@@ -553,10 +542,8 @@ def phase3_preflight(
         or PROFILE_SAVER
     )
 
-    local_tag_count = (
-        persist_local_tags(
-            image_id
-        )
+    local_tag_count = persist_local_tags(
+        image_id
     )
 
     (
@@ -591,9 +578,9 @@ def phase3_preflight(
         skip_api = True
 
         reason = (
-            "ç¯ç´ã¢ã¼ã: "
-            f"ã­ã¼ã«ã«é¡åè£{face_score:.3f}ã"
-            f"ã­ã¼ã«ã«ã¿ã°{local_tag_count}ä»¶"
+            "節約モード: "
+            f"ローカル顔候補{face_score:.3f}、"
+            f"ローカルタグ{local_tag_count}件"
         )
 
     decision = (
@@ -679,7 +666,6 @@ def record_cache_event(
     saved_api_call: bool,
     note: str = "",
 ) -> None:
-
     init_phase3_schema()
 
     with closing(get_connection()) as con:
@@ -699,9 +685,7 @@ def record_cache_event(
                 int(image_id),
                 str(cache_kind)[:40],
                 1 if hit else 0,
-                1
-                if saved_api_call
-                else 0,
+                1 if saved_api_call else 0,
                 str(note)[:500],
                 _now(),
             ),
@@ -1015,13 +999,13 @@ def refresh_quality_scores() -> dict[str, int]:
             )
 
             if score >= 0.8:
-                note = "é«è§£ååº¦"
+                note = "高解像度"
 
             elif score >= 0.5:
-                note = "æ¨æº"
+                note = "標準"
 
             else:
-                note = "ä½åè³ªåè£"
+                note = "低品質候補"
 
             con.execute(
                 """
@@ -1069,7 +1053,6 @@ def refresh_quality_scores() -> dict[str, int]:
 def rebuild_recommendations(
     limit: int = 5000,
 ) -> int:
-
     init_phase3_schema()
 
     now = _now()
@@ -1134,7 +1117,7 @@ def rebuild_recommendations(
                     int(image_id),
                     int(person_id or 0),
                     score,
-                    "åçåè³ªï¼ç¢ºå®äººç©",
+                    "写真品質＋確定人物",
                     now,
                 ),
             )
@@ -1316,19 +1299,19 @@ def dashboard_embed() -> discord.Embed:
         )
 
     embed = discord.Embed(
-        title="ð§  Phase 3 AIç®¡çã»ã³ã¿ã¼",
+        title="🧠 AI管理センター",
         color=0x5865F2,
     )
 
     embed.description = (
-        "ã­ã¼ã«ã«å¤å®ãåã«ä½¿ãã"
-        "å¿è¦ãªç»åã ãOpenAIã¸éã"
-        "ä½ã³ã¹ãè¨­è¨ã§ãã"
+        "ローカル判定を先に使い、"
+        "必要な画像だけOpenAIへ送る"
+        "低コスト設計です。"
     )
 
     safe_add_field(
         embed,
-        name="âï¸ ãã­ãã¡ã¤ã«",
+        name="⚙️ プロファイル",
         value=PROFILE_LABELS.get(
             str(
                 settings.get(
@@ -1346,61 +1329,61 @@ def dashboard_embed() -> discord.Embed:
 
     safe_add_field(
         embed,
-        name="ð¾ ã­ã£ãã·ã¥",
+        name="💾 キャッシュ",
         value=(
-            f"å½ä¸­ç **{cache['hit_rate']:.1f}%**\n"
-            f"APIåé¿ **{cache['saved_api_calls']:,}å**\n"
-            f"ã­ã¼ã«ã«å®çµ **{cache['local_completed']:,}ä»¶**"
+            f"命中率 **{cache['hit_rate']:.1f}%**\n"
+            f"API回避 **{cache['saved_api_calls']:,}回**\n"
+            f"ローカル完結 **{cache['local_completed']:,}件**"
         ),
         inline=True,
     )
 
     safe_add_field(
         embed,
-        name="ð° APIäºæ¸¬",
+        name="💰 API予測",
         value=(
-            f"æªè§£æ **{prediction['pending']:,}æ**\n"
-            f"å¹³å **${prediction['avg_cost']:.6f}/æ**\n"
-            f"æ®ãæ¨å® **${prediction['projected_remaining_cost']:.2f}**"
+            f"未解析 **{prediction['pending']:,}枚**\n"
+            f"平均 **${prediction['avg_cost']:.6f}/枚**\n"
+            f"残り推定 **${prediction['projected_remaining_cost']:.2f}**"
         ),
         inline=True,
     )
 
     safe_add_field(
         embed,
-        name="ð·ï¸ ã¿ã°åè³ª",
+        name="🏷️ タグ品質",
         value=(
-            f"è©ä¾¡æ¸ã¿ **{int(tag_quality[0] or 0):,}**\n"
-            f"èªåæ¿èªåè£ **{int(tag_quality[1] or 0):,}**"
+            f"評価済み **{int(tag_quality[0] or 0):,}**\n"
+            f"自動承認候補 **{int(tag_quality[1] or 0):,}**"
         ),
         inline=True,
     )
 
     safe_add_field(
         embed,
-        name="ð¤ äººç©åè³ª",
+        name="👤 人物品質",
         value=(
-            f"è©ä¾¡æ¸ã¿ **{int(person_quality[0] or 0):,}äºº**\n"
-            f"å¹³å **{float(person_quality[1] or 0) * 100:.1f}%**"
+            f"評価済み **{int(person_quality[0] or 0):,}人**\n"
+            f"平均 **{float(person_quality[1] or 0) * 100:.1f}%**"
         ),
         inline=True,
     )
 
     safe_add_field(
         embed,
-        name="ð· åçåè³ª",
+        name="📷 写真品質",
         value=(
-            f"è©ä¾¡æ¸ã¿ **{int(photos[0] or 0):,}æ**\n"
-            f"å¹³å **{float(photos[1] or 0) * 100:.1f}%**\n"
-            f"ãããã **{recommendations:,}ä»¶**"
+            f"評価済み **{int(photos[0] or 0):,}枚**\n"
+            f"平均 **{float(photos[1] or 0) * 100:.1f}%**\n"
+            f"おすすめ **{recommendations:,}件**"
         ),
         inline=True,
     )
 
     embed.set_footer(
         text=(
-            "ãã®ç»é¢ã®éè¨ã¯"
-            "OpenAI APIãå¼ã³ã¾ããã"
+            "この画面の集計は"
+            "OpenAI APIを呼びません。"
         )
     )
 
@@ -1438,7 +1421,7 @@ class ProfileSelect(
 
         super().__init__(
             placeholder=(
-                "AIè¨­å®ãã­ãã¡ã¤ã«ãé¸æ"
+                "AI設定プロファイルを選択"
             ),
             options=options,
         )
@@ -1500,7 +1483,7 @@ class Phase3AIView(
         await (
             interaction.response
             .send_message(
-                "ãã®ç»é¢ã¯éããç®¡çèã ããæä½ã§ãã¾ãã",
+                "この画面は開いた管理者だけが操作できます。",
                 ephemeral=True,
             )
         )
@@ -1508,8 +1491,8 @@ class Phase3AIView(
         return False
 
     @discord.ui.button(
-        label="åè³ªãåè¨ç®",
-        emoji="ð§ª",
+        label="品質を再計算",
+        emoji="🧪",
         style=
             discord.ButtonStyle.primary,
         row=1,
@@ -1543,19 +1526,19 @@ class Phase3AIView(
             interaction.followup
             .send(
                 (
-                    "â åè³ªãåè¨ç®ãã¾ããã\n"
-                    f"ã¿ã° {result['tags']:,}\n"
-                    f"äººç© {result['people']:,}\n"
-                    f"åç {result['images']:,}\n"
-                    f"ãããã {recommendations:,}"
+                    "✅ 品質を再計算しました。\n"
+                    f"タグ {result['tags']:,}\n"
+                    f"人物 {result['people']:,}\n"
+                    f"写真 {result['images']:,}\n"
+                    f"おすすめ {recommendations:,}"
                 ),
                 ephemeral=True,
             )
         )
 
     @discord.ui.button(
-        label="APIä½¿ç¨äºæ¸¬",
-        emoji="ð°",
+        label="API使用予測",
+        emoji="💰",
         style=
             discord.ButtonStyle.secondary,
         row=1,
@@ -1575,24 +1558,24 @@ class Phase3AIView(
         )
 
         embed = discord.Embed(
-            title="ð° APIä½¿ç¨äºæ¸¬",
+            title="💰 API使用予測",
             color=0xFEE75C,
         )
 
         embed.description = (
-            f"æªè§£æ **{prediction['pending']:,}æ**\n"
-            f"éå»APIè§£æ **{prediction['historical_calls']:,}å**\n"
-            f"å¹³åæ¨å® **${prediction['avg_cost']:.6f}/æ**\n"
-            f"å¨æ®ããåæ¡ä»¶ã§è§£æããå ´å "
-            f"**ç´${prediction['projected_remaining_cost']:.2f}**\n"
-            f"æ¬æ¥æ®ã **{prediction['daily_remaining']:,}æ** "
-            f"/ ä»ææ®ã **{prediction['monthly_remaining']:,}æ**"
+            f"未解析 **{prediction['pending']:,}枚**\n"
+            f"過去API解析 **{prediction['historical_calls']:,}回**\n"
+            f"平均推定 **${prediction['avg_cost']:.6f}/枚**\n"
+            f"全残りを同条件で解析した場合 "
+            f"**約${prediction['projected_remaining_cost']:.2f}**\n"
+            f"本日残り **{prediction['daily_remaining']:,}枚** "
+            f"/ 今月残り **{prediction['monthly_remaining']:,}枚**"
         )
 
         embed.set_footer(
             text=(
-                "éå»å®ç¸¾ããã®åç´æ¨å®ã§ãã"
-                "å®æéãä¿è¨¼ãããã®ã§ã¯ããã¾ããã"
+                "過去実績からの単純推定です。"
+                "実料金を保証するものではありません。"
             )
         )
 
@@ -1605,8 +1588,8 @@ class Phase3AIView(
         )
 
     @discord.ui.button(
-        label="ã­ã£ãã·ã¥è¨ºæ­",
-        emoji="ð¾",
+        label="キャッシュ診断",
+        emoji="💾",
         style=
             discord.ButtonStyle.secondary,
         row=1,
@@ -1629,21 +1612,21 @@ class Phase3AIView(
             interaction.response
             .send_message(
                 (
-                    "ð¾ ã­ã£ãã·ã¥è¨ºæ­\n"
-                    f"ã¤ãã³ã **{cache['events']:,}**\n"
-                    f"å½ä¸­ **{cache['hits']:,}**"
-                    f"ï¼{cache['hit_rate']:.1f}%ï¼\n"
-                    f"APIåé¿ **{cache['saved_api_calls']:,}**\n"
-                    f"ã­ã¼ã«ã«å¤å® **{cache['local_checked']:,}** "
-                    f"/ å®çµ **{cache['local_completed']:,}**"
+                    "💾 キャッシュ診断\n"
+                    f"イベント **{cache['events']:,}**\n"
+                    f"命中 **{cache['hits']:,}**"
+                    f"（{cache['hit_rate']:.1f}%）\n"
+                    f"API回避 **{cache['saved_api_calls']:,}**\n"
+                    f"ローカル判定 **{cache['local_checked']:,}** "
+                    f"/ 完結 **{cache['local_completed']:,}**"
                 ),
                 ephemeral=True,
             )
         )
 
     @discord.ui.button(
-        label="ã¢ãã«ã»ãã­ã³ãã",
-        emoji="ð§¾",
+        label="モデル・プロンプト",
+        emoji="🧾",
         style=
             discord.ButtonStyle.secondary,
         row=2,
@@ -1670,23 +1653,23 @@ class Phase3AIView(
             interaction.response
             .send_message(
                 (
-                    "ð§¾ ã¢ãã«ã»ãã­ã³ããç®¡ç\n"
-                    f"ç¾å¨ã¢ãã«: "
-                    f"`{settings.get('current_model') or 'ç°å¢å¤æ°ã®æ¢å®ã¢ãã«'}`\n"
+                    "🧾 モデル・プロンプト管理\n"
+                    f"現在モデル: "
+                    f"`{settings.get('current_model') or '環境変数の既定モデル'}`\n"
                     f"Prompt: "
                     f"`{settings.get('current_prompt_version') or 'default'}`\n"
-                    f"ç»é²ã¢ãã« **{data['models']}** "
-                    f"/ Promptç **{data['prompts']}**\n"
-                    "å¤æ´ã¯DBã¸å±¥æ­´ãæ®ãè¨­è¨ã§ãã"
-                    "æªç»é²ã¢ãã«ã¸åæã«åãæ¿ãã¾ããã"
+                    f"登録モデル **{data['models']}** "
+                    f"/ Prompt版 **{data['prompts']}**\n"
+                    "変更はDBへ履歴を残す設計です。"
+                    "未登録モデルへ勝手に切り替えません。"
                 ),
                 ephemeral=True,
             )
         )
 
     @discord.ui.button(
-        label="è§£æäºç´è¨­å®",
-        emoji="ð",
+        label="解析予約設定",
+        emoji="🕒",
         style=
             discord.ButtonStyle.secondary,
         row=2,
@@ -1705,20 +1688,20 @@ class Phase3AIView(
             interaction.response
             .send_message(
                 (
-                    "ð è§£æäºç´\n"
-                    f"ç¶æ **{'ON' if int(settings.get('scheduled_enabled', 0)) else 'OFF'}**\n"
-                    f"æå» **{int(settings.get('scheduled_hour', 3)):02d}:00**\n"
-                    f"ä¸é **{int(settings.get('scheduled_limit', 20))}æ/å**\n"
-                    "å®å¨ã®ããåæç¶æã¯OFFã§ãã"
-                    "æ¥æ¬¡/ææ¬¡APIä¸éã¯å¸¸ã«åªåããã¾ãã"
+                    "🕒 解析予約\n"
+                    f"状態 **{'ON' if int(settings.get('scheduled_enabled', 0)) else 'OFF'}**\n"
+                    f"時刻 **{int(settings.get('scheduled_hour', 3)):02d}:00**\n"
+                    f"上限 **{int(settings.get('scheduled_limit', 20))}枚/回**\n"
+                    "安全のため初期状態はOFFです。"
+                    "日次/月次API上限は常に優先されます。"
                 ),
                 ephemeral=True,
             )
         )
 
     @discord.ui.button(
-        label="æ´æ°",
-        emoji="â»ï¸",
+        label="更新",
+        emoji="♻️",
         style=
             discord.ButtonStyle.secondary,
         row=2,
@@ -1778,7 +1761,7 @@ async def send_phase3_ai_center(
 
 
 # -------------------------
-# Phase 3 è©³ç´°ç®¡ç
+# AI 詳細管理
 # -------------------------
 
 def tag_quality_rows(
@@ -1911,8 +1894,8 @@ def recommendation_rows(
 
 def learning_cleanup_diagnostics() -> dict[str, int]:
     """
-    åé¤ã¯ããã
-    æ´çåè£ã ãæ°ããã
+    削除はせず、
+    整理候補だけ数える。
     """
 
     with closing(get_connection()) as con:
@@ -2108,11 +2091,11 @@ def similar_tags(
 
 class TagSearchModal(
     discord.ui.Modal,
-    title="ã¿ã°åè£ã»é¡ä¼¼ã¿ã°æ¤ç´¢",
+    title="タグ候補・類似タグ検索",
 ):
     query = discord.ui.TextInput(
-        label="ã¿ã°ã¾ãã¯ä¸é¨æå­",
-        placeholder="ä¾ï¼ç¬é¡ / å¶æ",
+        label="タグまたは一部文字",
+        placeholder="例：笑顔 / 制服",
         max_length=80,
     )
 
@@ -2144,39 +2127,39 @@ class TagSearchModal(
 
         embed = discord.Embed(
             title=(
-                f"ð ã¿ã°æ¤ç´¢: {query}"
+                f"🔎 タグ検索: {query}"
             ),
             color=0x3498DB,
         )
 
         safe_add_field(
             embed,
-            name="é¨åä¸è´",
+            name="部分一致",
             value=(
                 "\n".join(
-                    f"ã»{tag}ï¼{count:,}ä»¶ï¼"
+                    f"・{tag}（{count:,}件）"
                     for (
                         tag,
                         count,
                     ) in suggestions
                 )
-                or "ãªã"
+                or "なし"
             ),
             inline=False,
         )
 
         safe_add_field(
             embed,
-            name="é¡ä¼¼åè£",
+            name="類似候補",
             value=(
                 "\n".join(
-                    f"ã»{tag}ï¼{score * 100:.1f}%ï¼"
+                    f"・{tag}（{score * 100:.1f}%）"
                     for (
                         tag,
                         score,
                     ) in similars
                 )
-                or "ãªã"
+                or "なし"
             ),
             inline=False,
         )
@@ -2192,16 +2175,16 @@ class TagSearchModal(
 
 class PromptRegisterModal(
     discord.ui.Modal,
-    title="ãã­ã³ããçãç»é²",
+    title="プロンプト版を登録",
 ):
     version = discord.ui.TextInput(
-        label="ãã¼ã¸ã§ã³å",
-        placeholder="ä¾: v6",
+        label="バージョン名",
+        placeholder="例: v6",
         max_length=40,
     )
 
     prompt = discord.ui.TextInput(
-        label="ã·ã¹ãã ãã­ã³ãã",
+        label="システムプロンプト",
         style=
             discord.TextStyle.paragraph,
         max_length=4000,
@@ -2228,7 +2211,7 @@ class PromptRegisterModal(
             await (
                 interaction.response
                 .send_message(
-                    "ãã¼ã¸ã§ã³åã¨ãã­ã³ãããå¿è¦ã§ãã",
+                    "バージョン名とプロンプトが必要です。",
                     ephemeral=True,
                 )
             )
@@ -2275,8 +2258,8 @@ class PromptRegisterModal(
             interaction.response
             .send_message(
                 (
-                    f"â Prompt `{version}` ãä¿å­ãã¾ããã"
-                    "åæ¿ã¯è¨­å®ããè¡ãã¾ãã"
+                    f"✅ Prompt `{version}` を保存しました。"
+                    "切替は設定から行います。"
                 ),
                 ephemeral=True,
             )
@@ -2313,7 +2296,7 @@ class Phase3DetailsView(
         await (
             interaction.response
             .send_message(
-                "ãã®ç»é¢ã¯éããç®¡çèã ããæä½ã§ãã¾ãã",
+                "この画面は開いた管理者だけが操作できます。",
                 ephemeral=True,
             )
         )
@@ -2321,8 +2304,8 @@ class Phase3DetailsView(
         return False
 
     @discord.ui.button(
-        label="ã¿ã°åè³ª",
-        emoji="ð·ï¸",
+        label="タグ品質",
+        emoji="🏷️",
         style=
             discord.ButtonStyle.primary,
     )
@@ -2342,10 +2325,10 @@ class Phase3DetailsView(
             (
                 f"**{row['tag']}** "
                 f"/ {row['category']} "
-                f"â {row['quality_score'] * 100:.1f}%"
-                f"ï¼{row['usage_count']:,}ä»¶ï¼"
+                f"— {row['quality_score'] * 100:.1f}%"
+                f"（{row['usage_count']:,}件）"
                 + (
-                    " â­æ¿èªåè£"
+                    " ⭐承認候補"
                     if row[
                         "auto_approve_candidate"
                     ]
@@ -2359,11 +2342,11 @@ class Phase3DetailsView(
             interaction.response
             .send_message(
                 embed=discord.Embed(
-                    title="ð·ï¸ ã¿ã°åè³ª",
+                    title="🏷️ タグ品質",
                     description=(
                         "\n".join(lines)
                         or
-                        "åè³ªè¨ç®ãåã«å®è¡ãã¦ãã ããã"
+                        "品質計算を先に実行してください。"
                     ),
                     color=0xF1C40F,
                 ),
@@ -2372,8 +2355,8 @@ class Phase3DetailsView(
         )
 
     @discord.ui.button(
-        label="äººç©åè³ª",
-        emoji="ð¤",
+        label="人物品質",
+        emoji="👤",
         style=
             discord.ButtonStyle.primary,
     )
@@ -2392,9 +2375,9 @@ class Phase3DetailsView(
         lines = [
             (
                 f"**{row['person_name']}** "
-                f"â åè³ª{row['quality_score'] * 100:.1f}% "
-                f"/ ç¢ºå®é¡{row['confirmed_faces']:,} "
-                f"/ åç§{row['reference_faces']:,}"
+                f"— 品質{row['quality_score'] * 100:.1f}% "
+                f"/ 確定顔{row['confirmed_faces']:,} "
+                f"/ 参照{row['reference_faces']:,}"
             )
             for row in rows
         ]
@@ -2403,11 +2386,11 @@ class Phase3DetailsView(
             interaction.response
             .send_message(
                 embed=discord.Embed(
-                    title="ð¤ äººç©åè³ª",
+                    title="👤 人物品質",
                     description=(
                         "\n".join(lines)
                         or
-                        "åè³ªè¨ç®ãåã«å®è¡ãã¦ãã ããã"
+                        "品質計算を先に実行してください。"
                     ),
                     color=0xEB459E,
                 ),
@@ -2416,8 +2399,8 @@ class Phase3DetailsView(
         )
 
     @discord.ui.button(
-        label="ããããåç",
-        emoji="ð",
+        label="おすすめ写真",
+        emoji="🌟",
         style=
             discord.ButtonStyle.secondary,
     )
@@ -2435,9 +2418,9 @@ class Phase3DetailsView(
 
         lines = [
             (
-                f"ç»å`{row['image_id']}` "
-                f"{row.get('person_name') or row.get('member_name') or 'äººç©æªæå®'} "
-                f"â {row['score'] * 100:.1f}%"
+                f"画像`{row['image_id']}` "
+                f"{row.get('person_name') or row.get('member_name') or '人物未指定'} "
+                f"— {row['score'] * 100:.1f}%"
             )
             for row in rows
         ]
@@ -2446,11 +2429,11 @@ class Phase3DetailsView(
             interaction.response
             .send_message(
                 embed=discord.Embed(
-                    title="ð ããããåç",
+                    title="🌟 おすすめ写真",
                     description=(
                         "\n".join(lines)
                         or
-                        "åè³ªåè¨ç®ãåã«å®è¡ãã¦ãã ããã"
+                        "品質再計算を先に実行してください。"
                     ),
                     color=0x57F287,
                 ),
@@ -2459,8 +2442,8 @@ class Phase3DetailsView(
         )
 
     @discord.ui.button(
-        label="å­¦ç¿æ´çè¨ºæ­",
-        emoji="ð§¹",
+        label="学習整理診断",
+        emoji="🧹",
         style=
             discord.ButtonStyle.secondary,
     )
@@ -2479,19 +2462,19 @@ class Phase3DetailsView(
             interaction.response
             .send_message(
                 (
-                    "ð§¹ å­¦ç¿ãã¼ã¿æ´çåè£\n"
-                    f"ä½åè³ªåè£ **{diagnostics['low_quality']:,}**\n"
-                    f"ç¹å¾´éãªã **{diagnostics['no_embedding']:,}**\n"
-                    f"åç§é¡1000ä»¶è¶ã®äººç© **{diagnostics['heavy_people']:,}**\n"
-                    "â»ãã®è¨ºæ­ã¯åé¤ãã¾ããã"
+                    "🧹 学習データ整理候補\n"
+                    f"低品質候補 **{diagnostics['low_quality']:,}**\n"
+                    f"特徴量なし **{diagnostics['no_embedding']:,}**\n"
+                    f"参照顔1000件超の人物 **{diagnostics['heavy_people']:,}**\n"
+                    "※この診断は削除しません。"
                 ),
                 ephemeral=True,
             )
         )
 
     @discord.ui.button(
-        label="ã¿ã°æ¤ç´¢",
-        emoji="ð",
+        label="タグ検索",
+        emoji="🔎",
         style=
             discord.ButtonStyle.secondary,
     )
@@ -2508,8 +2491,8 @@ class Phase3DetailsView(
         )
 
     @discord.ui.button(
-        label="Promptç»é²",
-        emoji="ð",
+        label="Prompt登録",
+        emoji="📝",
         style=
             discord.ButtonStyle.secondary,
         row=1,
@@ -2527,13 +2510,13 @@ class Phase3DetailsView(
         )
 
 
-# æ¢å­Viewã¸ãè©³ç´°ããã¿ã³ãè¿½å ããããã®æ´¾çView
+# 既存Viewへ「詳細」ボタンを追加するための派生View
 class Phase3AIViewFull(
     Phase3AIView
 ):
     @discord.ui.button(
-        label="åè³ªã»ããããè©³ç´°",
-        emoji="ð",
+        label="品質・おすすめ詳細",
+        emoji="📚",
         style=
             discord.ButtonStyle.success,
         row=3,
@@ -2546,7 +2529,7 @@ class Phase3AIViewFull(
         await (
             interaction.response
             .send_message(
-                "è¦ããé ç®ãé¸ãã§ãã ããã",
+                "見たい項目を選んでください。",
                 view=Phase3DetailsView(
                     self.owner_id
                 ),
@@ -2555,9 +2538,10 @@ class Phase3AIViewFull(
         )
 
     @discord.ui.button(
-        label="é¡åè£è¨ºæ­",
-        emoji="ð",
-        style=discord.ButtonStyle.secondary,
+        label="顔候補診断",
+        emoji="🔍",
+        style=
+            discord.ButtonStyle.secondary,
         row=3,
     )
     async def face_diagnostics(
@@ -2565,12 +2549,17 @@ class Phase3AIViewFull(
         interaction,
         _,
     ):
-        from face_candidate_diagnostics import send_face_candidate_diagnostics
-        await send_face_candidate_diagnostics(interaction)
+        from face_candidate_diagnostics import (
+            send_face_candidate_diagnostics,
+        )
+
+        await send_face_candidate_diagnostics(
+            interaction
+        )
 
     @discord.ui.button(
-        label="è§£æäºç´ON/OFF",
-        emoji="â°",
+        label="解析予約ON/OFF",
+        emoji="⏰",
         style=
             discord.ButtonStyle.secondary,
         row=3,
@@ -2645,7 +2634,7 @@ async def send_phase3_ai_center_full(
 
 
 # -------------------------
-# è§£æäºç´ã¯ã¼ã«ã¼
+# 解析予約ワーカー
 # -------------------------
 
 _SCHEDULE_TASK: (
@@ -2762,7 +2751,7 @@ async def _scheduled_loop() -> None:
 
         except Exception as exc:
             print(
-                "Phase3è§£æäºç´ã¯ã¼ã«ã¼ã¨ã©ã¼:",
+                "AI解析予約ワーカーエラー:",
                 type(exc).__name__,
                 exc,
             )
