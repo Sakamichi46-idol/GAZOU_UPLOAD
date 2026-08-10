@@ -105,6 +105,32 @@ def run()->dict:
     checks.append(('phase3_two_stage','phase3_preflight' in analyzer and 'local_two_stage' in analyzer,'ローカル→OpenAI二段階判定'))
     checks.append(('phase3_hash_cache','record_cache_event(image_id, "image_hash"' in analyzer,'画像ハッシュキャッシュ診断'))
     checks.append(('phase3_prompt_model','effective_model' in analyzer and 'effective_prompt' in analyzer,'モデル・プロンプト動的管理'))
+
+    # photo_ai_analyzer から ai_center へ依存する主要関数は、
+    # 関数ローカルではなくモジュールスコープで解決できることを確認する。
+    analyzer_tree = ast.parse(analyzer)
+    ai_center_imports = set()
+    for node in analyzer_tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == 'ai_center':
+            ai_center_imports.update(alias.asname or alias.name for alias in node.names)
+    required_ai_center_names = {
+        'effective_model', 'effective_prompt', 'phase3_preflight', 'record_cache_event'
+    }
+    checks.append((
+        'phase3_analyzer_ai_center_import_scope',
+        required_ai_center_names.issubset(ai_center_imports),
+        'photo_ai_analyzerのPhase3依存関数をモジュールスコープでimport',
+    ))
+    ai_center_tree = ast.parse(phase3)
+    ai_center_defs = {
+        node.name for node in ai_center_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    checks.append((
+        'phase3_ai_center_exports',
+        required_ai_center_names.issubset(ai_center_defs),
+        'ai_center側に必要なPhase3関数が実在',
+    ))
     checks.append(('phase3_schedule','start_phase3_schedule_worker' in (ROOT/'archive_main.py').read_text(encoding='utf-8'),'解析予約ワーカー'))
     checks.append(('phase3_quality',all(x in phase3 for x in ('phase3_tag_quality','phase3_person_quality','phase3_photo_quality')),'タグ・人物・写真品質'))
     checks.append(('phase3_recommendations','phase3_recommendations' in phase3 and 'おすすめ写真' in phase3,'おすすめ写真'))
