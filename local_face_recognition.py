@@ -309,6 +309,9 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
     group_name = str(image.get("group_name") or "")
     result: list[dict[str, Any]] = []
     for face in faces:
+        # すでに本確定・自動シード済みの顔は、再び確認待ちへ戻さない。
+        if face.get("confirmed_person_id") is not None:
+            continue
         encoded = str(face.get("face_embedding") or "")
         if not encoded:
             continue
