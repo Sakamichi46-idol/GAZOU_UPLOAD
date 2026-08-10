@@ -45,16 +45,16 @@ def run()->dict:
     checks.append((
         'person_confirm_ephemeral_cleanup',
         '_delete_unique_messages' in text
-        and 'interaction.message' in text
-        and 'state.selection_message' in text
-        and 'selection_message = await interaction.followup.send' in text,
-        '人物確定後に元レビュー・followup人物選択・現在操作中エフェメラルを明示削除',
+        and 'interaction.delete_original_response()' in text
+        and 'interaction.followup.delete_message(message_id)' in text,
+        '人物確定後は現在InteractionとメッセージIDの両経路でエフェメラルを削除',
     ))
     checks.append((
-        'person_confirm_followup_tracking',
-        'selection_message: discord.Message | None = None' in text
-        and 'state.selection_message = selection_message' in text,
-        'followupで作った人物選択エフェメラルをSelectionStateで追跡',
+        'person_confirm_single_message_flow',
+        'selection_message=source_message' in text
+        and 'await interaction.edit_original_response(' in text
+        and 'selection_message = await interaction.followup.send' not in text,
+        '人物選択は別followupを作らず元の人物確認カードを同一メッセージで編集',
     ))
     checks.append((
         'person_confirm_double_tap_guard',
