@@ -161,11 +161,38 @@ class FaceCandidateDiagnosticView(discord.ui.View):
         await interaction.response.send_modal(FaceDiagnosticIdModal())
 
 
-async def send_face_candidate_diagnostics(interaction: discord.Interaction) -> None:
-    report = await asyncio.to_thread(diagnose_recent, 20)
-    embed = _recent_embed(report)
-    view = FaceCandidateDiagnosticView(interaction.user.id)
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+async def send_face_candidate_diagnostics(
+    interaction: discord.Interaction,
+) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+    try:
+        report = await asyncio.to_thread(
+            diagnose_recent,
+            20,
+        )
+
+        embed = _recent_embed(report)
+
+        view = FaceCandidateDiagnosticView(
+            interaction.user.id
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            view=view,
+            ephemeral=True,
+        )
+
+    except Exception as exc:
+        await interaction.followup.send(
+            (
+                "⚠️ 顔候補診断に失敗しました。\n"
+                f"`{type(exc).__name__}: {exc}`"
+            ),
+            ephemeral=True,
+        )
