@@ -44,8 +44,17 @@ def run()->dict:
     checks.append(('review_upsert','ON CONFLICT' in db and 'photo_review_queue' in db,'確認キューUPSERT'))
     checks.append((
         'person_confirm_ephemeral_cleanup',
-        'await interaction.delete_original_response()' in text and '_finish_review_message' in text and '_finish_selection_message' in text,
-        '人物確定後に元レビューと操作中エフェメラルを削除',
+        '_delete_unique_messages' in text
+        and 'interaction.message' in text
+        and 'state.selection_message' in text
+        and 'selection_message = await interaction.followup.send' in text,
+        '人物確定後に元レビュー・followup人物選択・現在操作中エフェメラルを明示削除',
+    ))
+    checks.append((
+        'person_confirm_followup_tracking',
+        'selection_message: discord.Message | None = None' in text
+        and 'state.selection_message = selection_message' in text,
+        'followupで作った人物選択エフェメラルをSelectionStateで追跡',
     ))
     checks.append((
         'person_confirm_double_tap_guard',
