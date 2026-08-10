@@ -1545,22 +1545,20 @@ def analyze_photo_image_sync(
                 }
 
         preflight = phase3_preflight(image_id, image_hash)
-        if preflight.get("skip_api") and not manual_api:
-            update_image_analysis_status(image_id, "review", str(preflight.get("reason") or "ローカル判定で完結"))
-            record_cache_event(image_id, "local_two_stage", True, True, str(preflight.get("reason") or ""))
-            save_ai_usage(
-                image_id=image_id,
-                model_name="local_two_stage",
-                request_kind="local_only",
-                status="review",
-            )
-            return {
-                "image_id": image_id,
-                "status": "review",
-                "api_sent": False,
-                "local_only": True,
-                **preflight,
-            }
+        # 人物判定がローカルで十分でも、画像内容タグはOpenAIで生成する。
+        # ここでは「顔はローカルで解決済み」という事実だけ記録し、
+        # 画像全体のAIタグ解析を丸ごとスキップしない。
+        if preflight.get("local_face_complete"):
+            try:
+                record_cache_event(
+                    image_id,
+                    "local_face_resolved",
+                    True,
+                    False,
+                    "人物判定はローカルで十分。OpenAIは画像タグ生成のため実行。",
+                )
+            except Exception:
+                pass
 
         api_allowed, block_reason = can_send_image_to_api(manual=manual_api)
         if not api_allowed:
