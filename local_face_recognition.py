@@ -6,8 +6,10 @@ continues to run without the optional face-recognition dependencies.
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import zlib
+from datetime import datetime, timezone
 
 import requests
 from contextlib import closing, contextmanager
@@ -296,6 +298,58 @@ def _reference_embeddings(exclude_face_id: int, group_name: str = "") -> list[di
         return [dict(row) for row in rows]
 
 
+
+def _save_candidate_diagnostic(
+    image_id: int,
+    face_id: int,
+    ranked: list[dict[str, Any]],
+    reason: str,
+    reference_count: int,
+) -> None:
+    """正式候補とは別に、しきい値未満も含む上位スコアを診断用に保存する。"""
+    now = datetime.now(timezone.utc).isoformat()
+    top = ranked[:3]
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS photo_face_candidate_diagnostics (
+                face_id INTEGER PRIMARY KEY,
+                image_id INTEGER NOT NULL,
+                threshold REAL NOT NULL DEFAULT 0,
+                reference_count INTEGER NOT NULL DEFAULT 0,
+                best_person_id INTEGER,
+                best_person_name TEXT NOT NULL DEFAULT '',
+                best_confidence REAL NOT NULL DEFAULT 0,
+                top_candidates_json TEXT NOT NULL DEFAULT '[]',
+                reason TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        best = top[0] if top else {}
+        connection.execute(
+            """
+            INSERT INTO photo_face_candidate_diagnostics(
+                face_id,image_id,threshold,reference_count,best_person_id,best_person_name,
+                best_confidence,top_candidates_json,reason,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(face_id) DO UPDATE SET
+                image_id=excluded.image_id, threshold=excluded.threshold,
+                reference_count=excluded.reference_count, best_person_id=excluded.best_person_id,
+                best_person_name=excluded.best_person_name, best_confidence=excluded.best_confidence,
+                top_candidates_json=excluded.top_candidates_json, reason=excluded.reason,
+                updated_at=excluded.updated_at
+            """,
+            (
+                int(face_id), int(image_id), float(DEFAULT_MATCH_THRESHOLD), int(reference_count),
+                int(best.get("person_id")) if best.get("person_id") is not None else None,
+                str(best.get("person_name") or ""), float(best.get("confidence") or 0),
+                json.dumps(top, ensure_ascii=False), str(reason), now,
+            ),
+        )
+        connection.commit()
+
+
 def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict[str, Any]]:
     """Compare detected faces with confirmed local references using cosine similarity."""
     _, np = _load_dependencies()
@@ -316,27 +370,48 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
         if not encoded:
             continue
         target = _decode_embedding(encoded, np)
-        best_by_person: dict[int, dict[str, Any]] = {}
-        for reference in _reference_embeddings(int(face["id"]), group_name):
+        references = _reference_embeddings(int(face["id"]), group_name)
+        best_by_person_all: dict[int, dict[str, Any]] = {}
+        for reference in references:
             try:
                 vector = _decode_embedding(str(reference["face_embedding"]), np)
             except Exception:
                 continue
             similarity = float(np.dot(target, vector))
             # 正規化済みベクトルのコサイン類似度を0〜1へ丸める。
-            # (similarity + 1) / 2 は無関係な顔まで50%前後に見せるため使わない。
             confidence = max(0.0, min(similarity, 1.0))
-            if confidence < DEFAULT_MATCH_THRESHOLD:
-                continue
             person_id = int(reference["person_id"])
-            current = best_by_person.get(person_id)
+            current = best_by_person_all.get(person_id)
             if current is None or confidence > float(current["confidence"]):
-                best_by_person[person_id] = {
+                best_by_person_all[person_id] = {
                     "person_id": person_id,
                     "person_name": str(reference["person_name"]),
                     "confidence": confidence,
                 }
-        candidates = sorted(best_by_person.values(), key=lambda item: item["confidence"], reverse=True)[:max(1, min(limit_per_face, 10))]
+
+        ranked_all = sorted(
+            best_by_person_all.values(),
+            key=lambda item: item["confidence"],
+            reverse=True,
+        )
+        candidates = [
+            item for item in ranked_all
+            if float(item["confidence"]) >= DEFAULT_MATCH_THRESHOLD
+        ][:max(1, min(limit_per_face, 10))]
+
+        if not references:
+            diagnostic_reason = "参照顔なし"
+        elif not ranked_all:
+            diagnostic_reason = "有効な参照顔なし"
+        elif float(ranked_all[0]["confidence"]) < DEFAULT_MATCH_THRESHOLD:
+            diagnostic_reason = "候補しきい値未満"
+        elif candidates:
+            diagnostic_reason = "候補登録"
+        else:
+            diagnostic_reason = "候補なし"
+        _save_candidate_diagnostic(
+            int(image_id), int(face["id"]), ranked_all, diagnostic_reason, len(references)
+        )
 
         # 最新の確定顔を学習元として再計算するため、古い候補をいったん削除する。
         # これにより手動確定・一括確定した顔が、次回の候補生成へ確実に反映される。
@@ -357,6 +432,144 @@ def suggest_face_candidates(image_id: int, limit_per_face: int = 5) -> list[dict
         result.append({"face_id": int(face["id"]), "candidates": candidates})
     return result
 
+
+
+def diagnose_face_candidates(image_id: int, top_n: int = 3, *, scan_if_missing: bool = True) -> dict[str, Any]:
+    """APIを使わず、顔候補が確認待ちに入らない理由を再計算する。
+
+    正式候補の保存条件は変更せず、しきい値未満も診断結果として返す。
+    """
+    _, np = _load_dependencies()
+    image_id = int(image_id)
+    image = get_photo_image(image_id)
+    if not image:
+        raise ValueError("画像IDが見つかりません。")
+
+    faces = get_image_faces(image_id)
+    scanned_now = False
+    if not faces and scan_if_missing:
+        detect_faces_for_image(image_id)
+        faces = get_image_faces(image_id)
+        scanned_now = True
+
+    group_name = str(image.get("group_name") or "")
+    result_faces: list[dict[str, Any]] = []
+    summary = {
+        "detected_faces": len(faces),
+        "with_embedding": 0,
+        "confirmed_faces": 0,
+        "no_embedding": 0,
+        "no_references": 0,
+        "below_threshold": 0,
+        "registered_candidates": 0,
+    }
+
+    for face in faces:
+        face_id = int(face["id"])
+        confirmed = face.get("confirmed_person_id") is not None
+        if confirmed:
+            summary["confirmed_faces"] += 1
+
+        encoded = str(face.get("face_embedding") or "")
+        if not encoded:
+            summary["no_embedding"] += 1
+            result_faces.append({
+                "face_id": face_id,
+                "confirmed": confirmed,
+                "reason": "特徴量なし",
+                "references": 0,
+                "top_candidates": [],
+                "registered_count": 0,
+            })
+            continue
+
+        summary["with_embedding"] += 1
+        target = _decode_embedding(encoded, np)
+        references = _reference_embeddings(face_id, group_name)
+        if not references:
+            summary["no_references"] += 1
+            result_faces.append({
+                "face_id": face_id,
+                "confirmed": confirmed,
+                "reason": "参照顔なし",
+                "references": 0,
+                "top_candidates": [],
+                "registered_count": len(get_face_candidates(face_id)),
+            })
+            continue
+
+        best_by_person: dict[int, dict[str, Any]] = {}
+        for reference in references:
+            try:
+                vector = _decode_embedding(str(reference["face_embedding"]), np)
+            except Exception:
+                continue
+            similarity = float(np.dot(target, vector))
+            confidence = max(0.0, min(similarity, 1.0))
+            person_id = int(reference["person_id"])
+            current = best_by_person.get(person_id)
+            if current is None or confidence > float(current["confidence"]):
+                best_by_person[person_id] = {
+                    "person_id": person_id,
+                    "person_name": str(reference["person_name"]),
+                    "confidence": confidence,
+                }
+
+        ranked = sorted(
+            best_by_person.values(),
+            key=lambda item: float(item["confidence"]),
+            reverse=True,
+        )[:max(1, min(int(top_n), 10))]
+        registered = get_face_candidates(face_id)
+        registered_count = len(registered)
+        summary["registered_candidates"] += registered_count
+
+        if confirmed:
+            reason = "人物確定済み"
+        elif not ranked:
+            reason = "有効な参照顔なし"
+        elif float(ranked[0]["confidence"]) < DEFAULT_MATCH_THRESHOLD:
+            reason = "候補しきい値未満"
+            summary["below_threshold"] += 1
+        elif registered_count:
+            reason = "候補登録済み"
+        else:
+            reason = "しきい値通過・未登録（候補生成の再実行を確認）"
+
+        result_faces.append({
+            "face_id": face_id,
+            "confirmed": confirmed,
+            "reason": reason,
+            "references": len(references),
+            "top_candidates": ranked,
+            "registered_count": registered_count,
+        })
+
+    if not faces:
+        overall_reason = "顔未検出"
+    elif all(item["confirmed"] for item in result_faces):
+        overall_reason = "全顔が人物確定済み"
+    elif summary["registered_candidates"] > 0:
+        overall_reason = "候補登録あり"
+    elif summary["below_threshold"] > 0:
+        overall_reason = "候補しきい値未満"
+    elif summary["no_embedding"] > 0:
+        overall_reason = "特徴量なし"
+    elif summary["no_references"] > 0:
+        overall_reason = "参照顔なし"
+    else:
+        overall_reason = "候補なし"
+
+    return {
+        "image_id": image_id,
+        "group_name": group_name,
+        "analysis_status": str(image.get("analysis_status") or ""),
+        "threshold": float(DEFAULT_MATCH_THRESHOLD),
+        "scanned_now": scanned_now,
+        "summary": summary,
+        "faces": result_faces,
+        "overall_reason": overall_reason,
+    }
 
 def get_face_summary(image_id: int) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
