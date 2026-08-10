@@ -814,20 +814,30 @@ class SelectedPeopleView(OwnedView):
 
     @discord.ui.button(label="この内容で確定", emoji="✅", style=discord.ButtonStyle.success, row=1)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer()
-        reviewer = get_reviewer_name(interaction.user)
+        # SelectedPeopleView 自身は image_id を持たないため、必ず SelectionState の
+        # review から取得する。以前 self.image_id を参照していたため、ボタン押下後に
+        # AttributeError となり、Discord 上では「押せない」ように見える不具合があった。
         image_id = int(self.state.review["image_id"])
         names = list(self.state.selected_names)
         if self.state.unknown_other_people:
             names.append(make_unknown_other_label(self.state.unknown_other_people))
         names = normalize_people_for_storage(names)
-        await asyncio.to_thread(create_people_snapshot, self.image_id, interaction.user.id, "person_review_confirm")
+        if not names:
+            await interaction.response.send_message(
+                "確定する人物が選択されていません。人物が写っていない場合は「人物なし」を使ってください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        reviewer = get_reviewer_name(interaction.user)
         await asyncio.to_thread(
-            set_confirmed_image_people,
+            _commit_selected_people,
             image_id,
             names,
-            confirmed_by=reviewer,
-            note="階層式レビュー画面から複数人を確定",
+            interaction.user.id,
+            reviewer,
+            "階層式レビュー画面から複数人を確定",
         )
         await _finish_selection_message(
             interaction,
@@ -852,11 +862,12 @@ class SelectedPeopleView(OwnedView):
         await interaction.response.defer()
         image_id = int(self.state.review["image_id"])
         await asyncio.to_thread(
-            set_confirmed_image_people,
+            _commit_selected_people,
             image_id,
             [],
-            confirmed_by=get_reviewer_name(interaction.user),
-            note="人物なし",
+            interaction.user.id,
+            get_reviewer_name(interaction.user),
+            "人物なし",
         )
         await _finish_selection_message(
             interaction,
@@ -870,12 +881,14 @@ class SelectedPeopleView(OwnedView):
     async def unknown(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer()
         image_id = int(self.state.review["image_id"])
+        names = [make_unknown_other_label(1)]
         await asyncio.to_thread(
-            set_confirmed_image_people,
+            _commit_selected_people,
             image_id,
-            [make_unknown_other_label(1)],
-            confirmed_by=get_reviewer_name(interaction.user),
-            note="その他の人物（名前不明）1人",
+            names,
+            interaction.user.id,
+            get_reviewer_name(interaction.user),
+            "その他の人物（名前不明）1人",
         )
         await _finish_selection_message(
             interaction,
@@ -884,6 +897,27 @@ class SelectedPeopleView(OwnedView):
         )
         if self.state.session:
             await self.state.session.mark_done(image_id, interaction)
+
+
+def _commit_selected_people(
+    image_id: int,
+    names: list[str],
+    admin_user_id: int,
+    reviewer: str,
+    note: str,
+) -> None:
+    """階層式人物選択からの確定処理を1か所に集約する。
+
+    スナップショット作成と人物確定の呼び出し順を全経路で揃え、
+    「通常確定だけUndoできるが人物なしは戻せない」といった差を防ぐ。
+    """
+    create_people_snapshot(int(image_id), int(admin_user_id), "person_review_confirm")
+    set_confirmed_image_people(
+        int(image_id),
+        list(names),
+        confirmed_by=reviewer,
+        note=note,
+    )
 
 
 class BlogBulkConfirmView(discord.ui.View):
