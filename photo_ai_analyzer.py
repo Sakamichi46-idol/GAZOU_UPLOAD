@@ -827,8 +827,12 @@ def request_photo_analysis(
 
     client = get_openai_client()
 
+    from phase3_ai_center import effective_model, effective_prompt
+    active_model = effective_model(PHOTO_AI_MODEL)
+    active_prompt, active_prompt_version = effective_prompt(SYSTEM_PROMPT)
+
     request_options: dict[str, Any] = {
-        "model": PHOTO_AI_MODEL,
+        "model": active_model,
         "store": False,
         "input": [
             {
@@ -836,7 +840,7 @@ def request_photo_analysis(
                 "content": [
                     {
                         "type": "input_text",
-                        "text": SYSTEM_PROMPT,
+                        "text": active_prompt,
                     },
                 ],
             },
@@ -871,7 +875,7 @@ def request_photo_analysis(
     }
 
     # GPT-5系では推論量を抑え、JSON本文へ使える出力枠を確保する。
-    if PHOTO_AI_MODEL.startswith("gpt-5"):
+    if active_model.startswith("gpt-5"):
         request_options["reasoning"] = {
             "effort": "low",
         }
@@ -911,7 +915,7 @@ def request_photo_analysis(
             retry_options = dict(request_options)
             retry_options["max_output_tokens"] = min(max(PHOTO_AI_MAX_OUTPUT_TOKENS * 2, 2048), 8192)
             retry_options["input"] = [
-                {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PROMPT}]},
+                {"role": "system", "content": [{"type": "input_text", "text": active_prompt}]},
                 {"role": "user", "content": [
                     {"type": "input_text", "text": "JSONスキーマに必要な項目だけを最短で返してください。説明文は不要です。"},
                     {"type": "input_image", "image_url": image_data_url, "detail": "low"},
@@ -1460,6 +1464,11 @@ def analyze_photo_image_sync(
                     f"image_id={image_id}",
                     f"source_image_id={source_image_id}",
                 )
+                try:
+                    from phase3_ai_center import record_cache_event
+                    record_cache_event(image_id, "image_hash", True, True, f"source_image_id={source_image_id}")
+                except Exception:
+                    pass
                 return {
                     "image_id": image_id,
                     "status": final_status,
@@ -1467,6 +1476,25 @@ def analyze_photo_image_sync(
                     "source_image_id": source_image_id,
                     "api_sent": False,
                 }
+
+        from phase3_ai_center import phase3_preflight, record_cache_event
+        preflight = phase3_preflight(image_id, image_hash)
+        if preflight.get("skip_api") and not manual_api:
+            update_image_analysis_status(image_id, "review", str(preflight.get("reason") or "ローカル判定で完結"))
+            record_cache_event(image_id, "local_two_stage", True, True, str(preflight.get("reason") or ""))
+            save_ai_usage(
+                image_id=image_id,
+                model_name="local_two_stage",
+                request_kind="local_only",
+                status="review",
+            )
+            return {
+                "image_id": image_id,
+                "status": "review",
+                "api_sent": False,
+                "local_only": True,
+                **preflight,
+            }
 
         api_allowed, block_reason = can_send_image_to_api(manual=manual_api)
         if not api_allowed:
@@ -1511,7 +1539,7 @@ def analyze_photo_image_sync(
         costs = calculate_estimated_cost(usage_data)
         save_ai_usage(
             image_id=image_id,
-            model_name=PHOTO_AI_MODEL,
+            model_name=effective_model(PHOTO_AI_MODEL),
             request_kind="api",
             status=str(result.get("status", "completed")),
             input_tokens=int(usage_data.get("input_tokens", 0) or 0),
