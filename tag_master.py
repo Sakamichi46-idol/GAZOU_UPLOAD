@@ -129,6 +129,16 @@ def init_schema(connection: Any) -> None:
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS phase3_tag_quality (
+            tag TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            quality_score REAL NOT NULL DEFAULT 0,
+            usage_count INTEGER NOT NULL DEFAULT 0,
+            avg_confidence REAL NOT NULL DEFAULT 0,
+            auto_approve_candidate INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(tag, category)
+        );
         CREATE TABLE IF NOT EXISTS tag_search_cache (
             canonical_tag_id INTEGER NOT NULL,
             image_id INTEGER NOT NULL,
@@ -236,8 +246,10 @@ def rebuild_cache(connection: Any) -> dict[str, int]:
            SELECT a.canonical_tag_id,t.image_id,2,?
            FROM photo_ai_tags t JOIN tag_aliases a ON a.alias_key = tag_normalized_key(t.tag)
            JOIN tag_master m ON m.id=a.canonical_tag_id
+           LEFT JOIN phase3_tag_quality q ON q.tag=t.tag AND q.category=t.category
            WHERE m.status='approved' AND m.searchable=1
              AND t.confidence >= m.minimum_confidence
+             AND COALESCE(q.quality_score, 0.75) >= 0.50
              AND NOT EXISTS(SELECT 1 FROM tag_rejections r WHERE r.image_id=t.image_id AND r.normalized_key=a.alias_key)""", (now,)
     )
     count = int(connection.execute("SELECT COUNT(*) FROM tag_search_cache").fetchone()[0])
@@ -358,8 +370,10 @@ def refresh_image_cache(connection: Any, image_id: int) -> dict[str, int]:
            SELECT a.canonical_tag_id,t.image_id,2,?
            FROM photo_ai_tags t JOIN tag_aliases a ON a.alias_key=tag_normalized_key(t.tag)
            JOIN tag_master m ON m.id=a.canonical_tag_id
+           LEFT JOIN phase3_tag_quality q ON q.tag=t.tag AND q.category=t.category
            WHERE t.image_id=? AND m.status='approved' AND m.searchable=1
              AND t.confidence >= m.minimum_confidence
+             AND COALESCE(q.quality_score, 0.75) >= 0.50
              AND NOT EXISTS(SELECT 1 FROM tag_rejections r WHERE r.image_id=t.image_id AND r.normalized_key=a.alias_key)""", (now, image_id)
     )
     return {"assignments": int(connection.execute("SELECT COUNT(*) FROM tag_search_cache WHERE image_id=?", (image_id,)).fetchone()[0])}
