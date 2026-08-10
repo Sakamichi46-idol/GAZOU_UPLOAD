@@ -164,35 +164,34 @@ class FaceCandidateDiagnosticView(discord.ui.View):
 async def send_face_candidate_diagnostics(
     interaction: discord.Interaction,
 ) -> None:
-    if not interaction.response.is_done():
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
-        )
+    embed = discord.Embed(
+        title="🔍 顔候補診断",
+        description=(
+            "診断方法を選んでください。\n\n"
+            "・**直近20枚を診断**：最近AI解析した画像をまとめて確認します。\n"
+            "・**画像IDを指定**：1枚だけ詳しく確認します。\n\n"
+            "この画面を開くだけでは重い診断処理を実行しません。"
+            "診断はローカル処理のみで、OpenAI APIは使用しません。"
+        ),
+        color=0x5865F2,
+    )
+    embed.set_footer(
+        text="診断を実行したい方法を下のボタンから選んでください。"
+    )
 
-    try:
-        report = await asyncio.to_thread(
-            diagnose_recent,
-            20,
-        )
+    view = FaceCandidateDiagnosticView(
+        interaction.user.id
+    )
 
-        embed = _recent_embed(report)
-
-        view = FaceCandidateDiagnosticView(
-            interaction.user.id
-        )
-
+    if interaction.response.is_done():
         await interaction.followup.send(
             embed=embed,
             view=view,
             ephemeral=True,
         )
-
-    except Exception as exc:
-        await interaction.followup.send(
-            (
-                "⚠️ 顔候補診断に失敗しました。\n"
-                f"`{type(exc).__name__}: {exc}`"
-            ),
+    else:
+        await interaction.response.send_message(
+            embed=embed,
+            view=view,
             ephemeral=True,
         )
