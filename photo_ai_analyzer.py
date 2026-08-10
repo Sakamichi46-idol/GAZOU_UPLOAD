@@ -1406,6 +1406,67 @@ def materialize_analysis_image(image: dict[str, Any]):
         yield temp_path
 
 
+
+
+def _refresh_local_face_candidates_after_analysis(image_id: int) -> dict[str, Any]:
+    """
+    AI解析成功後にローカル顔候補を更新する。
+
+    - OpenAI APIは呼ばない。
+    - 既に顔スキャン済みなら再スキャンせず既存の顔を利用する。
+    - 顔認識側の失敗でAI解析本体を失敗扱いにはしない。
+    - すでに人物確定済みの顔は候補再生成の対象外。
+    """
+    from local_face_recognition import detect_faces_for_image, suggest_face_candidates
+
+    summary: dict[str, Any] = {
+        "attempted": True,
+        "scan_reused": False,
+        "detected": 0,
+        "auto_confirmed": 0,
+        "candidate_faces": 0,
+        "candidate_count": 0,
+        "error": "",
+    }
+
+    try:
+        with get_connection() as con:
+            scan = con.execute(
+                """
+                SELECT status, detected_faces, auto_confirmed_faces
+                FROM photo_face_scans
+                WHERE image_id=?
+                """,
+                (int(image_id),),
+            ).fetchone()
+
+        if scan and str(scan[0] or "") == "completed":
+            summary["scan_reused"] = True
+            summary["detected"] = int(scan[1] or 0)
+            summary["auto_confirmed"] = int(scan[2] or 0)
+        else:
+            scan_result = detect_faces_for_image(int(image_id))
+            summary["detected"] = int(scan_result.get("detected", 0) or 0)
+            summary["auto_confirmed"] = int(scan_result.get("auto_confirmed", 0) or 0)
+
+        # 顔がない画像、または全顔が自動確定済みなら候補生成は不要。
+        if summary["detected"] <= 0:
+            return summary
+
+        candidate_result = suggest_face_candidates(int(image_id))
+        summary["candidate_faces"] = sum(1 for item in candidate_result if item.get("candidates"))
+        summary["candidate_count"] = sum(len(item.get("candidates") or []) for item in candidate_result)
+        return summary
+
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+        print(
+            "AI解析後のローカル顔候補更新に失敗:",
+            f"image_id={image_id}",
+            summary["error"],
+        )
+        return summary
+
 # =========================
 # 画像1枚の解析
 # =========================
@@ -1473,12 +1534,14 @@ def analyze_photo_image_sync(
                     record_cache_event(image_id, "image_hash", True, True, f"source_image_id={source_image_id}")
                 except Exception:
                     pass
+                face_candidates = _refresh_local_face_candidates_after_analysis(image_id)
                 return {
                     "image_id": image_id,
                     "status": final_status,
                     "reused": True,
                     "source_image_id": source_image_id,
                     "api_sent": False,
+                    "face_candidates": face_candidates,
                 }
 
         preflight = phase3_preflight(image_id, image_hash)
@@ -1555,6 +1618,7 @@ def analyze_photo_image_sync(
         result["usage"] = usage_data
         result["estimated_cost_usd"] = costs["estimated_cost_usd"]
         result["api_sent"] = True
+        result["face_candidates"] = _refresh_local_face_candidates_after_analysis(image_id)
         finish_api_attempt(api_attempt_id, status="completed")
 
         print(
