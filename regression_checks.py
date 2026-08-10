@@ -136,6 +136,23 @@ def run()->dict:
     checks.append(('phase3_recommendations','phase3_recommendations' in phase3 and 'おすすめ写真' in phase3,'おすすめ写真'))
     checks.append(('phase3_tag_search','TagSearchModal' in phase3 and 'similar_tags' in phase3,'タグ候補・類似タグ検索'))
     checks.append(('phase3_utf8',not any(marker in phase3 for marker in MOJIBAKE_MARKERS),'Phase3日本語文字化けなし'))
+    checks.append((
+        'ai_success_local_face_candidate_hook',
+        '_refresh_local_face_candidates_after_analysis(image_id)' in analyzer
+        and 'result["face_candidates"] = _refresh_local_face_candidates_after_analysis(image_id)' in analyzer,
+        'AI解析成功後にローカル顔スキャン・候補生成へ接続',
+    ))
+    local_face=(ROOT/'local_face_recognition.py').read_text(encoding='utf-8')
+    checks.append((
+        'local_face_confirmed_skip',
+        'if face.get("confirmed_person_id") is not None:' in local_face,
+        '確定済み顔を候補再生成でpendingへ戻さない',
+    ))
+    checks.append((
+        'face_candidate_failure_isolated',
+        'AI解析後のローカル顔候補更新に失敗:' in analyzer and 'summary["error"]' in analyzer,
+        'ローカル顔候補生成失敗をAI解析本体から分離',
+    ))
 
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
