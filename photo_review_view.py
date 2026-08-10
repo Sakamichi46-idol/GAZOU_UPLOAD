@@ -201,21 +201,42 @@ def build_skipped_embed(review: dict[str, Any], reviewer: discord.abc.User) -> d
     return embed
 
 
-async def _delete_message_safely(message: discord.Message | None) -> None:
+async def _delete_message_safely(
+    message: discord.Message | None,
+    interaction: discord.Interaction | None = None,
+) -> None:
+    """エフェメラルを含むDiscordメッセージを可能な経路で確実に削除する。
+
+    古いInteractionから作られたWebhookMessageでは ``message.delete()`` が
+    失敗することがあるため、現在のInteractionトークンから
+    ``followup.delete_message(message.id)`` も試す。
+    """
     if message is None:
         return
+
     try:
         await message.delete()
+        return
+    except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+        pass
+
+    if interaction is None:
+        return
+
+    message_id = int(getattr(message, "id", 0) or 0)
+    if not message_id:
+        return
+    try:
+        await interaction.followup.delete_message(message_id)
     except (discord.HTTPException, discord.NotFound, discord.Forbidden):
         pass
 
 
-async def _delete_unique_messages(*messages: discord.Message | None) -> None:
-    """同じDiscordメッセージを二重削除せず、安全にまとめて削除する。
-
-    エフェメラルのfollowupメッセージも ``WebhookMessage.delete()`` を持つため、
-    元の人物確認カードと現在操作中の人物選択/最終確認カードを同じ方法で扱う。
-    """
+async def _delete_unique_messages(
+    *messages: discord.Message | None,
+    interaction: discord.Interaction | None = None,
+) -> None:
+    """同じDiscordメッセージを二重削除せず、安全にまとめて削除する。"""
     seen: set[int] = set()
     for message in messages:
         if message is None:
@@ -225,7 +246,7 @@ async def _delete_unique_messages(*messages: discord.Message | None) -> None:
             continue
         if message_id:
             seen.add(message_id)
-        await _delete_message_safely(message)
+        await _delete_message_safely(message, interaction)
 
 
 async def _delete_message_later(
@@ -262,17 +283,19 @@ async def _finish_selection_message(
     if not interaction.response.is_done():
         await interaction.response.defer()
 
-    await _delete_unique_messages(
-        source_message,
-        selection_message,
-        interaction.message,
-    )
-
-    # Modalなど、interaction.message を取得できない経路のフォールバック。
+    # 現在押したコンポーネントが載っているメッセージは、
+    # Interaction自身の削除APIが最も確実。最初にこれを試す。
     try:
         await interaction.delete_original_response()
     except (discord.HTTPException, discord.NotFound, discord.Forbidden):
         pass
+
+    await _delete_unique_messages(
+        source_message,
+        selection_message,
+        interaction.message,
+        interaction=interaction,
+    )
 
     try:
         notice = await interaction.followup.send(text, ephemeral=True, wait=True)
@@ -296,15 +319,16 @@ async def _finish_review_message(
     if not interaction.response.is_done():
         await interaction.response.defer()
 
-    await _delete_unique_messages(
-        source_message,
-        interaction.message,
-    )
-
     try:
         await interaction.delete_original_response()
     except (discord.HTTPException, discord.NotFound, discord.Forbidden):
         pass
+
+    await _delete_unique_messages(
+        source_message,
+        interaction.message,
+        interaction=interaction,
+    )
 
     try:
         notice = await interaction.followup.send(
@@ -1289,26 +1313,32 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="人物を選ぶ", emoji="👥", style=discord.ButtonStyle.primary, row=0)
     async def select_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        """人物選択は新しいfollowupを作らず、元のレビューカード上で進める。
+
+        以前は人物選択だけ別のエフェメラルfollowupへ遷移していたため、
+        確定後に元の「写真の人物確認」カードだけが残るケースがあった。
+        同じメッセージを編集して選択UIへ切り替えることで、確定時に
+        現在のInteractionから1枚を確実に削除できるようにする。
+        """
+        await interaction.response.defer()
         await asyncio.to_thread(seed_member_master)
         initial_raw = split_person_names(self.review.get("confirmed_people", ""))
         initial_unknown = sum(unknown_other_count(name) for name in initial_raw)
         initial = [name for name in initial_raw if not unknown_other_count(name)]
+        source_message = self.message or interaction.message
         state = SelectionState(
             review=self.review,
             owner_id=interaction.user.id,
-            source_message=interaction.message,
+            source_message=source_message,
+            selection_message=source_message,
             session=self.session,
             selected_names=initial,
             unknown_other_people=initial_unknown,
         )
-        selection_message = await interaction.followup.send(
-            selection_text(state),
+        await interaction.edit_original_response(
+            content=selection_text(state),
             view=GroupView(state),
-            ephemeral=True,
-            wait=True,
         )
-        state.selection_message = selection_message
 
     @discord.ui.button(label="手入力", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
     async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
