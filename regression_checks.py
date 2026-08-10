@@ -17,8 +17,16 @@ def check_face_candidate_diagnostics() -> list[str]:
         errors.append("顔候補診断モジュールが不完全です")
     if 'label="顔候補診断"' not in ai_text:
         errors.append("AI管理に顔候補診断ボタンがありません")
-    if "OpenAI APIを使わず" not in diag_text:
+    if "OpenAI APIを使わず" not in diag_text and "OpenAI APIは使用しません" not in diag_text:
         errors.append("API不使用の診断表示がありません")
+    if "await interaction.response.defer" not in ai_text.split("async def face_diagnostics", 1)[1].split("@discord.ui.button", 1)[0]:
+        errors.append("AI管理の顔候補診断callbackがimport前にdeferしていません")
+    if "from local_face_recognition import DEFAULT_MATCH_THRESHOLD, diagnose_face_candidates" in diag_text:
+        errors.append("顔候補診断がlocal_face_recognitionをトップレベルimportしています")
+    if "def _load_face_diagnostics" not in diag_text:
+        errors.append("顔認識の遅延importヘルパーがありません")
+    if "await interaction.edit_original_response" not in diag_text:
+        errors.append("defer後の診断メニュー表示がedit_original_responseを使っていません")
     return errors
 
 
