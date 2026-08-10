@@ -761,7 +761,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Phase 3 AI管理", emoji="🧠", style=discord.ButtonStyle.primary, custom_id="photo:admin:phase3_ai")
     async def phase3_ai(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        from phase3_ai_center import send_phase3_ai_center_full
+        from ai_center import send_phase3_ai_center_full
         await send_phase3_ai_center_full(interaction)
 
     @discord.ui.button(label="保存状況", emoji="💾", style=discord.ButtonStyle.secondary, custom_id="photo:admin:storage")
