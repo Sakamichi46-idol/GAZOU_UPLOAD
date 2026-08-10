@@ -17,6 +17,7 @@ import discord
 
 from embed_safety import safe_add_field
 from local_face_recognition import get_face_crop_bytes
+from face_candidate_scoring import get_face_score_details, init_candidate_scoring_schema
 from photo_database import (
     complete_face_reviews_bulk,
     get_connection,
@@ -101,7 +102,22 @@ def query_candidate_reviews(
             """,
             (*params, PAGE_SIZE, page * PAGE_SIZE),
         ).fetchall()
-    return total, [dict(row) for row in rows]
+    items = [dict(row) for row in rows]
+    init_candidate_scoring_schema()
+    for item in items:
+        details = get_face_score_details(int(item["face_id"]))
+        detail = details.get(int(item.get("person_id") or 0), {})
+        if detail:
+            item.update({
+                "face_similarity": float(detail.get("face_similarity") or 0),
+                "person_quality": float(detail.get("person_quality") or 0),
+                "reference_count": int(detail.get("reference_count") or 0),
+                "acceptance_rate": float(detail.get("acceptance_rate") or 0),
+                "author_match": bool(detail.get("author_match")),
+                "confidence_band": str(detail.get("confidence_band") or ""),
+                "score_reason": str(detail.get("reason") or ""),
+            })
+    return total, items
 
 
 def get_face_review_by_id(face_id: int) -> dict[str, Any] | None:
@@ -170,9 +186,15 @@ def center_embed(state: CandidateState) -> discord.Embed:
     ), inline=True)
     lines = []
     for item in rows[:12]:
+        score = float(item.get("confidence") or 0)
+        raw = float(item.get("face_similarity") or 0)
+        band = _text(item.get("confidence_band"))
+        suffix = f" / 顔{raw*100:.1f}%" if raw else ""
+        if band:
+            suffix += f" / {band}"
         lines.append(
             f"・顔ID **{item['face_id']}** — **{item['person_name']}** "
-            f"{float(item.get('confidence') or 0) * 100:.1f}%（{_score_source_label(item.get('score_source'))}）"
+            f"統合{score * 100:.1f}%{suffix}"
         )
     safe_add_field(e, name="このページの先頭候補", value="\n".join(lines) or "対象なし", inline=False)
     e.set_footer(text="複数選択後に『選択を一括採用』を押すと、変更前確認を経て確定します。")
@@ -190,7 +212,7 @@ class CandidateFaceSelect(discord.ui.Select):
             options.append(discord.SelectOption(
                 label=f"顔{face_id}: {_text(item.get('person_name'))[:70]}",
                 value=str(face_id),
-                description=f"{confidence * 100:.1f}% / 画像ID {item.get('image_id')}",
+                description=(f"統合{confidence * 100:.1f}% / 顔{float(item.get('face_similarity') or 0)*100:.1f}% / 画像{item.get('image_id')}")[:100],
                 default=face_id in state.selected_face_ids,
             ))
         super().__init__(
