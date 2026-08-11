@@ -47,6 +47,32 @@ def run()->dict:
     text=(ROOT/'photo_review_view.py').read_text(encoding='utf-8')
     checks.append(('review_select_row', 'row=3' in text or 'row = 3' in text, '人物選択Select専用行'))
 
+    # 2026-08-11:
+    # discord.py の View は内部で `_refresh(components)` を使用する。
+    # 自作 View が `_refresh(self)` を定義すると、Discord のメッセージ更新時に
+    # TypeError: ... _refresh() takes 1 positional argument but 2 were given
+    # で Bot 全体がクラッシュするため、予約内部名との衝突を防ぐ。
+    combined_search = (ROOT/'combined_photo_search.py').read_text(encoding='utf-8')
+    combined_tree = ast.parse(combined_search)
+    combined_refresh_override = False
+    combined_sync_method = False
+    for node in combined_tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == 'CombinedSearchView':
+            method_names = {
+                item.name
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            combined_refresh_override = '_refresh' in method_names
+            combined_sync_method = '_sync_navigation_buttons' in method_names
+            break
+    checks.append((
+        'combined_search_no_discord_refresh_collision',
+        not combined_refresh_override and combined_sync_method
+        and 'self._sync_navigation_buttons()' in combined_search,
+        'CombinedSearchViewはdiscord.py内部の_refreshを上書きしない',
+    ))
+
     # 2026-08-08: 階層式人物選択で「この内容で確定」を押すと、
     # SelectedPeopleView に存在しない self.image_id を参照して AttributeError になった回帰。
     selected_block = text.split('class SelectedPeopleView', 1)[1].split('class BlogBulkConfirmView', 1)[0]
