@@ -89,7 +89,7 @@ class CombinedSearchView(discord.ui.View):
         self.results = results
         self.query = query
         self.index = index % len(results)
-        self._refresh()
+        self._sync_navigation_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -97,7 +97,12 @@ class CombinedSearchView(discord.ui.View):
             return False
         return True
 
-    def _refresh(self) -> None:
+    def _sync_navigation_buttons(self) -> None:
+        """検索結果の前へ/次へボタン状態だけを同期する。
+
+        discord.py の View 内部メソッド `_refresh(components)` と
+        名前が衝突しないよう、アプリ専用のメソッド名を使用する。
+        """
         self.previous.disabled = len(self.results) <= 1
         self.next.disabled = len(self.results) <= 1
 
