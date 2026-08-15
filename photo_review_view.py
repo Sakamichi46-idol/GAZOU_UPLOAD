@@ -658,6 +658,7 @@ class SelectionState:
     member_page: int = 0
     remove_page: int = 0
     unknown_other_people: int = 0
+    base_person_set_name: str = ""
     commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     committed: bool = False
 
@@ -687,7 +688,16 @@ def selection_text(state: SelectionState) -> str:
     selected = truncate_text(selected, 1700)
     path = " → ".join(v for v in (state.group_name, state.generation_name) if v) or "グループを選んでください。"
     total = len(state.selected_names) + state.unknown_other_people
-    return f"**選択場所:** {path}\n**選択中（合計{total}人）:** {selected}"
+    base_set = (
+        f"**人物セット:** {discord.utils.escape_markdown(state.base_person_set_name)}\n"
+        if state.base_person_set_name
+        else ""
+    )
+    return (
+        f"{base_set}"
+        f"**選択場所:** {path}\n"
+        f"**選択中（合計{total}人）:** {selected}"
+    )
 
 
 class OtherPersonInputModal(discord.ui.Modal, title="その他の人物を追加"):
@@ -964,11 +974,15 @@ class SelectedPeopleView(OwnedView):
                 ephemeral=True,
             )
             return
+        note = "階層式レビュー画面から複数人を確定"
+        if self.state.base_person_set_name:
+            note = f"人物セット「{self.state.base_person_set_name}」を部分修正して確定"
+
         await _commit_selection_state(
             interaction,
             self.state,
             names,
-            note="階層式レビュー画面から複数人を確定",
+            note=note,
         )
 
     @discord.ui.button(label="名前不明を1人追加", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
@@ -1168,8 +1182,29 @@ class PersonSetApplySelect(discord.ui.Select):
         super().__init__(placeholder="人物セットを選択",options=options)
         self.sets={str(x["id"]):x for x in sets}
     async def callback(self, interaction: discord.Interaction):
-        item=self.sets[self.values[0]]
-        await self.review_view.complete_review(interaction,item["people"],note=f"人物セット「{item['name']}」を使用")
+        item = self.sets[self.values[0]]
+
+        # 人物セットは「そのまま確定」ではなく、確認・部分修正できる初期値として読み込む。
+        # セット内の一部だけ外す、別人物を追加する、といった修正をしてから確定できる。
+        source_message = self.review_view.message or interaction.message
+        state = SelectionState(
+            review=self.review_view.review,
+            owner_id=interaction.user.id,
+            source_message=source_message,
+            selection_message=interaction.message,
+            session=self.review_view.session,
+            selected_names=normalize_people_for_storage(list(item["people"])),
+            base_person_set_name=normalize_text(item["name"]),
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                f"📚 人物セット **{discord.utils.escape_markdown(item['name'])}** を読み込みました。\n"
+                "必要な人物だけ外したり、別の人物を追加してから確定できます。\n\n"
+                + selection_text(state)
+            ),
+            view=SelectedPeopleView(state),
+        )
 
 class PersonSetApplyView(discord.ui.View):
     def __init__(self, review_view: "PersonReviewView", sets: list[dict[str, Any]]):
