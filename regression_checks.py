@@ -259,6 +259,34 @@ def run()->dict:
         '名前付き人物セットを保存・更新できる',
     ))
 
+    review_text=(ROOT/'photo_review_view.py').read_text(encoding='utf-8') if (ROOT/'photo_review_view.py').exists() else ''
+    checks.append((
+        'person_set_partial_edit_before_confirm',
+        'base_person_set_name: str = ""' in review_text
+        and '必要な人物だけ外したり、別の人物を追加してから確定できます。' in review_text
+        and 'view=SelectedPeopleView(state)' in review_text,
+        '人物セットを即確定せず部分修正画面へ読み込める',
+    ))
+    checks.append((
+        'person_set_edit_keeps_set_name',
+        '**人物セット:**' in review_text
+        and 'base_person_set_name=normalize_text(item["name"])' in review_text,
+        '人物セット編集中に元セット名を表示できる',
+    ))
+    checks.append((
+        'person_set_edit_can_add_remove',
+        'class SelectedPeopleView' in review_text
+        and 'class RemoveSelect' in review_text
+        and 'label="人物を追加"' in review_text
+        and 'label="この内容で確定"' in review_text,
+        '人物セットから人物を外す・追加する・確定する操作を維持',
+    ))
+    checks.append((
+        'person_set_edit_audit_note',
+        '人物セット「{self.state.base_person_set_name}」を部分修正して確定' in review_text,
+        '人物セット部分修正の確定を履歴noteに残す',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
