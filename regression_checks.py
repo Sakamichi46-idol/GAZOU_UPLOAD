@@ -308,6 +308,27 @@ def run()->dict:
         '読み未登録の新メンバーでもソート処理を継続できる',
     ))
 
+    photo_db_text=(ROOT/'photo_database.py').read_text(encoding='utf-8') if (ROOT/'photo_database.py').exists() else ''
+    checks.append((
+        'person_review_missing_queue_auto_repair',
+        'def ensure_pending_person_review_queue' in photo_db_text
+        and 'if normalized_status == "pending":' in photo_db_text
+        and 'ensure_pending_person_review_queue(group_name, blog_id)' in photo_db_text,
+        '人物確認pending取得前にキュー未作成の未確定画像を自動補完する',
+    ))
+    checks.append((
+        'person_review_auto_repair_excludes_confirmed',
+        "pip.relation_status = 'confirmed'" in photo_db_text
+        and "existing_review.review_type = 'person_identity'" in photo_db_text,
+        '人物確定済み・既存レビュー行を重複してpending化しない',
+    ))
+    checks.append((
+        'person_review_auto_repair_excludes_terminal',
+        "NOT IN ('invalid_url', 'permanent_failed')" in photo_db_text
+        and 'reviewable_image_count = max(0, image_count - terminal)' in photo_db_text,
+        '復旧不能画像は人物確認キューと残り件数から除外する',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
