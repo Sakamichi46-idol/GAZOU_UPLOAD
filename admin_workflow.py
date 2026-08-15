@@ -464,7 +464,7 @@ class GroupSelect(discord.ui.Select):
         group = self.values[0]
         await interaction.response.defer()
         authors = await asyncio.to_thread(get_blog_authors_for_admin, group, 500)
-        view = AuthorSelectView(group, authors, page=0)
+        view = AuthorSelectView(group, authors, page=0, sort_mode="completion_desc")
         await interaction.edit_original_response(
             content=view.text(), embed=None, view=view,
         )
@@ -476,6 +476,75 @@ class GroupSelectView(AdminWorkflowView):
         self.add_item(GroupSelect())
 
 
+def _author_completion_percent(author: dict[str, Any]) -> int:
+    total = int(author.get("blog_count") or 0)
+    completed = int(author.get("completed_blog_count") or 0)
+    return int(author.get("completion_percent") or (round(completed * 100 / total) if total else 0))
+
+
+def _sort_authors(authors: list[dict[str, Any]], sort_mode: str) -> list[dict[str, Any]]:
+    """投稿者一覧を管理画面で選択された基準に従って安定ソートする。"""
+    rows = list(authors)
+    if sort_mode == "name_asc":
+        return sorted(rows, key=lambda a: str(a.get("member_name") or ""))
+    if sort_mode == "blogs_desc":
+        return sorted(
+            rows,
+            key=lambda a: (-int(a.get("blog_count") or 0), str(a.get("member_name") or "")),
+        )
+    if sort_mode == "pending_desc":
+        return sorted(
+            rows,
+            key=lambda a: (
+                -max(0, int(a.get("pending_blog_count") or (int(a.get("blog_count") or 0) - int(a.get("completed_blog_count") or 0)))),
+                -int(a.get("blog_count") or 0),
+                str(a.get("member_name") or ""),
+            ),
+        )
+    # 既定: 完了率が高い順。同率なら完了件数、ブログ件数、メンバー名の順。
+    return sorted(
+        rows,
+        key=lambda a: (
+            -_author_completion_percent(a),
+            -int(a.get("completed_blog_count") or 0),
+            -int(a.get("blog_count") or 0),
+            str(a.get("member_name") or ""),
+        ),
+    )
+
+
+AUTHOR_SORT_LABELS = {
+    "completion_desc": "完了%が高い順",
+    "name_asc": "メンバー名順",
+    "blogs_desc": "ブログ件数が多い順",
+    "pending_desc": "未完了件数が多い順",
+}
+
+
+class AuthorSortSelect(discord.ui.Select):
+    def __init__(self, parent: "AuthorSelectView"):
+        self.parent_view = parent
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=value,
+                default=(value == parent.sort_mode),
+            )
+            for value, label in AUTHOR_SORT_LABELS.items()
+        ]
+        super().__init__(placeholder="並び順を変更", options=options, row=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        sort_mode = self.values[0]
+        view = AuthorSelectView(
+            self.parent_view.group,
+            self.parent_view.raw_authors,
+            page=0,
+            sort_mode=sort_mode,
+        )
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+
 class AuthorSelect(discord.ui.Select):
     def __init__(self, parent: "AuthorSelectView", authors: list[dict[str, Any]]):
         self.parent_view = parent
@@ -485,7 +554,7 @@ class AuthorSelect(discord.ui.Select):
             total = int(author.get("blog_count") or 0)
             completed = int(author.get("completed_blog_count") or 0)
             pending = max(0, int(author.get("pending_blog_count") or (total - completed)))
-            percent = int(author.get("completion_percent") or (round(completed * 100 / total) if total else 0))
+            percent = _author_completion_percent(author)
             options.append(discord.SelectOption(
                 label=str(author["member_name"])[:100], value=str(author["member_name"])[:100],
                 description=(f"完了 {completed}/{total}件 ({percent}%) ・ 未完了 {pending}件")[:100],
@@ -511,28 +580,44 @@ class AuthorSelect(discord.ui.Select):
 
 class AuthorSelectView(AdminWorkflowView):
     PAGE_SIZE = 25
-    def __init__(self, group: str, authors: list[dict[str, Any]], page: int = 0):
-        super().__init__(); self.group=group; self.authors=authors
-        self.page_count=max(1,(len(authors)+self.PAGE_SIZE-1)//self.PAGE_SIZE)
-        self.page=max(0,min(int(page),self.page_count-1))
-        start=self.page*self.PAGE_SIZE; page_authors=authors[start:start+self.PAGE_SIZE]
-        self.add_item(AuthorSelect(self,page_authors))
-        self.previous.disabled=self.page<=0; self.next.disabled=self.page>=self.page_count-1
-    def text(self)->str:
-        start=self.page*self.PAGE_SIZE+1 if self.authors else 0; end=min((self.page+1)*self.PAGE_SIZE,len(self.authors))
+
+    def __init__(self, group: str, authors: list[dict[str, Any]], page: int = 0, sort_mode: str = "completion_desc"):
+        super().__init__()
+        self.group = group
+        self.raw_authors = list(authors)
+        self.sort_mode = sort_mode if sort_mode in AUTHOR_SORT_LABELS else "completion_desc"
+        self.authors = _sort_authors(self.raw_authors, self.sort_mode)
+        self.page_count = max(1, (len(self.authors) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(int(page), self.page_count - 1))
+        start = self.page * self.PAGE_SIZE
+        page_authors = self.authors[start:start + self.PAGE_SIZE]
+        self.add_item(AuthorSelect(self, page_authors))
+        self.add_item(AuthorSortSelect(self))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+
+    def text(self) -> str:
+        start = self.page * self.PAGE_SIZE + 1 if self.authors else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.authors))
         return (
             f"📖 **{self.group}** のブログ投稿者を選択してください。\n"
-            f"表示 **{start}〜{end}人目 / 全{len(self.authors)}人**（{self.page+1}/{self.page_count}ページ）\n"
+            f"並び順: **{AUTHOR_SORT_LABELS[self.sort_mode]}**\n"
+            f"表示 **{start}〜{end}人目 / 全{len(self.authors)}人**（{self.page + 1}/{self.page_count}ページ）\n"
             "各投稿者には、完了記事数・全記事数・未完了数を表示しています。"
         )
-    @discord.ui.button(label="前の25人",emoji="◀️",style=discord.ButtonStyle.secondary,row=1)
-    async def previous(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
-        v=AuthorSelectView(self.group,self.authors,self.page-1); await interaction.response.edit_message(content=v.text(),embed=None,view=v)
-    @discord.ui.button(label="次の25人",emoji="▶️",style=discord.ButtonStyle.secondary,row=1)
-    async def next(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
-        v=AuthorSelectView(self.group,self.authors,self.page+1); await interaction.response.edit_message(content=v.text(),embed=None,view=v)
-    @discord.ui.button(label="グループ選択へ",emoji="↩️",style=discord.ButtonStyle.secondary,row=1)
-    async def back(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=2)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = AuthorSelectView(self.group, self.raw_authors, self.page - 1, self.sort_mode)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=2)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = AuthorSelectView(self.group, self.raw_authors, self.page + 1, self.sort_mode)
+        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="グループ選択へ", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
             content="👤 **投稿者から選ぶ**\nグループを選択してください。",
             embed=None, view=GroupSelectView(),
