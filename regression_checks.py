@@ -225,6 +225,40 @@ def run()->dict:
         '顔候補診断: ' + ('OK' if not diag_errors else ' / '.join(diag_errors)),
     ))
 
+    advanced_admin=(ROOT/'advanced_admin_features.py').read_text(encoding='utf-8') if (ROOT/'advanced_admin_features.py').exists() else ''
+    checks.append((
+        'person_set_selection_mode',
+        'class PersonSetCreateModeView' in advanced_admin
+        and 'label="メンバーから選択"' in advanced_admin
+        and 'label="名前を直接入力"' in advanced_admin,
+        '人物セット保存で選択式と直接入力式を選べる',
+    ))
+    checks.append((
+        'person_set_named_builder',
+        'class PersonSetNameModal' in advanced_admin
+        and 'class PersonSetBuilderState' in advanced_admin
+        and 'label="セット名"' in advanced_admin,
+        '選択式人物セットにセット名を付けられる',
+    ))
+    checks.append((
+        'person_set_hierarchical_select',
+        all(name in advanced_admin for name in (
+            'class PersonSetGroupSelect',
+            'class PersonSetGenerationSelect',
+            'class PersonSetMemberSelect',
+            'label="別の期生から追加"',
+            'label="別グループから追加"',
+        )),
+        'グループ・期生・人物を選択UIで複数追加できる',
+    ))
+    checks.append((
+        'person_set_named_save',
+        'def save_person_set(' in advanced_admin
+        and 'ON CONFLICT(set_name) DO UPDATE SET' in advanced_admin
+        and 'label="この人物セットを保存"' in advanced_admin,
+        '名前付き人物セットを保存・更新できる',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
