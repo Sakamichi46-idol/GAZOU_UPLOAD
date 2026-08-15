@@ -4103,6 +4103,87 @@ def get_photo_storage_stats() -> dict[str, int]:
 
 
 
+
+def ensure_pending_person_review_queue(
+    group_name: str = "",
+    blog_id: int | None = None,
+) -> int:
+    """人物未確定なのにレビューキューが無い画像へ pending 行を補完する。
+
+    ブログ進捗では、キュー未作成の画像も「未確認」として数える。
+    一方、従来の人物確認画面は photo_review_queue.status='pending' の行しか
+    取得しなかったため、「残りあり」なのに「確認待ちなし」となることがあった。
+    この補完処理で両者の対象条件を一致させる。
+
+    復旧不能URLなど terminal 状態の画像と、すでに人物確定済みの画像は対象外。
+    """
+    normalized_group = str(group_name or "").strip()
+    normalized_blog_id = int(blog_id) if blog_id is not None else None
+
+    filters = [
+        "COALESCE(pb.is_hidden, 0) = 0",
+        "COALESCE(pi.download_status, '') NOT IN ('invalid_url', 'permanent_failed')",
+        """NOT EXISTS (
+            SELECT 1
+            FROM photo_image_people pip
+            WHERE pip.image_id = pi.id
+              AND pip.relation_status = 'confirmed'
+        )""",
+        """NOT EXISTS (
+            SELECT 1
+            FROM photo_review_queue existing_review
+            WHERE existing_review.image_id = pi.id
+              AND existing_review.review_type = 'person_identity'
+        )""",
+    ]
+    values: list[Any] = []
+
+    if normalized_group:
+        filters.append("pb.group_name = ?")
+        values.append(normalized_group)
+
+    if normalized_blog_id is not None:
+        filters.append("pb.id = ?")
+        values.append(normalized_blog_id)
+
+    now = utc_now_text()
+
+    with closing(get_connection()) as connection:
+        before = int(connection.total_changes)
+
+        connection.execute(
+            f"""
+            INSERT INTO photo_review_queue (
+                image_id,
+                review_type,
+                question,
+                candidates,
+                status,
+                created_at,
+                updated_at
+            )
+            SELECT
+                pi.id,
+                'person_identity',
+                'この写真に写っている人物を確認してください。',
+                '',
+                'pending',
+                ?,
+                ?
+            FROM photo_images pi
+            JOIN photo_blogs pb
+              ON pb.id = pi.blog_id
+            WHERE {' AND '.join(filters)}
+            """,
+            (now, now, *values),
+        )
+
+        inserted = int(connection.total_changes) - before
+        connection.commit()
+
+    return max(0, inserted)
+
+
 def get_person_reviews_by_status(
     status: str,
     limit: int = 100,
@@ -4120,6 +4201,11 @@ def get_person_reviews_by_status(
             f"Unsupported review status: {normalized_status!r}. "
             f"Allowed: {sorted(allowed_statuses)}"
         )
+
+    # pending を読む前に、進捗上は未確認だがキュー未作成だった画像を補完する。
+    # skipped の再確認では既存 skipped 行だけを対象にする。
+    if normalized_status == "pending":
+        ensure_pending_person_review_queue(group_name, blog_id)
 
     safe_limit = max(1, min(int(limit), 500))
     normalized_group = str(group_name or "").strip()
@@ -5409,10 +5495,13 @@ def _normalize_blog_admin_rows(rows: list[Any]) -> list[dict[str, Any]]:
         pending = int(item.get("review_pending_count") or 0)
         skipped = int(item.get("review_skipped_count") or 0)
         # レビュー行がまだ作られていない画像も未確認として扱う。
+        # ただし不正URL・復旧不能など terminal 除外済み画像は人物確認対象に含めない。
         image_count = int(item.get("image_count") or 0)
-        effective_total = max(total, image_count)
+        terminal = int(item.get("terminal_excluded_count") or 0)
+        reviewable_image_count = max(0, image_count - terminal)
+        effective_total = max(total, reviewable_image_count)
         effective_completed = min(completed, effective_total)
-        unreviewed_without_queue = max(0, image_count - total)
+        unreviewed_without_queue = max(0, reviewable_image_count - total)
         effective_pending = pending + skipped + unreviewed_without_queue
         percent = 100 if effective_total == 0 else round(effective_completed * 100 / effective_total)
         item["progress_total"] = effective_total
