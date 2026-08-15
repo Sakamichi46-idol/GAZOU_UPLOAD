@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 from contextlib import closing
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -16,6 +17,7 @@ import discord
 from ai_cost_control import get_ai_cost_status, simulate_pending_api_usage
 from embed_safety import safe_add_field
 from photo_database import get_connection
+from sakamichi_members import SAKAMICHI_MEMBERS
 
 
 def _now() -> str:
@@ -182,33 +184,483 @@ async def send_manual_preview(interaction: discord.Interaction, limit: int) -> N
     await interaction.followup.send(embed=e, view=ManualAnalyzeConfirmView(interaction.user.id, limit), ephemeral=True)
 
 
-class PersonSetModal(discord.ui.Modal):
+
+PERSON_SET_PAGE_SIZE = 25
+
+
+def save_person_set(set_name: str, names: list[str], created_by: int) -> dict[str, Any]:
+    """人物セットを保存する。セット名が同じ場合は内容を更新する。"""
+    init_advanced_admin_schema()
+
+    normalized_name = " ".join(str(set_name or "").split()).strip()
+    normalized_people: list[str] = []
+    seen: set[str] = set()
+
+    for raw_name in names:
+        name = " ".join(str(raw_name or "").split()).strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized_people.append(name)
+
+    if not normalized_name:
+        return {"ok": False, "reason": "セット名を入力してください。"}
+    if not normalized_people:
+        return {"ok": False, "reason": "人物を1人以上選択してください。"}
+
+    now = _now()
+    with closing(get_connection()) as con:
+        con.execute(
+            """INSERT INTO photo_person_sets(
+                   set_name,people_json,created_by,created_at,updated_at
+               ) VALUES(?,?,?,?,?)
+               ON CONFLICT(set_name) DO UPDATE SET
+                   people_json=excluded.people_json,
+                   created_by=excluded.created_by,
+                   updated_at=excluded.updated_at""",
+            (
+                normalized_name,
+                json.dumps(normalized_people, ensure_ascii=False),
+                int(created_by),
+                now,
+                now,
+            ),
+        )
+        con.commit()
+
+    return {
+        "ok": True,
+        "set_name": normalized_name,
+        "people": normalized_people,
+    }
+
+
+class PersonSetManualModal(discord.ui.Modal):
+    """従来どおり、人物名を直接入力して人物セットを保存する。"""
+
     def __init__(self) -> None:
-        super().__init__(title="人物セットを保存", timeout=300)
-        self.set_name = discord.ui.TextInput(label="セット名", placeholder="例：金村美玖＋小坂菜緒", max_length=80)
-        self.people = discord.ui.TextInput(label="人物名（読点・カンマ区切り）", placeholder="金村美玖、小坂菜緒", style=discord.TextStyle.paragraph, max_length=1000)
-        self.add_item(self.set_name); self.add_item(self.people)
+        super().__init__(title="人物セットを直接入力", timeout=300)
+        self.set_name = discord.ui.TextInput(
+            label="セット名",
+            placeholder="例：日向坂46 4期生お気に入り",
+            max_length=80,
+        )
+        self.people = discord.ui.TextInput(
+            label="人物名（読点・カンマ区切り）",
+            placeholder="例：正源司陽子、藤嶌果歩、山下葉留花",
+            style=discord.TextStyle.paragraph,
+            max_length=1000,
+        )
+        self.add_item(self.set_name)
+        self.add_item(self.people)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        import re
-        names = []
+        names: list[str] = []
         for part in re.split(r"[,、，\n]+", str(self.people.value)):
             name = part.strip()
             if name and name not in names:
                 names.append(name)
-        if not names:
-            await interaction.response.send_message("人物名を1人以上入力してください。", ephemeral=True)
-            return
-        now = _now()
-        with closing(get_connection()) as con:
-            con.execute(
-                """INSERT INTO photo_person_sets(set_name,people_json,created_by,created_at,updated_at)
-                   VALUES(?,?,?,?,?) ON CONFLICT(set_name) DO UPDATE SET
-                   people_json=excluded.people_json,created_by=excluded.created_by,updated_at=excluded.updated_at""",
-                (str(self.set_name.value).strip(), json.dumps(names, ensure_ascii=False), interaction.user.id, now, now),
+
+        result = await asyncio.to_thread(
+            save_person_set,
+            str(self.set_name.value),
+            names,
+            interaction.user.id,
+        )
+        if not result.get("ok"):
+            await interaction.response.send_message(
+                str(result.get("reason") or "人物セットを保存できませんでした。"),
+                ephemeral=True,
             )
-            con.commit()
-        await interaction.response.send_message(f"✅ 人物セット **{self.set_name.value}** を保存しました。\n" + "、".join(names), ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"✅ 人物セット **{result['set_name']}** を保存しました。\n"
+            + "、".join(result["people"]),
+            ephemeral=True,
+        )
+
+
+@dataclass
+class PersonSetBuilderState:
+    owner_id: int
+    set_name: str
+    selected_names: list[str] = field(default_factory=list)
+    group_name: str = ""
+    generation_name: str = ""
+    member_page: int = 0
+    remove_page: int = 0
+
+    def add_names(self, names: list[str]) -> None:
+        for raw_name in names:
+            name = " ".join(str(raw_name or "").split()).strip()
+            if name and name not in self.selected_names:
+                self.selected_names.append(name)
+
+
+def person_set_builder_text(state: PersonSetBuilderState) -> str:
+    path = " → ".join(
+        value for value in (state.group_name, state.generation_name) if value
+    ) or "グループを選んでください。"
+
+    selected = "、".join(state.selected_names) if state.selected_names else "まだ選択されていません。"
+    if len(selected) > 1600:
+        selected = selected[:1597] + "..."
+
+    return (
+        "👥 **人物セット作成**\n"
+        f"セット名: **{discord.utils.escape_markdown(state.set_name)}**\n"
+        f"選択場所: **{discord.utils.escape_markdown(path)}**\n"
+        f"選択中: **{len(state.selected_names)}人**\n"
+        f"{selected}\n\n"
+        "グループ → 期生 → メンバーの順に選択してください。"
+        "複数の期生・グループから追加できます。"
+    )
+
+
+class PersonSetBuilderOwnedView(discord.ui.View):
+    def __init__(self, state: PersonSetBuilderState, *, timeout: float | None = 900):
+        super().__init__(timeout=timeout)
+        self.state = state
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.state.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この人物セット作成画面は、開いた管理者だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+
+class PersonSetNameModal(discord.ui.Modal):
+    def __init__(self) -> None:
+        super().__init__(title="人物セット名を入力", timeout=300)
+        self.set_name = discord.ui.TextInput(
+            label="セット名",
+            placeholder="例：日向坂46 4期生 / よく写るメンバー",
+            max_length=80,
+        )
+        self.add_item(self.set_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        set_name = " ".join(str(self.set_name.value or "").split()).strip()
+        if not set_name:
+            await interaction.response.send_message(
+                "セット名を入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        state = PersonSetBuilderState(
+            owner_id=interaction.user.id,
+            set_name=set_name,
+        )
+        await interaction.response.send_message(
+            person_set_builder_text(state),
+            view=PersonSetGroupView(state),
+            ephemeral=True,
+        )
+
+
+class PersonSetCreateModeView(discord.ui.View):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(timeout=300)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この画面は開いた管理者だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(label="メンバーから選択", emoji="👥", style=discord.ButtonStyle.primary)
+    async def select_members(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonSetNameModal())
+
+    @discord.ui.button(label="名前を直接入力", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def manual(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonSetManualModal())
+
+
+class PersonSetGroupSelect(discord.ui.Select):
+    def __init__(self, state: PersonSetBuilderState):
+        super().__init__(
+            placeholder="グループを選択",
+            options=[discord.SelectOption(label=name, value=name) for name in SAKAMICHI_MEMBERS],
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.state.group_name = self.values[0]
+        self.state.generation_name = ""
+        self.state.member_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetGenerationView(self.state),
+        )
+
+
+class PersonSetGroupView(PersonSetBuilderOwnedView):
+    def __init__(self, state: PersonSetBuilderState):
+        super().__init__(state)
+        self.add_item(PersonSetGroupSelect(state))
+
+    @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=1)
+    async def selected(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+    @discord.ui.button(label="キャンセル", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="人物セットの作成をキャンセルしました。",
+            view=None,
+        )
+
+
+class PersonSetGenerationSelect(discord.ui.Select):
+    def __init__(self, state: PersonSetBuilderState):
+        generations = SAKAMICHI_MEMBERS.get(state.group_name, {})
+        super().__init__(
+            placeholder="期生・区分を選択",
+            options=[discord.SelectOption(label=name, value=name) for name in generations],
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.state.generation_name = self.values[0]
+        self.state.member_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetMemberView(self.state),
+        )
+
+
+class PersonSetGenerationView(PersonSetBuilderOwnedView):
+    def __init__(self, state: PersonSetBuilderState):
+        super().__init__(state)
+        self.add_item(PersonSetGenerationSelect(state))
+
+    @discord.ui.button(label="グループへ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.group_name = ""
+        self.state.generation_name = ""
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetGroupView(self.state),
+        )
+
+    @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=1)
+    async def selected(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+
+class PersonSetMemberSelect(discord.ui.Select):
+    def __init__(self, state: PersonSetBuilderState):
+        all_names = list(
+            SAKAMICHI_MEMBERS.get(state.group_name, {}).get(state.generation_name, [])
+        )
+        page_count = max(1, (len(all_names) + PERSON_SET_PAGE_SIZE - 1) // PERSON_SET_PAGE_SIZE)
+        state.member_page = max(0, min(state.member_page, page_count - 1))
+        start = state.member_page * PERSON_SET_PAGE_SIZE
+        names = all_names[start:start + PERSON_SET_PAGE_SIZE]
+
+        options = [
+            discord.SelectOption(label=name, value=name, default=name in state.selected_names)
+            for name in names
+        ]
+        super().__init__(
+            placeholder=f"メンバーを選択（{state.member_page + 1}/{page_count}ページ）",
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.state.add_names(list(self.values))
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetMemberView(self.state),
+        )
+
+
+class PersonSetMemberView(PersonSetBuilderOwnedView):
+    def __init__(self, state: PersonSetBuilderState):
+        super().__init__(state)
+        all_names = list(
+            SAKAMICHI_MEMBERS.get(state.group_name, {}).get(state.generation_name, [])
+        )
+        page_count = max(1, (len(all_names) + PERSON_SET_PAGE_SIZE - 1) // PERSON_SET_PAGE_SIZE)
+        state.member_page = max(0, min(state.member_page, page_count - 1))
+
+        self.add_item(PersonSetMemberSelect(state))
+        self.previous_page.disabled = state.member_page <= 0
+        self.next_page.disabled = state.member_page >= page_count - 1
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page = max(0, self.state.member_page - 1)
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetMemberView(self.state),
+        )
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.member_page += 1
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetMemberView(self.state),
+        )
+
+    @discord.ui.button(label="別の期生から追加", emoji="➕", style=discord.ButtonStyle.secondary, row=2)
+    async def another_generation(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.generation_name = ""
+        self.state.member_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetGenerationView(self.state),
+        )
+
+    @discord.ui.button(label="別グループから追加", emoji="🌳", style=discord.ButtonStyle.secondary, row=2)
+    async def another_group(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.group_name = ""
+        self.state.generation_name = ""
+        self.state.member_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetGroupView(self.state),
+        )
+
+    @discord.ui.button(label="選択中を確認", emoji="📋", style=discord.ButtonStyle.primary, row=2)
+    async def selected(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+
+class PersonSetRemoveSelect(discord.ui.Select):
+    def __init__(self, state: PersonSetBuilderState):
+        page_count = max(
+            1,
+            (len(state.selected_names) + PERSON_SET_PAGE_SIZE - 1) // PERSON_SET_PAGE_SIZE,
+        )
+        state.remove_page = max(0, min(state.remove_page, page_count - 1))
+        start = state.remove_page * PERSON_SET_PAGE_SIZE
+        names = state.selected_names[start:start + PERSON_SET_PAGE_SIZE]
+        super().__init__(
+            placeholder=f"セットから外す人物を選択（{state.remove_page + 1}/{page_count}ページ）",
+            min_values=1,
+            max_values=max(1, len(names)),
+            options=[discord.SelectOption(label=name, value=name) for name in names],
+        )
+        self.state = state
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        remove_names = set(self.values)
+        self.state.selected_names = [
+            name for name in self.state.selected_names if name not in remove_names
+        ]
+        self.state.remove_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+
+class PersonSetSelectedView(PersonSetBuilderOwnedView):
+    def __init__(self, state: PersonSetBuilderState):
+        super().__init__(state)
+
+        if state.selected_names:
+            self.add_item(PersonSetRemoveSelect(state))
+
+        page_count = max(
+            1,
+            (len(state.selected_names) + PERSON_SET_PAGE_SIZE - 1) // PERSON_SET_PAGE_SIZE,
+        )
+        state.remove_page = max(0, min(state.remove_page, page_count - 1))
+
+        self.previous_page.disabled = not state.selected_names or state.remove_page <= 0
+        self.next_page.disabled = not state.selected_names or state.remove_page >= page_count - 1
+        self.save.disabled = not bool(state.selected_names)
+        self.clear.disabled = not bool(state.selected_names)
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page = max(0, self.state.remove_page - 1)
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.remove_page += 1
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
+    @discord.ui.button(label="人物を追加", emoji="➕", style=discord.ButtonStyle.primary, row=1)
+    async def add_more(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.group_name = ""
+        self.state.generation_name = ""
+        self.state.member_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetGroupView(self.state),
+        )
+
+    @discord.ui.button(label="この人物セットを保存", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def save(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+
+        result = await asyncio.to_thread(
+            save_person_set,
+            self.state.set_name,
+            list(self.state.selected_names),
+            interaction.user.id,
+        )
+        if not result.get("ok"):
+            await interaction.edit_original_response(
+                content=str(result.get("reason") or "人物セットを保存できませんでした。"),
+                view=PersonSetSelectedView(self.state),
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ 人物セット **{result['set_name']}** を保存しました。\n"
+                f"登録人数: **{len(result['people'])}人**\n"
+                + "、".join(result["people"])
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="すべて解除", emoji="🧹", style=discord.ButtonStyle.danger, row=2)
+    async def clear(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.selected_names.clear()
+        self.state.remove_page = 0
+        await interaction.response.edit_message(
+            content=person_set_builder_text(self.state),
+            view=PersonSetSelectedView(self.state),
+        )
+
 
 
 def person_sets_embed() -> discord.Embed:
@@ -253,7 +705,11 @@ class AICenterView(discord.ui.View):
 
     @discord.ui.button(label="人物セット保存", emoji="👥", style=discord.ButtonStyle.secondary)
     async def save_set(self, interaction, _):
-        await interaction.response.send_modal(PersonSetModal())
+        await interaction.response.send_message(
+            "人物セットの作り方を選んでください。",
+            view=PersonSetCreateModeView(interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="人物セット一覧", emoji="📚", style=discord.ButtonStyle.secondary)
     async def sets(self, interaction, _):
