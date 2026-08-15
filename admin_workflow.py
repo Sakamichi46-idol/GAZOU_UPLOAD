@@ -30,7 +30,7 @@ from photo_database import (
     set_confirmed_image_people,
 )
 from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
-from sakamichi_members import SAKAMICHI_MEMBERS
+from sakamichi_members import SAKAMICHI_MEMBERS, member_surname_kana_sort_key
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
 PROGRESS_SEGMENTS = 10
@@ -486,11 +486,11 @@ def _sort_authors(authors: list[dict[str, Any]], sort_mode: str) -> list[dict[st
     """投稿者一覧を管理画面で選択された基準に従って安定ソートする。"""
     rows = list(authors)
     if sort_mode == "name_asc":
-        return sorted(rows, key=lambda a: str(a.get("member_name") or ""))
+        return sorted(rows, key=lambda a: member_surname_kana_sort_key(str(a.get("member_name") or "")))
     if sort_mode == "blogs_desc":
         return sorted(
             rows,
-            key=lambda a: (-int(a.get("blog_count") or 0), str(a.get("member_name") or "")),
+            key=lambda a: (-int(a.get("blog_count") or 0), member_surname_kana_sort_key(str(a.get("member_name") or ""))),
         )
     if sort_mode == "pending_desc":
         return sorted(
@@ -498,7 +498,7 @@ def _sort_authors(authors: list[dict[str, Any]], sort_mode: str) -> list[dict[st
             key=lambda a: (
                 -max(0, int(a.get("pending_blog_count") or (int(a.get("blog_count") or 0) - int(a.get("completed_blog_count") or 0)))),
                 -int(a.get("blog_count") or 0),
-                str(a.get("member_name") or ""),
+                member_surname_kana_sort_key(str(a.get("member_name") or "")),
             ),
         )
     # 既定: 完了率が高い順。同率なら完了件数、ブログ件数、メンバー名の順。
@@ -508,14 +508,14 @@ def _sort_authors(authors: list[dict[str, Any]], sort_mode: str) -> list[dict[st
             -_author_completion_percent(a),
             -int(a.get("completed_blog_count") or 0),
             -int(a.get("blog_count") or 0),
-            str(a.get("member_name") or ""),
+            member_surname_kana_sort_key(str(a.get("member_name") or "")),
         ),
     )
 
 
 AUTHOR_SORT_LABELS = {
     "completion_desc": "完了%が高い順",
-    "name_asc": "メンバー名順",
+    "name_asc": "メンバー名順（五十音）",
     "blogs_desc": "ブログ件数が多い順",
     "pending_desc": "未完了件数が多い順",
 }
