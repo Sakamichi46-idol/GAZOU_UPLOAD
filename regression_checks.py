@@ -287,6 +287,27 @@ def run()->dict:
         '人物セット部分修正の確定を履歴noteに残す',
     ))
 
+    members_text=(ROOT/'sakamichi_members.py').read_text(encoding='utf-8') if (ROOT/'sakamichi_members.py').exists() else ''
+    admin_text=(ROOT/'admin_workflow.py').read_text(encoding='utf-8') if (ROOT/'admin_workflow.py').exists() else ''
+    checks.append((
+        'author_name_sort_uses_surname_kana',
+        'def member_surname_kana_sort_key' in members_text
+        and 'member_surname_kana_sort_key' in admin_text
+        and 'メンバー名順（五十音）' in admin_text,
+        '投稿者のメンバー名順は名字の読み仮名による五十音順',
+    ))
+    checks.append((
+        'author_name_sort_handles_uemura_kamimura',
+        "'上村莉菜': 'うえむら'" in members_text
+        and "'上村ひなの': 'かみむら'" in members_text,
+        '同じ漢字で読みが違う名字はフルネーム例外で扱う',
+    ))
+    checks.append((
+        'author_name_sort_has_safe_fallback',
+        'return (text, text)' in members_text,
+        '読み未登録の新メンバーでもソート処理を継続できる',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
