@@ -523,22 +523,24 @@ class PhotoSearchDetailView(discord.ui.View):
 
     @discord.ui.button(label="あとで見る", emoji="🔖", style=discord.ButtonStyle.secondary, row=2)
     async def watch_later_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         image_id = int(self.results[self.index].get("id") or 0)
         added = await asyncio.to_thread(add_watch_later, interaction.user.id, image_id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🔖 あとで見るへ追加しました。" if added else "ℹ️ すでにあとで見るへ追加済みです。",
             ephemeral=True,
         )
 
     @discord.ui.button(label="関連写真", emoji="🔗", style=discord.ButtonStyle.secondary, row=2)
     async def related_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         image_id = int(self.results[self.index].get("id") or 0)
         rows = await asyncio.to_thread(related_rows, image_id, 9)
         if not rows:
-            await interaction.response.send_message("関連写真が見つかりませんでした。", ephemeral=True)
+            await interaction.followup.send("関連写真が見つかりませんでした。", ephemeral=True)
             return
         view = SimplePhotoListView(interaction.user.id, rows, title="🔗 関連写真")
-        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+        await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
 
     @discord.ui.button(label="写真情報をコピー", emoji="📋", style=discord.ButtonStyle.secondary, row=3)
     async def copy_info_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
