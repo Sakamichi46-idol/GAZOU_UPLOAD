@@ -619,10 +619,11 @@ class FaceReviewView(discord.ui.View):
 
     @discord.ui.button(label="投稿者で確定", emoji="📝", style=discord.ButtonStyle.primary, row=1)
     async def author_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         member_name = _text(self.review.get("member_name"))
         person = await asyncio.to_thread(get_person_by_name, member_name)
         if not person:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ 投稿者 **{discord.utils.escape_markdown(member_name)}** が人物マスターに見つかりません。",
                 ephemeral=True,
             )
@@ -644,6 +645,7 @@ class FaceReviewView(discord.ui.View):
 
     @discord.ui.button(label="今回は保留", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
     async def skip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(
             skip_face_review,
             int(self.review["face_id"]),
@@ -655,7 +657,7 @@ class FaceReviewView(discord.ui.View):
         embed = discord.Embed(title="⏭️ 顔レビューを保留しました", color=discord.Color.orange())
         safe_add_field(embed, name="顔ID", value=str(self.review.get("face_id", "不明")), inline=True)
         safe_add_field(embed, name="画像ID", value=str(self.review.get("image_id", "不明")), inline=True)
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.edit_original_response(embed=embed, view=None)
 
     async def on_timeout(self) -> None:
         for item in self.children:
