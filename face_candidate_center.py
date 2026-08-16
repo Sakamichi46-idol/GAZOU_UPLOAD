@@ -403,19 +403,20 @@ class CandidateCenterView(discord.ui.View):
 
     @discord.ui.button(label="選択した1件を開く", emoji="🖼️", style=discord.ButtonStyle.primary, row=3)
     async def open_one(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         face_id = next(iter(self.state.selected_face_ids))
         review = await asyncio.to_thread(get_face_review_by_id, face_id)
         if not review:
-            await interaction.response.send_message("対象の顔レビューが見つかりません。", ephemeral=True)
+            await interaction.followup.send("対象の顔レビューが見つかりません。", ephemeral=True)
             return
         try:
             data, _ = await asyncio.to_thread(get_face_crop_bytes, face_id)
         except Exception as error:
-            await interaction.response.send_message(f"顔画像を作成できませんでした: `{type(error).__name__}: {error}`", ephemeral=True)
+            await interaction.followup.send(f"顔画像を作成できませんでした: `{type(error).__name__}: {error}`", ephemeral=True)
             return
         candidates = await asyncio.to_thread(get_face_candidates, face_id)
         view = FaceReviewView(review, candidates[:5], owner_id=interaction.user.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=build_face_review_embed(review, candidates[:5]),
             file=discord.File(io.BytesIO(data), filename="face_review.jpg"),
             view=view,
@@ -428,6 +429,7 @@ class CandidateCenterView(discord.ui.View):
 
     @discord.ui.button(label="選択を一括採用", emoji="✅", style=discord.ButtonStyle.success, row=3)
     async def bulk(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         selected = set(self.state.selected_face_ids)
         items: list[dict[str, Any]] = []
         # ページをまたいだ選択にも対応するため、顔IDごとに1位候補を再取得する。
@@ -447,7 +449,7 @@ class CandidateCenterView(discord.ui.View):
                 if row:
                     items.append(dict(row))
         if not items:
-            await interaction.response.send_message("一括採用できる確認待ち候補がありません。", ephemeral=True)
+            await interaction.followup.send("一括採用できる確認待ち候補がありません。", ephemeral=True)
             return
         names: dict[str, int] = {}
         for item in items:
@@ -457,7 +459,7 @@ class CandidateCenterView(discord.ui.View):
         safe_add_field(e, name="対象", value=f"{len(items)}件", inline=True)
         safe_add_field(e, name="候補別", value=detail or "なし", inline=False)
         safe_add_field(e, name="注意", value="画像を見ずに確定すると誤学習につながります。表示条件と候補を確認してください。", inline=False)
-        await interaction.response.send_message(embed=e, view=BulkConfirmView(interaction.user.id, items), ephemeral=True)
+        await interaction.followup.send(embed=e, view=BulkConfirmView(interaction.user.id, items), ephemeral=True)
 
     @discord.ui.button(label="使い方", emoji="❓", style=discord.ButtonStyle.secondary, row=3)
     async def help(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
