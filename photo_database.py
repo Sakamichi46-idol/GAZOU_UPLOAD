@@ -5251,10 +5251,13 @@ def get_blogs_for_admin_filtered(
         filters.append("substr(pb.published_at, 1, 4) = ?")
         params.append(f"{int(year):04d}")
     if month:
-        # 2026.7 / 2026/07 / 2026-07 のいずれにも対応する。
+        # 保存済みブログには複数の日付形式が混在するため、
+        # 2026.7 / 2026/07 / 2026-07 / 2026年7月 / 2026年07月
+        # のすべてを月フィルター対象にする。
         month_value = int(month)
         filters.append(
-            "(" 
+            "("
+            "pb.published_at LIKE ? OR pb.published_at LIKE ? OR "
             "pb.published_at LIKE ? OR pb.published_at LIKE ? OR "
             "pb.published_at LIKE ? OR pb.published_at LIKE ? OR "
             "pb.published_at LIKE ? OR pb.published_at LIKE ?"
@@ -5264,6 +5267,7 @@ def get_blogs_for_admin_filtered(
             f"____.{month_value}.%", f"____.{month_value:02d}.%",
             f"____/{month_value}/%", f"____/{month_value:02d}/%",
             f"____-{month_value}-%", f"____-{month_value:02d}-%",
+            f"____年{month_value}月%", f"____年{month_value:02d}月%",
         ])
     clean_query = str(title_query or "").strip()
     if clean_query:
