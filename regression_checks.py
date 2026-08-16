@@ -337,6 +337,44 @@ def run()->dict:
         'ブログ月フィルターは2019年3月/2019年03月形式にも対応する',
     ))
 
+    # Discord interaction timeout guard: audited UI callbacks that perform potentially
+    # slow thread/DB work must acknowledge the interaction before that work begins.
+    interaction_guard_files = [
+        'admin_quality.py','admin_insights.py','admin_workflow.py','admin_operations.py',
+        'ai_center.py','photo_review_view.py','tag_master_admin.py','user_experience.py',
+        'face_candidate_center.py','photo_search.py','past_face_learning.py','photo_face_review_view.py',
+    ]
+    interaction_guard_violations=[]
+    for guard_name in interaction_guard_files:
+        guard_path=ROOT/guard_name
+        if not guard_path.exists():
+            continue
+        guard_text=guard_path.read_text(encoding='utf-8')
+        try:
+            guard_tree=ast.parse(guard_text)
+        except Exception:
+            continue
+        for node in ast.walk(guard_tree):
+            if not isinstance(node,ast.AsyncFunctionDef):
+                continue
+            is_ui=(node.name=='callback' or any(isinstance(d,ast.Call) and 'discord.ui.button' in ast.unparse(d.func) for d in node.decorator_list))
+            if not is_ui:
+                continue
+            src=ast.get_source_segment(guard_text,node) or ''
+            heavy_positions=[p for token in ('asyncio.to_thread','_to_thread(') if (p:=src.find(token))>=0]
+            if not heavy_positions:
+                continue
+            first_heavy=min(heavy_positions)
+            ack_positions=[p for token in ('.defer(','.send_message(','.edit_message(','.send_modal(') if (p:=src.find(token))>=0]
+            first_ack=min(ack_positions) if ack_positions else 10**9
+            if first_heavy < first_ack:
+                interaction_guard_violations.append(f'{guard_name}:{node.name}')
+    checks.append((
+        'discord_heavy_callbacks_ack_before_work',
+        not interaction_guard_violations,
+        '重いDiscord UIコールバックは処理前にACKする: '+(', '.join(interaction_guard_violations[:10]) if interaction_guard_violations else 'OK'),
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
