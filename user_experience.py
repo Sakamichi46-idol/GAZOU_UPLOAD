@@ -718,6 +718,7 @@ class BeginnerGuideView(discord.ui.View):
 
     @discord.ui.button(label="トップメニューを使う", emoji="✅", style=discord.ButtonStyle.success)
     async def disable_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(set_beginner_guide, self.owner_id, False)
         from control_panel import UserPanelView
         embed = discord.Embed(
@@ -725,7 +726,7 @@ class BeginnerGuideView(discord.ui.View):
             description="目的に合うカテゴリーを選んでください。",
             color=0x3498DB,
         )
-        await interaction.response.edit_message(embed=embed, view=UserPanelView(), content=None)
+        await interaction.edit_original_response(embed=embed, view=UserPanelView(), content=None)
 
 
 def beginner_guide_embed() -> discord.Embed:
@@ -962,6 +963,7 @@ class ExploreView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows = await asyncio.to_thread(
             random_rows,
             9,
@@ -984,6 +986,7 @@ class ExploreView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         row = await asyncio.to_thread(today_row)
 
         await self._show(
@@ -1002,6 +1005,7 @@ class ExploreView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows = await asyncio.to_thread(
             recent_rows,
             self.owner_id,
@@ -1024,6 +1028,7 @@ class ExploreView(discord.ui.View):
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows = await asyncio.to_thread(
             watch_later_rows,
             self.owner_id,
@@ -1031,7 +1036,7 @@ class ExploreView(discord.ui.View):
         )
 
         if not rows:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "🔖 あとで見る写真はありません。",
                 ephemeral=True,
             )
@@ -1044,7 +1049,7 @@ class ExploreView(discord.ui.View):
             watch_later=True,
         )
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=view.embed(),
             view=view,
             ephemeral=True,
