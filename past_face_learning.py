@@ -338,6 +338,7 @@ class PastFaceLearningView(discord.ui.View):
 
     @discord.ui.button(label="反映履歴", emoji="📜", style=discord.ButtonStyle.secondary)
     async def history(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         stats = await __import__("asyncio").to_thread(learning_stats)
         lines = []
         for row in stats["runs"]:
@@ -345,7 +346,7 @@ class PastFaceLearningView(discord.ui.View):
                 f"**#{row['id']}** {row['created_at']}\n反映 {int(row['registered_count']):,} / 対象 {int(row['scanned_count']):,} / 除外 {int(row['duplicate_count']) + int(row['no_embedding_count']) + int(row['invalid_person_count']) + int(row['low_quality_count']):,}"
             )
         e = discord.Embed(title="📜 過去顔データ反映履歴", description="\n\n".join(lines) or "履歴はありません。", color=0x5865F2)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
 
 def past_learning_home_embed() -> discord.Embed:
