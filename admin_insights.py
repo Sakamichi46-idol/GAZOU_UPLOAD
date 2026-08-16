@@ -303,8 +303,9 @@ class PrioritySelect(discord.ui.Select):
         super().__init__(placeholder="AI解析の優先順位", options=options, row=4)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(set_priority_mode, self.values[0], interaction.user.id)
-        await interaction.response.send_message("✅ AI解析の優先順位を更新しました。自動解析/手動解析の次回取得から反映されます。", ephemeral=True)
+        await interaction.followup.send("✅ AI解析の優先順位を更新しました。自動解析/手動解析の次回取得から反映されます。", ephemeral=True)
 
 
 class AdminInsightsView(discord.ui.View):
@@ -321,25 +322,28 @@ class AdminInsightsView(discord.ui.View):
 
     @discord.ui.button(label="AI概要", emoji="🤖", style=discord.ButtonStyle.primary, row=0)
     async def overview(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(ai_overview)
         e=discord.Embed(title="🤖 AIダッシュボード", color=0x5865F2)
         e.description=(f"📷 登録画像 **{d['images']:,}枚**\n🤖 AI解析済み **{d['analyzed']:,}枚**\n"
                        f"⏳ AI未解析 **{d['pending']:,}枚**\n⚠️ AI失敗 **{d['failed']:,}枚**\n"
                        f"🏷️ AIタグ **{d['tags']:,}個**（{d['tagged_images']:,}枚に付与 / 平均{d['avg_tags']:.2f}個）\n"
                        f"👤 顔スキャン済み **{d['faces_scanned']:,}枚**\n✅ 人物確認完了 **{d['reviewed']:,}枚**")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="解析キュー", emoji="⏳", style=discord.ButtonStyle.primary, row=0)
     async def queue(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(queue_stats)
         e=discord.Embed(title="⏳ AI解析キュー", color=0x3498DB)
         e.description=(f"待機 **{d['pending']:,}**\n成功 **{d['completed']:,}**\n確認待ち **{d['review']:,}**\n"
                        f"失敗 **{d['failed']:,}**\nその他 **{d['other']:,}**\n\n現在の優先順位: **{get_priority_mode()}**")
         e.set_footer(text="失敗画像は下の『失敗100件を再試行』からpendingへ戻せます。")
-        await interaction.response.send_message(embed=e, view=QueueActionView(self.owner_id), ephemeral=True)
+        await interaction.followup.send(embed=e, view=QueueActionView(self.owner_id), ephemeral=True)
 
     @discord.ui.button(label="AI使用量", emoji="💰", style=discord.ButtonStyle.secondary, row=0)
     async def usage(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(usage_report)
         e=discord.Embed(title="💰 AI使用量レポート", color=0xF1C40F)
         lines=[f"今日 API **{d['today']:,}回**"]
@@ -347,10 +351,11 @@ class AdminInsightsView(discord.ui.View):
             x=d[key]; lines.append(f"{label}: API {x['api']:,} / 再利用 {x['reuse']:,} / {x['tokens']:,} tokens / 推定 ${x['cost']:.6f}")
         e.description="\n".join(lines)
         e.set_footer(text="金額は保存済みusageと設定単価からの推定です。")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="タグ品質", emoji="🏷️", style=discord.ButtonStyle.secondary, row=1)
     async def tags(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(tag_quality_report)
         e=discord.Embed(title="🏷️ タグ品質レポート", color=0xF1C40F)
         if not d.get('available'):
@@ -360,10 +365,11 @@ class AdminInsightsView(discord.ui.View):
                            f"検索対象 **{d['searchable']:,}** / 別表記 **{d['aliases']:,}** / 信頼度0.6未満の割当 **{d['low']:,}**")
             safe_add_field(e, name="使用回数上位", value="\n".join(f"・{n}: {c:,}" for n,c in d['top']) or "なし",inline=False)
             safe_add_field(e, name="カテゴリー別", value="\n".join(f"・{n}: {c:,}（平均{a*100:.1f}%）" for n,c,a in d['categories']) or "なし",inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="顔認識精度", emoji="👤", style=discord.ButtonStyle.secondary, row=1)
     async def faces(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(face_accuracy_report)
         e=discord.Embed(title="👤 顔認識精度レポート", color=0xEB459E)
         if not d.get('available'):
@@ -372,20 +378,22 @@ class AdminInsightsView(discord.ui.View):
             e.description=f"評価 **{d['total']:,}件** / 採用 **{d['accepted']:,}件** / 修正 **{d['corrected']:,}件** / 実測採用率 **{d['rate']:.1f}%**"
             safe_add_field(e, name="誤判定しやすい組み合わせ", value="\n".join(f"・{a} → {b}: {c}回" for a,b,c in d['confusions']) or "なし",inline=False)
             safe_add_field(e, name="人物別評価", value="\n".join(f"・{n}: 採用{a}/修正{c}/計{t}" for n,a,c,t in d['people']) or "なし",inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="DB健康診断", emoji="🩺", style=discord.ButtonStyle.success, row=1)
     async def dbhealth(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(db_health_report)
         ok=d['integrity']=='ok' and d['foreign_key_errors']==0 and d['orphan_reviews']==0
         e=discord.Embed(title="🩺 DB健康診断", color=0x57F287 if ok else 0xED4245)
         e.description=(f"integrity_check: **{d['integrity']}**\n外部キー異常 **{d['foreign_key_errors']}**\n"
                        f"孤立レビュー **{d['orphan_reviews']}**\n確認キュー未作成候補 **{d['missing_queue']}**\n"
                        f"重複URLグループ **{d['duplicate_urls']}**\nインデックス **{d['indexes']}**")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="システム全体", emoji="📊", style=discord.ButtonStyle.success, row=2)
     async def system(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         d=await asyncio.to_thread(system_report)
         e=discord.Embed(title="📊 システム全体ダッシュボード", color=0x57F287)
         e.description=(f"DB **{_fmt_bytes(d['db_size'])}** / テーブル **{d['tables']}**\n"
@@ -393,10 +401,11 @@ class AdminInsightsView(discord.ui.View):
                        f"検出顔 **{d['faces']:,}** / 特徴量あり **{d['embeddings']:,}**\n"
                        f"AI優先順位 **{get_priority_mode()}**")
         e.set_footer(text="RailwayのCPU/RAM実測値はこのBotから直接取得できないため、DB内部指標を表示しています。")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="モデル比較", emoji="🧪", style=discord.ButtonStyle.secondary, row=2)
     async def models(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows=await asyncio.to_thread(model_comparison)
         e=discord.Embed(title="🧪 AIモデル比較（保存済み実績）", color=0x9B59B6)
         e.description="\n".join(
@@ -404,11 +413,13 @@ class AdminInsightsView(discord.ui.View):
             for r in rows[:15]
         ) or "モデル別データはまだありません。"
         e.set_footer(text="新しいAPI呼び出しは行わず、DBに保存済みの実績だけを比較しています。")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+        await interaction.followup.send(embed=e, ephemeral=True)
 
     @discord.ui.button(label="更新", emoji="🔄", style=discord.ButtonStyle.secondary, row=2)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.edit_message(embed=home_embed(), view=AdminInsightsView(self.owner_id))
+        await interaction.response.defer(ephemeral=True)
+        embed = await asyncio.to_thread(home_embed)
+        await interaction.edit_original_response(embed=embed, view=AdminInsightsView(self.owner_id))
 
 
 class QueueActionView(discord.ui.View):
@@ -419,8 +430,9 @@ class QueueActionView(discord.ui.View):
         await interaction.response.send_message("この画面は開いた管理者だけが操作できます。",ephemeral=True);return False
     @discord.ui.button(label="失敗100件を再試行",emoji="🔁",style=discord.ButtonStyle.danger)
     async def retry(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
+        await interaction.response.defer(ephemeral=True)
         count=await asyncio.to_thread(retry_failed_images,100)
-        await interaction.response.send_message(f"✅ {count}件を再試行待ちへ戻しました。APIはまだ呼び出していません。",ephemeral=True)
+        await interaction.followup.send(f"✅ {count}件を再試行待ちへ戻しました。APIはまだ呼び出していません。",ephemeral=True)
 
 
 def home_embed() -> discord.Embed:
@@ -436,8 +448,8 @@ def home_embed() -> discord.Embed:
 
 
 async def send_admin_insights(interaction: discord.Interaction) -> None:
-    init_insights_schema()
-    if interaction.response.is_done():
-        await interaction.followup.send(embed=home_embed(), view=AdminInsightsView(interaction.user.id), ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=home_embed(), view=AdminInsightsView(interaction.user.id), ephemeral=True)
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    await asyncio.to_thread(init_insights_schema)
+    embed = await asyncio.to_thread(home_embed)
+    await interaction.followup.send(embed=embed, view=AdminInsightsView(interaction.user.id), ephemeral=True)
