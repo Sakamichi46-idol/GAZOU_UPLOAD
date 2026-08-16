@@ -516,6 +516,7 @@ class ConfirmHiddenDeleteView(discord.ui.View):
 
     @discord.ui.button(label="完全削除する", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         deleted = await asyncio.to_thread(delete_hidden_photo_blog, self.blog_id)
         if deleted:
             await asyncio.to_thread(
@@ -526,9 +527,9 @@ class ConfirmHiddenDeleteView(discord.ui.View):
                 target_id=self.blog_id,
                 detail="除外済み記事を完全削除",
             )
-            await interaction.response.edit_message(content=f"✅ ブログID **{self.blog_id}** を完全削除しました。", embed=None, view=None)
+            await interaction.edit_original_response(content=f"✅ ブログID **{self.blog_id}** を完全削除しました。", embed=None, view=None)
         else:
-            await interaction.response.edit_message(content="対象が見つからないか、除外状態ではありません。", embed=None, view=None)
+            await interaction.edit_original_response(content="対象が見つからないか、除外状態ではありません。", embed=None, view=None)
         self.stop()
 
     @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
@@ -561,12 +562,13 @@ class HiddenBlogDetailView(discord.ui.View):
 
     @discord.ui.button(label="復元", emoji="👁️", style=discord.ButtonStyle.success)
     async def restore(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         restored = await asyncio.to_thread(restore_hidden_photo_blog, self.blog_id)
         if restored:
             await asyncio.to_thread(write_audit, interaction.user.id, "hidden_blog_restore", target_type="blog", target_id=self.blog_id, detail="除外一覧から復元")
-            await interaction.response.edit_message(content=f"✅ ブログID **{self.blog_id}** を人物確認対象へ戻しました。", embed=None, view=None)
+            await interaction.edit_original_response(content=f"✅ ブログID **{self.blog_id}** を人物確認対象へ戻しました。", embed=None, view=None)
         else:
-            await interaction.response.send_message("復元対象が見つかりませんでした。", ephemeral=True)
+            await interaction.followup.send("復元対象が見つかりませんでした。", ephemeral=True)
 
     @discord.ui.button(label="再解析待ちへ", emoji="🔄", style=discord.ButtonStyle.primary)
     async def reanalyze(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -580,9 +582,10 @@ class HiddenBlogDetailView(discord.ui.View):
 
     @discord.ui.button(label="完全削除", emoji="🗑️", style=discord.ButtonStyle.danger)
     async def delete(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         blog = await asyncio.to_thread(get_hidden_photo_blog, self.blog_id)
         count = int((blog or {}).get("image_count") or 0)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ ブログID **{self.blog_id}** と関連画像 **{count}件**を完全削除します。\nこの操作は元に戻せません。",
             view=ConfirmHiddenDeleteView(self.owner_id, self.blog_id),
             ephemeral=True,
@@ -823,11 +826,12 @@ class AISavingsView(discord.ui.View):
 
     @discord.ui.button(label="自動APIを切替", emoji="🔁", style=discord.ButtonStyle.secondary)
     async def toggle_auto(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
         current = await asyncio.to_thread(get_ai_cost_status)
         new_value = 0 if int(current.get('auto_api_enabled', 0)) else 1
         await asyncio.to_thread(update_ai_cost_settings, auto_api_enabled=new_value)
         write_audit(interaction.user.id, "ai_auto_api_toggle", target_type="settings", detail=f"enabled={new_value}")
-        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+        await interaction.edit_original_response(embed=await asyncio.to_thread(ai_savings_embed), view=self)
 
     @discord.ui.button(label="日・月上限", emoji="🧮", style=discord.ButtonStyle.primary)
     async def limits(self, interaction, _):
@@ -835,15 +839,17 @@ class AISavingsView(discord.ui.View):
 
     @discord.ui.button(label="停止解除", emoji="▶️", style=discord.ButtonStyle.success)
     async def resume(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(update_ai_cost_settings, is_paused=0, pause_reason='')
         write_audit(interaction.user.id, "ai_pause_clear", target_type="settings")
-        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+        await interaction.edit_original_response(embed=await asyncio.to_thread(ai_savings_embed), view=self)
 
     @discord.ui.button(label="手動停止", emoji="⏸️", style=discord.ButtonStyle.danger)
     async def pause(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
         await asyncio.to_thread(update_ai_cost_settings, is_paused=1, pause_reason='管理者が手動停止しました。')
         write_audit(interaction.user.id, "ai_pause", target_type="settings")
-        await interaction.response.edit_message(embed=await asyncio.to_thread(ai_savings_embed), view=self)
+        await interaction.edit_original_response(embed=await asyncio.to_thread(ai_savings_embed), view=self)
 
     @discord.ui.button(label="APIシミュレーション", emoji="🧮", style=discord.ButtonStyle.primary)
     async def simulation(self, interaction, _):
@@ -871,8 +877,9 @@ class AdminOperationsView(discord.ui.View):
 
     @discord.ui.button(label="前回の続き", emoji="⏯️", style=discord.ButtonStyle.success)
     async def resume(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
         from admin_workflow import BlogDashboardView
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "⏯️ **前回の続きから再開**\n投稿者を選ぶと、保存済みのページ・絞り込み・最後の記事へ戻れます。",
             view=BlogDashboardView(),
             ephemeral=True,
@@ -903,12 +910,13 @@ class AdminOperationsView(discord.ui.View):
 
     @discord.ui.button(label="監査ログ", emoji="📜", style=discord.ButtonStyle.secondary)
     async def audit(self, interaction, _):
+        await interaction.response.defer(ephemeral=True)
         rows = await asyncio.to_thread(list_audit, 20)
         text = "\n".join(
             f"`{r['id']}` <@{r['admin_user_id']}> **{r['action_type']}** {r['target_type']}:{r['target_id']}\n{str(r['detail'])[:180]}"
             for r in rows
         ) or "監査ログはまだありません。"
-        await interaction.response.send_message(embed=discord.Embed(title="📜 最近の管理操作", description=text[:4000], color=0x95A5A6), ephemeral=True)
+        await interaction.followup.send(embed=discord.Embed(title="📜 最近の管理操作", description=text[:4000], color=0x95A5A6), ephemeral=True)
 
     @discord.ui.button(label="人物マスター", emoji="👥", style=discord.ButtonStyle.secondary)
     async def people(self, interaction, _):
