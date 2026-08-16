@@ -337,6 +337,7 @@ class BlogDashboardView(AdminWorkflowView):
 
     @discord.ui.button(label="最新記事", emoji="📅", style=discord.ButtonStyle.primary)
     async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_latest_blogs_for_admin, 500)
         await _show_blog_list(interaction, "📅 最新記事", blogs)
 
@@ -350,25 +351,28 @@ class BlogDashboardView(AdminWorkflowView):
 
     @discord.ui.button(label="未解析記事", emoji="🆕", style=discord.ButtonStyle.success)
     async def unprocessed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_unprocessed_blogs_for_admin, 500)
         await _show_blog_list(interaction, "🆕 人物確認が未完了の記事", blogs)
 
     @discord.ui.button(label="エラー記事", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_error_blogs_for_admin, 500)
         await _show_blog_list(interaction, "⚠️ エラー記事", blogs)
 
 
 async def _show_blog_list(interaction: discord.Interaction, heading: str, blogs: list[dict[str, Any]]) -> None:
     if not blogs:
-        await interaction.response.edit_message(content=f"{heading}\n対象記事はありません。", embed=None, view=BlogDashboardView())
-        return
-    view = ProgressBlogSelectView(blogs, heading)
-    await interaction.response.edit_message(
-        content=view.text(),
-        embed=None,
-        view=view,
-    )
+        kwargs = dict(content=f"{heading}\n対象記事はありません。", embed=None, view=BlogDashboardView())
+    else:
+        view = ProgressBlogSelectView(blogs, heading)
+        kwargs = dict(content=view.text(), embed=None, view=view)
+
+    if interaction.response.is_done():
+        await interaction.edit_original_response(**kwargs)
+    else:
+        await interaction.response.edit_message(**kwargs)
 
 
 class ProgressBlogSelect(discord.ui.Select):
@@ -404,12 +408,13 @@ class ProgressBlogSelect(discord.ui.Select):
         super().__init__(placeholder="記事を選択", options=options)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         blog_id = int(self.values[0])
         blog = await asyncio.to_thread(get_blog_progress_for_admin, blog_id)
         if not blog:
-            await interaction.response.send_message("記事情報を取得できませんでした。", ephemeral=True)
+            await interaction.followup.send("記事情報を取得できませんでした。", ephemeral=True)
             return
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=None,
             embed=_article_embed(blog),
             view=BlogArticleView(blog_id),
@@ -1147,9 +1152,10 @@ class BlogPhotoBrowserView(AdminWorkflowView):
 
     @discord.ui.button(label="一覧を更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows = await asyncio.to_thread(get_blog_images_for_review_admin, self.blog_id)
         view = BlogPhotoBrowserView(self.blog_id, rows, self.page)
-        await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+        await interaction.edit_original_response(content=view.text(), embed=None, view=view)
 
 
 class BlogAuthorChangeConfirmView(AdminWorkflowView):
@@ -1215,10 +1221,11 @@ class BlogAuthorMemberSelect(discord.ui.Select):
         super().__init__(placeholder="正しい投稿者を選択", options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
         member = self.values[0]
         blog = await asyncio.to_thread(get_photo_blog_for_admin_edit, self.parent_view.blog_id)
         if not blog:
-            await interaction.response.send_message("対象記事が見つかりませんでした。", ephemeral=True)
+            await interaction.followup.send("対象記事が見つかりませんでした。", ephemeral=True)
             return
         embed = safe_embed(title="✏️ ブログ投稿者の変更確認", color=discord.Color.orange())
         safe_add_field(embed, name="記事", value=str(blog.get("title") or "無題"), inline=False)
@@ -1227,7 +1234,7 @@ class BlogAuthorMemberSelect(discord.ui.Select):
         safe_add_field(embed, name="関連画像", value=f"{int(blog.get('image_count') or 0)}枚", inline=True)
         if self.parent_view.restore_if_hidden:
             safe_add_field(embed, name="復元", value="投稿者変更と同時に除外状態を解除します。", inline=False)
-        await interaction.response.edit_message(
+        await interaction.edit_original_response(
             content=None, embed=embed,
             view=BlogAuthorChangeConfirmView(
                 self.parent_view.blog_id, self.parent_view.group_name, member,
@@ -1355,11 +1362,12 @@ class BlogArticleView(AdminWorkflowView):
 
     @discord.ui.button(label="進捗を更新", emoji="🔄", style=discord.ButtonStyle.primary)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         blog = await asyncio.to_thread(get_blog_progress_for_admin, self.blog_id)
         if not blog:
-            await interaction.response.send_message("記事情報を取得できませんでした。", ephemeral=True)
+            await interaction.followup.send("記事情報を取得できませんでした。", ephemeral=True)
             return
-        await interaction.response.edit_message(content=None, embed=_article_embed(blog), view=BlogArticleView(self.blog_id, browser_state=self.browser_state))
+        await interaction.edit_original_response(content=None, embed=_article_embed(blog), view=BlogArticleView(self.blog_id, browser_state=self.browser_state))
 
     @discord.ui.button(label="未解析だけAI人物判定", emoji="🤖", style=discord.ButtonStyle.secondary)
     async def ai_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
