@@ -159,6 +159,7 @@ class AdminHelpView(discord.ui.View):
 
     @discord.ui.button(label="状態整合性", emoji="🧩", style=discord.ButtonStyle.success, row=1)
     async def consistency(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         before = await _to_thread(get_review_consistency_stats)
         repaired = await _to_thread(repair_review_consistency)
         after = await _to_thread(get_review_consistency_stats)
@@ -166,10 +167,11 @@ class AdminHelpView(discord.ui.View):
         embed.add_field(name="修復前", value=_format_consistency(before), inline=False)
         embed.add_field(name="修復結果", value=f"更新 **{repaired['updated']}件** / 作成 **{repaired['inserted']}件**", inline=False)
         embed.add_field(name="修復後", value=_format_consistency(after), inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="エラー履歴", emoji="🚨", style=discord.ButtonStyle.secondary, row=1)
     async def errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         rows = await _to_thread(get_recent_admin_errors, 15)
         embed = discord.Embed(title="🚨 直近の管理画面エラー", color=0xED4245)
         if not rows:
@@ -179,10 +181,11 @@ class AdminHelpView(discord.ui.View):
                 f"`{r['error_id']}` **{r['area']}**\n{r['exception_type']}: {r['message'][:180]}\n{r['created_at']}"
                 for r in rows
             )[:3900]
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="状態別テスト", emoji="🧪", style=discord.ButtonStyle.secondary, row=1)
     async def state_tests(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         static_report = await _to_thread(run_static_regression_tests)
         from integration_tests import run as run_integration_tests
         integration_report = await _to_thread(run_integration_tests)
@@ -191,7 +194,7 @@ class AdminHelpView(discord.ui.View):
             "total": int(static_report.get("total", 0)) + int(integration_report.get("total", 0)),
             "failed": list(static_report.get("failed", [])) + list(integration_report.get("failed", [])),
         }
-        await interaction.response.send_message(embed=regression_embed(combined), ephemeral=True)
+        await interaction.followup.send(embed=regression_embed(combined), ephemeral=True)
 
     @discord.ui.button(label="検証付きバックアップ", emoji="💾", style=discord.ButtonStyle.success, row=2)
     async def verified_backup(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -223,6 +226,7 @@ class AdminHelpView(discord.ui.View):
 
     @discord.ui.button(label="学習・タグ進捗", emoji="📈", style=discord.ButtonStyle.secondary, row=3)
     async def worker_status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         from face_learning_queue import queue_stats
         from tag_migration_worker import migration_stats
         faces = await _to_thread(queue_stats)
@@ -230,15 +234,16 @@ class AdminHelpView(discord.ui.View):
         embed = discord.Embed(title="📈 バックグラウンド処理状況", color=0x5865F2)
         embed.add_field(name="顔学習キュー", value="\n".join(f"{k}: {v:,}" for k,v in faces.items()), inline=False)
         embed.add_field(name="タグ移行", value="\n".join(f"{k}: {v['processed']:,}/{v['total']:,}（残り{v['remaining']:,}）" for k,v in tags.items()), inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="採用機能一覧", emoji="📋", style=discord.ButtonStyle.secondary, row=2)
     async def feature_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         from maintenance_suite import feature_checklist
         rows = await _to_thread(feature_checklist)
         icons = {'implemented':'✅','partial':'🟡','planned':'❌'}
         text = "\n".join(f"{icons.get(str(r['status']),'•')} {r['label']}" for r in rows)
-        await interaction.response.send_message(embed=discord.Embed(title="📋 採用済み機能チェックリスト", description=text[:4000], color=0x5865F2), ephemeral=True)
+        await interaction.followup.send(embed=discord.Embed(title="📋 採用済み機能チェックリスト", description=text[:4000], color=0x5865F2), ephemeral=True)
 
 
 async def _to_thread(func, *args):
