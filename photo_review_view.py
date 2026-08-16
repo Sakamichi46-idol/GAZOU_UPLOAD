@@ -1436,20 +1436,22 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="候補を仮確定", emoji="🧪", style=discord.ButtonStyle.secondary, row=2)
     async def provisional_candidates(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         if not self.candidates:
-            await interaction.response.send_message("仮確定できる候補がありません。", ephemeral=True); return
+            await interaction.followup.send("仮確定できる候補がありません。", ephemeral=True); return
         await asyncio.to_thread(save_provisional_people, self.image_id, self.candidates, "review_candidates", 0.0)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"🧪 写真ID **{self.image_id}** を仮確定しました。\n人物: {'、'.join(self.candidates)}\n本確定はAI育成センターから行えます。",
             ephemeral=True,
         )
 
     @discord.ui.button(label="人物セット", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
     async def use_person_set(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
         sets=await asyncio.to_thread(load_person_sets,25)
         if not sets:
-            await interaction.response.send_message("人物セットがまだ登録されていません。",ephemeral=True);return
-        await interaction.response.send_message("使用する人物セットを選んでください。",view=PersonSetApplyView(self,sets),ephemeral=True)
+            await interaction.followup.send("人物セットがまだ登録されていません。",ephemeral=True);return
+        await interaction.followup.send("使用する人物セットを選んでください。",view=PersonSetApplyView(self,sets),ephemeral=True)
 
 
 async def send_person_review(
