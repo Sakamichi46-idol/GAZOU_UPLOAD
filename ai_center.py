@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
-import os
-import sqlite3
+import re
 from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
 
 import discord
 
-from photo_database import get_connection, save_ai_tag
 from embed_safety import safe_add_field
+from photo_database import get_connection, save_ai_tag
 
 
 PROFILE_SAVER = "saver"
@@ -286,12 +284,45 @@ def _normalize_local_tag(text: str) -> str:
     ).strip()
 
 
+def _extract_year_month(
+    text: str,
+) -> tuple[int | None, int | None]:
+    value = str(text or "").strip()
+
+    patterns = (
+        r"(?P<year>\d{4})年\s*(?P<month>\d{1,2})月",
+        r"(?P<year>\d{4})[./-](?P<month>\d{1,2})",
+    )
+
+    for pattern in patterns:
+        match = re.search(
+            pattern,
+            value,
+        )
+
+        if not match:
+            continue
+
+        year = int(
+            match.group("year")
+        )
+
+        month = int(
+            match.group("month")
+        )
+
+        if 1 <= month <= 12:
+            return year, month
+
+    return None, None
+
+
 def derive_local_tags(
     image_id: int,
 ) -> list[tuple[str, str, float]]:
     """
     画像自体をAIへ送らず、
-    DBのブログ情報だけから確実なタグを作る。
+    DBのブログ情報だけから確実な補助タグを作る。
     """
 
     with closing(get_connection()) as con:
@@ -314,7 +345,8 @@ def derive_local_tags(
         return []
 
     group, member, title, published = map(
-        lambda value: _normalize_local_tag(value),
+        lambda value:
+            _normalize_local_tag(value),
         row,
     )
 
@@ -347,64 +379,61 @@ def derive_local_tags(
             )
         )
 
-    if (
-        published
-        and len(published) >= 7
-    ):
-        year = published[:4]
-        month = published[5:7]
+    year, month_number = (
+        _extract_year_month(
+            published
+        )
+    )
 
-        if year.isdigit():
-            tags.append(
-                (
-                    "date",
-                    f"{year}年",
-                    1.0,
-                )
+    if year is not None:
+        tags.append(
+            (
+                "date",
+                f"{year}年",
+                1.0,
             )
+        )
 
-        if month.isdigit():
-            month_number = int(month)
-
-            tags.append(
-                (
-                    "date",
-                    f"{month_number}月",
-                    1.0,
-                )
+    if month_number is not None:
+        tags.append(
+            (
+                "date",
+                f"{month_number}月",
+                1.0,
             )
+        )
 
-            if month_number in (
-                12,
-                1,
-                2,
-            ):
-                season = "冬"
+        if month_number in (
+            12,
+            1,
+            2,
+        ):
+            season = "冬"
 
-            elif month_number in (
-                3,
-                4,
-                5,
-            ):
-                season = "春"
+        elif month_number in (
+            3,
+            4,
+            5,
+        ):
+            season = "春"
 
-            elif month_number in (
-                6,
-                7,
-                8,
-            ):
-                season = "夏"
+        elif month_number in (
+            6,
+            7,
+            8,
+        ):
+            season = "夏"
 
-            else:
-                season = "秋"
+        else:
+            season = "秋"
 
-            tags.append(
-                (
-                    "season",
-                    season,
-                    0.98,
-                )
+        tags.append(
+            (
+                "season",
+                season,
+                0.98,
             )
+        )
 
     keyword_map = {
         "ライブ": "ライブ",
@@ -417,7 +446,9 @@ def derive_local_tags(
         "浴衣": "浴衣",
     }
 
-    for keyword, tag in keyword_map.items():
+    for keyword, tag in (
+        keyword_map.items()
+    ):
         if keyword in title:
             tags.append(
                 (
@@ -530,7 +561,10 @@ def phase3_preflight(
 ) -> dict[str, Any]:
     """
     APIの前にローカル情報を集め、
-    節約モードならAPI省略可否を決める。
+    人物判定をローカルで完結できるかを判断する。
+
+    画像内容タグはOpenAIで生成する設計なので、
+    skip_api は常に False のままにする。
     """
 
     init_phase3_schema()
@@ -542,8 +576,10 @@ def phase3_preflight(
         or PROFILE_SAVER
     )
 
-    local_tag_count = persist_local_tags(
-        image_id
+    local_tag_count = (
+        persist_local_tags(
+            image_id
+        )
     )
 
     (
@@ -576,9 +612,11 @@ def phase3_preflight(
         and local_tag_count >= min_tags
     ):
         local_face_complete = True
+
         reason = (
             "人物判定はローカルで十分: "
-            f"顔候補{face_score:.3f}、ローカル補助タグ{local_tag_count}件。"
+            f"顔候補{face_score:.3f}、"
+            f"ローカル補助タグ{local_tag_count}件。"
             "画像内容タグはOpenAIで生成します。"
         )
 
@@ -644,18 +682,22 @@ def phase3_preflight(
         con.commit()
 
     return {
-        "profile": profile,
+        "profile":
+            profile,
         "local_tag_count":
             local_tag_count,
         "local_face_person":
             person,
         "local_face_score":
             face_score,
-        # 互換キーは残すが、タグ生成を維持するため画像全体APIはスキップしない。
-        "skip_api": False,
-        "local_face_complete": local_face_complete,
-        "tag_api_required": True,
-        "reason": reason,
+        "skip_api":
+            False,
+        "local_face_complete":
+            local_face_complete,
+        "tag_api_required":
+            True,
+        "reason":
+            reason,
     }
 
 
@@ -666,6 +708,7 @@ def record_cache_event(
     saved_api_call: bool,
     note: str = "",
 ) -> None:
+
     init_phase3_schema()
 
     with closing(get_connection()) as con:
@@ -685,7 +728,9 @@ def record_cache_event(
                 int(image_id),
                 str(cache_kind)[:40],
                 1 if hit else 0,
-                1 if saved_api_call else 0,
+                1
+                if saved_api_call
+                else 0,
                 str(note)[:500],
                 _now(),
             ),
@@ -714,7 +759,10 @@ def cache_diagnostics() -> dict[str, Any]:
                 COUNT(*),
                 SUM(
                     CASE
-                        WHEN decision IN ('local_complete','local_face_complete_tag_api')
+                        WHEN decision IN (
+                            'local_complete',
+                            'local_face_complete_tag_api'
+                        )
                         THEN 1
                         ELSE 0
                     END
@@ -723,14 +771,25 @@ def cache_diagnostics() -> dict[str, Any]:
             """
         ).fetchone()
 
-    total = int(row[0] or 0)
-    hits = int(row[1] or 0)
-    saved = int(row[2] or 0)
+    total = int(
+        row[0] or 0
+    )
+
+    hits = int(
+        row[1] or 0
+    )
+
+    saved = int(
+        row[2] or 0
+    )
 
     return {
-        "events": total,
-        "hits": hits,
-        "saved_api_calls": saved,
+        "events":
+            total,
+        "hits":
+            hits,
+        "saved_api_calls":
+            saved,
         "hit_rate":
             hits * 100 / total
             if total
@@ -777,11 +836,9 @@ def refresh_quality_scores() -> dict[str, int]:
                 avg_conf or 0
             )
 
-            frequency_component = (
-                min(
-                    1.0,
-                    usage / 100.0,
-                )
+            frequency_component = min(
+                1.0,
+                usage / 100.0,
             )
 
             score = max(
@@ -789,8 +846,7 @@ def refresh_quality_scores() -> dict[str, int]:
                 min(
                     1.0,
                     avg_conf * 0.8
-                    + frequency_component
-                    * 0.2,
+                    + frequency_component * 0.2,
                 ),
             )
 
@@ -901,8 +957,7 @@ def refresh_quality_scores() -> dict[str, int]:
                 min(
                     1.0,
                     avg_score * 0.6
-                    + data_component
-                    * 0.4,
+                    + data_component * 0.4,
                 ),
             )
 
@@ -962,9 +1017,11 @@ def refresh_quality_scores() -> dict[str, int]:
             width = int(
                 width or 0
             )
+
             height = int(
                 height or 0
             )
+
             file_size = int(
                 file_size or 0
             )
@@ -976,8 +1033,7 @@ def refresh_quality_scores() -> dict[str, int]:
             resolution = (
                 min(
                     1.0,
-                    pixels
-                    / 2_000_000.0,
+                    pixels / 2_000_000.0,
                 )
                 if pixels
                 else 0.0
@@ -986,8 +1042,7 @@ def refresh_quality_scores() -> dict[str, int]:
             file_score = (
                 min(
                     1.0,
-                    file_size
-                    / 500_000.0,
+                    file_size / 500_000.0,
                 )
                 if file_size
                 else 0.0
@@ -1043,25 +1098,40 @@ def refresh_quality_scores() -> dict[str, int]:
 
         con.commit()
 
-    # 品質再計算を検索へ即時反映。手動タグは常に優先し、AIタグだけ品質閾値を使う。
     try:
         from tag_master import rebuild_cache
-        with closing(get_connection()) as cache_con:
-            rebuild_cache(cache_con)
+
+        with closing(
+            get_connection()
+        ) as cache_con:
+
+            rebuild_cache(
+                cache_con
+            )
+
             cache_con.commit()
+
     except Exception as exc:
-        print("タグ品質の検索キャッシュ反映に失敗:", type(exc).__name__, exc)
+        print(
+            "タグ品質の検索キャッシュ反映に失敗:",
+            type(exc).__name__,
+            exc,
+        )
 
     return {
-        "tags": len(tags),
-        "people": len(people),
-        "images": len(images),
+        "tags":
+            len(tags),
+        "people":
+            len(people),
+        "images":
+            len(images),
     }
 
 
 def rebuild_recommendations(
     limit: int = 5000,
 ) -> int:
+
     init_phase3_schema()
 
     now = _now()
@@ -1095,8 +1165,7 @@ def rebuild_recommendations(
 
         con.execute(
             """
-            DELETE FROM
-                phase3_recommendations
+            DELETE FROM phase3_recommendations
             """
         )
 
@@ -1205,8 +1274,10 @@ def usage_prediction() -> dict[str, Any]:
     )
 
     return {
-        "pending": pending,
-        "historical_calls": calls,
+        "pending":
+            pending,
+        "historical_calls":
+            calls,
         "historical_cost":
             total_cost,
         "avg_cost":
@@ -1256,9 +1327,12 @@ def model_prompt_summary() -> dict[str, Any]:
         )
 
     return {
-        "settings": settings,
-        "models": models,
-        "prompts": prompts,
+        "settings":
+            settings,
+        "models":
+            models,
+        "prompts":
+            prompts,
     }
 
 
@@ -1405,10 +1479,14 @@ class ProfileSelect(
     def __init__(
         self,
         owner_id: int,
+        view_cls:
+            type[discord.ui.View],
     ):
         self.owner_id = int(
             owner_id
         )
+
+        self.view_cls = view_cls
 
         options = [
             discord.SelectOption(
@@ -1441,15 +1519,25 @@ class ProfileSelect(
             discord.Interaction,
     ) -> None:
 
-        update_settings(
-            profile=self.values[0]
+        await (
+            interaction.response
+            .defer()
+        )
+
+        await asyncio.to_thread(
+            update_settings,
+            profile=self.values[0],
+        )
+
+        embed = await asyncio.to_thread(
+            dashboard_embed
         )
 
         await (
-            interaction.response
-            .edit_message(
-                embed=dashboard_embed(),
-                view=Phase3AIView(
+            interaction
+            .edit_original_response(
+                embed=embed,
+                view=self.view_cls(
                     self.owner_id
                 ),
             )
@@ -1473,7 +1561,8 @@ class Phase3AIView(
 
         self.add_item(
             ProfileSelect(
-                owner_id
+                owner_id,
+                type(self),
             )
         )
 
@@ -1517,12 +1606,15 @@ class Phase3AIView(
         await (
             interaction.response
             .defer(
-                ephemeral=True
+                ephemeral=True,
+                thinking=True,
             )
         )
 
-        result = await asyncio.to_thread(
-            refresh_quality_scores
+        result = (
+            await asyncio.to_thread(
+                refresh_quality_scores
+            )
         )
 
         recommendations = (
@@ -1560,6 +1652,14 @@ class Phase3AIView(
             discord.ui.Button,
     ) -> None:
 
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         prediction = (
             await asyncio.to_thread(
                 usage_prediction
@@ -1589,8 +1689,8 @@ class Phase3AIView(
         )
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 embed=embed,
                 ephemeral=True,
             )
@@ -1611,6 +1711,14 @@ class Phase3AIView(
             discord.ui.Button,
     ) -> None:
 
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         cache = (
             await asyncio.to_thread(
                 cache_diagnostics
@@ -1618,8 +1726,8 @@ class Phase3AIView(
         )
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 (
                     "💾 キャッシュ診断\n"
                     f"イベント **{cache['events']:,}**\n"
@@ -1648,6 +1756,14 @@ class Phase3AIView(
             discord.ui.Button,
     ) -> None:
 
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         data = (
             await asyncio.to_thread(
                 model_prompt_summary
@@ -1659,8 +1775,8 @@ class Phase3AIView(
         ]
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 (
                     "🧾 モデル・プロンプト管理\n"
                     f"現在モデル: "
@@ -1691,11 +1807,23 @@ class Phase3AIView(
             discord.ui.Button,
     ) -> None:
 
-        settings = get_settings()
-
         await (
             interaction.response
-            .send_message(
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
+        settings = (
+            await asyncio.to_thread(
+                get_settings
+            )
+        )
+
+        await (
+            interaction.followup
+            .send(
                 (
                     "🕒 解析予約\n"
                     f"状態 **{'ON' if int(settings.get('scheduled_enabled', 0)) else 'OFF'}**\n"
@@ -1725,9 +1853,20 @@ class Phase3AIView(
 
         await (
             interaction.response
-            .edit_message(
-                embed=dashboard_embed(),
-                view=Phase3AIView(
+            .defer()
+        )
+
+        embed = (
+            await asyncio.to_thread(
+                dashboard_embed
+            )
+        )
+
+        await (
+            interaction
+            .edit_original_response(
+                embed=embed,
+                view=type(self)(
                     self.owner_id
                 ),
             )
@@ -1739,34 +1878,38 @@ async def send_phase3_ai_center(
         discord.Interaction,
 ) -> None:
 
-    init_phase3_schema()
-
-    if (
+    if not (
         interaction.response
         .is_done()
     ):
         await (
-            interaction.followup
-            .send(
-                embed=dashboard_embed(),
-                view=Phase3AIView(
-                    interaction.user.id
-                ),
+            interaction.response
+            .defer(
                 ephemeral=True,
+                thinking=True,
             )
         )
 
-    else:
-        await (
-            interaction.response
-            .send_message(
-                embed=dashboard_embed(),
-                view=Phase3AIView(
-                    interaction.user.id
-                ),
-                ephemeral=True,
-            )
+    await asyncio.to_thread(
+        init_phase3_schema
+    )
+
+    embed = (
+        await asyncio.to_thread(
+            dashboard_embed
         )
+    )
+
+    await (
+        interaction.followup
+        .send(
+            embed=embed,
+            view=Phase3AIView(
+                interaction.user.id
+            ),
+            ephemeral=True,
+        )
+    )
 
 
 # -------------------------
@@ -2114,6 +2257,14 @@ class TagSearchModal(
             discord.Interaction,
     ) -> None:
 
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         query = str(
             self.query.value
         ).strip()
@@ -2174,12 +2325,54 @@ class TagSearchModal(
         )
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 embed=embed,
                 ephemeral=True,
             )
         )
+
+
+def _save_prompt_version(
+    version: str,
+    prompt: str,
+    created_by: str,
+) -> None:
+
+    init_phase3_schema()
+
+    with closing(get_connection()) as con:
+        con.execute(
+            """
+            INSERT INTO phase3_prompt_versions(
+                version,
+                prompt_text,
+                is_active,
+                created_by,
+                created_at
+            )
+            VALUES(
+                ?,?,
+                0,
+                ?,
+                ?
+            )
+            ON CONFLICT(version)
+            DO UPDATE SET
+                prompt_text=
+                    excluded.prompt_text,
+                created_by=
+                    excluded.created_by
+            """,
+            (
+                version,
+                prompt,
+                created_by,
+                _now(),
+            ),
+        )
+
+        con.commit()
 
 
 class PromptRegisterModal(
@@ -2224,48 +2417,29 @@ class PromptRegisterModal(
                     ephemeral=True,
                 )
             )
+
             return
-
-        init_phase3_schema()
-
-        with closing(get_connection()) as con:
-            con.execute(
-                """
-                INSERT INTO phase3_prompt_versions(
-                    version,
-                    prompt_text,
-                    is_active,
-                    created_by,
-                    created_at
-                )
-                VALUES(
-                    ?,?,
-                    0,
-                    ?,
-                    ?
-                )
-                ON CONFLICT(version)
-                DO UPDATE SET
-                    prompt_text=
-                        excluded.prompt_text,
-                    created_by=
-                        excluded.created_by
-                """,
-                (
-                    version,
-                    prompt,
-                    str(
-                        interaction.user.id
-                    ),
-                    _now(),
-                ),
-            )
-
-            con.commit()
 
         await (
             interaction.response
-            .send_message(
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
+        await asyncio.to_thread(
+            _save_prompt_version,
+            version,
+            prompt,
+            str(
+                interaction.user.id
+            ),
+        )
+
+        await (
+            interaction.followup
+            .send(
                 (
                     f"✅ Prompt `{version}` を保存しました。"
                     "切替は設定から行います。"
@@ -2320,9 +2494,20 @@ class Phase3DetailsView(
     )
     async def tags(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         rows = (
             await asyncio.to_thread(
                 tag_quality_rows,
@@ -2348,8 +2533,8 @@ class Phase3DetailsView(
         ]
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 embed=discord.Embed(
                     title="🏷️ タグ品質",
                     description=(
@@ -2371,9 +2556,20 @@ class Phase3DetailsView(
     )
     async def people(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         rows = (
             await asyncio.to_thread(
                 person_quality_rows,
@@ -2392,8 +2588,8 @@ class Phase3DetailsView(
         ]
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 embed=discord.Embed(
                     title="👤 人物品質",
                     description=(
@@ -2415,9 +2611,20 @@ class Phase3DetailsView(
     )
     async def recs(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         rows = (
             await asyncio.to_thread(
                 recommendation_rows,
@@ -2435,8 +2642,8 @@ class Phase3DetailsView(
         ]
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 embed=discord.Embed(
                     title="🌟 おすすめ写真",
                     description=(
@@ -2458,9 +2665,20 @@ class Phase3DetailsView(
     )
     async def cleanup(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
         diagnostics = (
             await asyncio.to_thread(
                 learning_cleanup_diagnostics
@@ -2468,8 +2686,8 @@ class Phase3DetailsView(
         )
 
         await (
-            interaction.response
-            .send_message(
+            interaction.followup
+            .send(
                 (
                     "🧹 学習データ整理候補\n"
                     f"低品質候補 **{diagnostics['low_quality']:,}**\n"
@@ -2489,9 +2707,12 @@ class Phase3DetailsView(
     )
     async def tag_search(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
         await (
             interaction.response
             .send_modal(
@@ -2508,9 +2729,12 @@ class Phase3DetailsView(
     )
     async def prompt_add(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
         await (
             interaction.response
             .send_modal(
@@ -2519,7 +2743,6 @@ class Phase3DetailsView(
         )
 
 
-# 既存Viewへ「詳細」ボタンを追加するための派生View
 class Phase3AIViewFull(
     Phase3AIView
 ):
@@ -2532,9 +2755,12 @@ class Phase3AIViewFull(
     )
     async def details(
         self,
-        interaction,
-        _,
-    ):
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
         await (
             interaction.response
             .send_message(
@@ -2555,16 +2781,22 @@ class Phase3AIViewFull(
     )
     async def face_diagnostics(
         self,
-        interaction,
-        _,
-    ):
-        # Discordへ最優先で応答する。
-        # face_candidate_diagnostics / local_face_recognition のimportやDB処理が
-        # 遅くても「アプリケーションが応答しませんでした」にならないようにする。
-        if not interaction.response.is_done():
-            await interaction.response.defer(
-                ephemeral=True,
-                thinking=True,
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        if not (
+            interaction.response
+            .is_done()
+        ):
+            await (
+                interaction.response
+                .defer(
+                    ephemeral=True,
+                    thinking=True,
+                )
             )
 
         try:
@@ -2572,16 +2804,22 @@ class Phase3AIViewFull(
                 send_face_candidate_diagnostics,
             )
 
-            await send_face_candidate_diagnostics(
-                interaction
+            await (
+                send_face_candidate_diagnostics(
+                    interaction
+                )
             )
+
         except Exception as exc:
-            await interaction.followup.send(
-                (
-                    "⚠️ 顔候補診断画面を開けませんでした。\n"
-                    f"`{type(exc).__name__}: {exc}`"
-                ),
-                ephemeral=True,
+            await (
+                interaction.followup
+                .send(
+                    (
+                        "⚠️ 顔候補診断画面を開けませんでした。\n"
+                        f"`{type(exc).__name__}: {exc}`"
+                    ),
+                    ephemeral=True,
+                )
             )
 
     @discord.ui.button(
@@ -2593,10 +2831,22 @@ class Phase3AIViewFull(
     )
     async def toggle_schedule(
         self,
-        interaction,
-        _,
-    ):
-        settings = get_settings()
+        interaction:
+            discord.Interaction,
+        _:
+            discord.ui.Button,
+    ) -> None:
+
+        await (
+            interaction.response
+            .defer()
+        )
+
+        settings = (
+            await asyncio.to_thread(
+                get_settings
+            )
+        )
 
         new_value = (
             0
@@ -2609,15 +2859,22 @@ class Phase3AIViewFull(
             else 1
         )
 
-        update_settings(
+        await asyncio.to_thread(
+            update_settings,
             scheduled_enabled=
-                new_value
+                new_value,
+        )
+
+        embed = (
+            await asyncio.to_thread(
+                dashboard_embed
+            )
         )
 
         await (
-            interaction.response
-            .edit_message(
-                embed=dashboard_embed(),
+            interaction
+            .edit_original_response(
+                embed=embed,
                 view=Phase3AIViewFull(
                     self.owner_id
                 ),
@@ -2630,34 +2887,40 @@ async def send_phase3_ai_center_full(
         discord.Interaction,
 ) -> None:
 
-    init_phase3_schema()
+    if not (
+        interaction.response
+        .is_done()
+    ):
+        await (
+            interaction.response
+            .defer(
+                ephemeral=True,
+                thinking=True,
+            )
+        )
+
+    await asyncio.to_thread(
+        init_phase3_schema
+    )
 
     view = Phase3AIViewFull(
         interaction.user.id
     )
 
-    if (
-        interaction.response
-        .is_done()
-    ):
-        await (
-            interaction.followup
-            .send(
-                embed=dashboard_embed(),
-                view=view,
-                ephemeral=True,
-            )
+    embed = (
+        await asyncio.to_thread(
+            dashboard_embed
         )
+    )
 
-    else:
-        await (
-            interaction.response
-            .send_message(
-                embed=dashboard_embed(),
-                view=view,
-                ephemeral=True,
-            )
+    await (
+        interaction.followup
+        .send(
+            embed=embed,
+            view=view,
+            ephemeral=True,
         )
+    )
 
 
 # -------------------------
@@ -2670,6 +2933,44 @@ _SCHEDULE_TASK: (
 ) = None
 
 
+def _record_schedule_run(
+    limit: int,
+    result: Any,
+) -> None:
+
+    with closing(
+        get_connection()
+    ) as con:
+
+        con.execute(
+            """
+            INSERT INTO phase3_schedule_runs(
+                run_kind,
+                requested_limit,
+                result_json,
+                created_at
+            )
+            VALUES(
+                'scheduled',
+                ?,
+                ?,
+                ?
+            )
+            """,
+            (
+                int(limit),
+                json.dumps(
+                    result,
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                _now(),
+            ),
+        )
+
+        con.commit()
+
+
 async def _scheduled_loop() -> None:
     from zoneinfo import (
         ZoneInfo,
@@ -2680,7 +2981,9 @@ async def _scheduled_loop() -> None:
     while True:
         try:
             settings = (
-                get_settings()
+                await asyncio.to_thread(
+                    get_settings
+                )
             )
 
             if int(
@@ -2736,36 +3039,11 @@ async def _scheduled_loop() -> None:
                         )
                     )
 
-                    with closing(
-                        get_connection()
-                    ) as con:
-                        con.execute(
-                            """
-                            INSERT INTO phase3_schedule_runs(
-                                run_kind,
-                                requested_limit,
-                                result_json,
-                                created_at
-                            )
-                            VALUES(
-                                'scheduled',
-                                ?,
-                                ?,
-                                ?
-                            )
-                            """,
-                            (
-                                limit,
-                                json.dumps(
-                                    result,
-                                    ensure_ascii=False,
-                                    default=str,
-                                ),
-                                _now(),
-                            ),
-                        )
-
-                        con.commit()
+                    await asyncio.to_thread(
+                        _record_schedule_run,
+                        limit,
+                        result,
+                    )
 
                     last_day = day
 
