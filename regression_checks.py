@@ -329,6 +329,14 @@ def run()->dict:
         '復旧不能画像は人物確認キューと残り件数から除外する',
     ))
 
+    photo_db_text=(ROOT/'photo_database.py').read_text(encoding='utf-8') if (ROOT/'photo_database.py').exists() else ''
+    checks.append((
+        'admin_blog_month_filter_supports_japanese_date',
+        'f"____年{month_value}月%"' in photo_db_text
+        and 'f"____年{month_value:02d}月%"' in photo_db_text,
+        'ブログ月フィルターは2019年3月/2019年03月形式にも対応する',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
