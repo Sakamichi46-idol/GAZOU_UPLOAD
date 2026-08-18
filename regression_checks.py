@@ -425,6 +425,15 @@ def run()->dict:
         '人物検索結果を最新順・古い順・期間で絞り込める',
     ))
 
+    user_experience_text=(ROOT/'user_experience.py').read_text(encoding='utf-8') if (ROOT/'user_experience.py').exists() else ''
+    checks.append((
+        'user_experience_no_photo_search_top_level_import',
+        'from photo_search import get_display_image_url' not in user_experience_text.split('def _display_url', 1)[0]
+        and 'def _display_url' in user_experience_text
+        and 'from photo_search import get_display_image_url' in user_experience_text.split('def _display_url', 1)[1],
+        'photo_search↔user_experience の起動時循環importを防止する',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
