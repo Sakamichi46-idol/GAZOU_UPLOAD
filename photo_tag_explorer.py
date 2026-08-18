@@ -4,6 +4,7 @@ import asyncio
 import math
 from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 import discord
@@ -187,7 +188,57 @@ def _option_counts(
     return values
 
 
-def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
+def _parse_blog_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = (
+        text.replace("年", "-")
+        .replace("月", "-")
+        .replace("日", "")
+        .replace("/", "-")
+        .replace(".", "-")
+    )
+    normalized = " ".join(normalized.split())
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%Y-%m %H:%M",
+        "%Y-%m",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _period_bounds(value: str, *, end: bool = False) -> datetime | None:
+    clean = str(value or "").strip().replace("/", "-").replace(".", "-")
+    if not clean:
+        return None
+    parts = clean.split("-")
+    try:
+        year = int(parts[0])
+        month = int(parts[1]) if len(parts) >= 2 and parts[1] else (12 if end else 1)
+        if not 1 <= month <= 12:
+            return None
+        if end:
+            next_year = year + 1 if month == 12 else year
+            next_month = 1 if month == 12 else month + 1
+            return datetime(next_year, next_month, 1)
+        return datetime(year, month, 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def _load_results(
+    image_ids: set[int],
+    sort_order: str = "latest",
+    start_period: str = "",
+    end_period: str = "",
+) -> list[dict[str, Any]]:
     if not image_ids:
         return []
 
@@ -202,6 +253,7 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 photo_images.image_url,
                 photo_images.image_index,
                 photo_images.local_path,
+                photo_images.bucket_key,
                 photo_blogs.blog_url,
                 photo_blogs.group_name,
                 photo_blogs.member_name,
@@ -223,8 +275,6 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 ), '') AS candidate_people,
 
                 COALESCE(photo_images.analysis_status, 'pending') AS analysis_status,
-                COALESCE(photo_images.bucket_key, '') AS bucket_key,
-
                 COALESCE(photo_ai_analysis.clothing, '') AS clothing,
                 COALESCE(photo_ai_analysis.expression, '') AS expression,
                 COALESCE(photo_ai_analysis.background, '') AS background,
@@ -254,30 +304,51 @@ def _load_results(image_ids: set[int]) -> list[dict[str, Any]]:
                 ), '') AS manual_tags
 
             FROM photo_images
-
             JOIN photo_blogs
-                ON photo_blogs.id = photo_images.blog_id
-
+              ON photo_blogs.id = photo_images.blog_id
             LEFT JOIN photo_ai_analysis
-                ON photo_ai_analysis.image_id = photo_images.id
-
+              ON photo_ai_analysis.image_id = photo_images.id
             WHERE photo_images.id IN ({placeholders})
-
-            ORDER BY
-                photo_blogs.published_at DESC,
-                photo_images.image_index ASC,
-                photo_images.id DESC
             """,
             params,
         ).fetchall()
 
-    return [dict(row) for row in rows]
+    results = [dict(row) for row in rows]
+    start_dt = _period_bounds(start_period, end=False)
+    end_dt = _period_bounds(end_period or start_period, end=True) if (end_period or start_period) else None
+
+    if start_dt or end_dt:
+        filtered: list[dict[str, Any]] = []
+        for row in results:
+            published = _parse_blog_datetime(row.get("published_at"))
+            if published is None:
+                continue
+            if start_dt is not None and published < start_dt:
+                continue
+            if end_dt is not None and published >= end_dt:
+                continue
+            filtered.append(row)
+        results = filtered
+
+    reverse = str(sort_order or "latest") != "oldest"
+    results.sort(
+        key=lambda row: (
+            _parse_blog_datetime(row.get("published_at")) or datetime.min,
+            int(row.get("image_index") or 0) * (-1 if reverse else 1),
+            int(row.get("id") or 0),
+        ),
+        reverse=reverse,
+    )
+    return results
 
 
 @dataclass
 class ExplorerState:
     owner_id: int
     person_match_mode: str = "or"
+    sort_order: str = "latest"
+    start_period: str = ""
+    end_period: str = ""
 
     selections: dict[str, set[str]] = field(
         default_factory=lambda: {
@@ -1011,7 +1082,13 @@ class ExplorerView(OwnedView):
         search_button = discord.ui.Button(label=f"{count:,}枚を検索"[:80], emoji="🔍", style=discord.ButtonStyle.success, row=3, disabled=count == 0)
         async def search_callback(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
-            results = await asyncio.to_thread(_load_results, self.state.result_ids())
+            results = await asyncio.to_thread(
+                _load_results,
+                self.state.result_ids(),
+                self.state.sort_order,
+                self.state.start_period,
+                self.state.end_period,
+            )
             view = ResultsView(self.state, results, page=0)
             files = await view.build_files()
             if not files:
@@ -1374,6 +1451,129 @@ class TagResultSelect(discord.ui.Select):
         )
 
 
+class ResultPeriodModal(discord.ui.Modal):
+    def __init__(self, state: ExplorerState, *, range_mode: bool):
+        super().__init__(title="ブログ期間を指定")
+        self.state = state
+        self.range_mode = range_mode
+        self.start_value = discord.ui.TextInput(
+            label="開始年月" if range_mode else "年月",
+            placeholder="例: 2024-04" if range_mode else "例: 2024 または 2024-04",
+            max_length=7,
+        )
+        self.add_item(self.start_value)
+        self.end_value = None
+        if range_mode:
+            self.end_value = discord.ui.TextInput(
+                label="終了年月",
+                placeholder="例: 2025-03",
+                max_length=7,
+            )
+            self.add_item(self.end_value)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        start = str(self.start_value.value or "").strip()
+        end = str(self.end_value.value or "").strip() if self.end_value else start
+        if _period_bounds(start, end=False) is None or _period_bounds(end, end=True) is None:
+            await interaction.response.send_message(
+                "⚠️ `2024` または `2024-04` の形式で入力してください。",
+                ephemeral=True,
+            )
+            return
+        if _period_bounds(start, end=False) >= _period_bounds(end, end=True):
+            await interaction.response.send_message(
+                "⚠️ 終了年月は開始年月以降にしてください。",
+                ephemeral=True,
+            )
+            return
+        self.state.start_period = start.replace("/", "-").replace(".", "-")
+        self.state.end_period = end.replace("/", "-").replace(".", "-")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        results = await asyncio.to_thread(
+            _load_results,
+            self.state.result_ids(),
+            self.state.sort_order,
+            self.state.start_period,
+            self.state.end_period,
+        )
+        if not results:
+            await interaction.followup.send(
+                "条件に一致する写真はありませんでした。期間を変更してください。",
+                ephemeral=True,
+            )
+            return
+        view = ResultsView(self.state, results, page=0)
+        files = await view.build_files()
+        if not files:
+            await interaction.followup.send("画像を取得できませんでした。", ephemeral=True)
+            return
+        try:
+            await interaction.followup.send(
+                content=view.control_content(),
+                files=files,
+                view=view,
+                ephemeral=True,
+            )
+        finally:
+            close_discord_files(files)
+
+
+class ResultPeriodSortView(OwnedView):
+    def __init__(self, state: ExplorerState):
+        super().__init__(state, timeout=300)
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        results = await asyncio.to_thread(
+            _load_results,
+            self.state.result_ids(),
+            self.state.sort_order,
+            self.state.start_period,
+            self.state.end_period,
+        )
+        if not results:
+            await interaction.followup.send("条件に一致する写真はありません。", ephemeral=True)
+            return
+        view = ResultsView(self.state, results, page=0)
+        files = await view.build_files()
+        if not files:
+            await interaction.followup.send("画像を取得できませんでした。", ephemeral=True)
+            return
+        try:
+            await interaction.followup.send(
+                content=view.control_content(),
+                files=files,
+                view=view,
+                ephemeral=True,
+            )
+        finally:
+            close_discord_files(files)
+
+    @discord.ui.button(label="最新順", emoji="⬇️", style=discord.ButtonStyle.primary)
+    async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.sort_order = "latest"
+        await self._show(interaction)
+
+    @discord.ui.button(label="古い順", emoji="⬆️", style=discord.ButtonStyle.primary)
+    async def oldest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.sort_order = "oldest"
+        await self._show(interaction)
+
+    @discord.ui.button(label="年・月を指定", emoji="📅", style=discord.ButtonStyle.secondary)
+    async def month(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ResultPeriodModal(self.state, range_mode=False))
+
+    @discord.ui.button(label="期間を指定", emoji="🗓️", style=discord.ButtonStyle.secondary)
+    async def period(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ResultPeriodModal(self.state, range_mode=True))
+
+    @discord.ui.button(label="全期間", emoji="♻️", style=discord.ButtonStyle.secondary)
+    async def all_periods(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.start_period = ""
+        self.state.end_period = ""
+        await self._show(interaction)
+
+
 class ResultsView(OwnedView):
     """タグ検索結果を1ページ9枚ずつ、1つのメッセージにまとめて表示する。"""
 
@@ -1404,9 +1604,16 @@ class ResultsView(OwnedView):
     def control_content(self) -> str:
         start = self.page * PAGE_SIZE + 1
         end = min(len(self.results), start + PAGE_SIZE - 1)
+        period = "全期間"
+        if self.state.start_period:
+            period = self.state.start_period
+            if self.state.end_period and self.state.end_period != self.state.start_period:
+                period += f"〜{self.state.end_period}"
+        order = "最新順" if self.state.sort_order != "oldest" else "古い順"
         return (
             "🔍 **タグ検索結果**\n"
             f"取得件数: **{len(self.results)}件**\n"
+            f"並び: **{order}** / 期間: **{period}**\n"
             f"現在表示: **{start}〜{end}件目**（最大9枚を1セットで表示）"
         )
 
@@ -1438,6 +1645,14 @@ class ResultsView(OwnedView):
     @discord.ui.button(label="次の9枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._change_page(interaction, self.page + 1)
+
+    @discord.ui.button(label="並び順・期間", emoji="🗓️", style=discord.ButtonStyle.secondary, row=1)
+    async def period_sort(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            "並び順やブログ期間を選んでください。",
+            view=ResultPeriodSortView(self.state),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="条件変更", emoji="🔧", style=discord.ButtonStyle.success, row=1)
     async def explorer(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
