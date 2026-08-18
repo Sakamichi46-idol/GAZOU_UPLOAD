@@ -19,7 +19,10 @@ def check_face_candidate_diagnostics() -> list[str]:
         errors.append("AI管理に顔候補診断ボタンがありません")
     if "OpenAI APIを使わず" not in diag_text and "OpenAI APIは使用しません" not in diag_text:
         errors.append("API不使用の診断表示がありません")
-    if "await interaction.response.defer" not in ai_text.split("async def face_diagnostics", 1)[1].split("@discord.ui.button", 1)[0]:
+    face_callback = ai_text.split("async def face_diagnostics", 1)[1].split("@discord.ui.button", 1)[0]
+    defer_pos = face_callback.find(".defer(")
+    import_pos = face_callback.find("from face_candidate_diagnostics import")
+    if defer_pos < 0 or import_pos < 0 or defer_pos > import_pos:
         errors.append("AI管理の顔候補診断callbackがimport前にdeferしていません")
     if "from local_face_recognition import diagnose_face_candidates" in diag_text.split("def _load_face_diagnostics", 1)[0]:
         errors.append("顔候補診断がlocal_face_recognitionをトップレベルimportしています")
@@ -373,6 +376,28 @@ def run()->dict:
         'discord_heavy_callbacks_ack_before_work',
         not interaction_guard_violations,
         '重いDiscord UIコールバックは処理前にACKする: '+(', '.join(interaction_guard_violations[:10]) if interaction_guard_violations else 'OK'),
+    ))
+
+    admin_workflow_text=(ROOT/'admin_workflow.py').read_text(encoding='utf-8') if (ROOT/'admin_workflow.py').exists() else ''
+    photo_db_text=(ROOT/'photo_database.py').read_text(encoding='utf-8') if (ROOT/'photo_database.py').exists() else ''
+    checks.append((
+        'completed_no_people_is_displayed_as_nobody',
+        'if status == "completed":\n                    desc = "人物なし"' in admin_workflow_text,
+        '人物なし確定済み写真を未確認と表示しない',
+    ))
+    checks.append((
+        'blog_workflow_stats_available',
+        'def get_blog_workflow_stats_for_admin' in photo_db_text
+        and 'label="処理件数"' in admin_workflow_text
+        and "'blogs_with_skipped_photos'" in admin_workflow_text,
+        'ブログ処理件数・スキップ件数を管理画面で確認できる',
+    ))
+    checks.append((
+        'blog_workflow_stats_separates_hidden_and_photo_skip',
+        "hidden_reason = 'MANUAL_HIDE'" in photo_db_text
+        and "'skipped_photos'" in admin_workflow_text
+        and "'hidden_blogs'" in admin_workflow_text,
+        '写真スキップとブログ除外を別集計する',
     ))
 
     failed=[c for c in checks if not c[1]]
