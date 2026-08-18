@@ -40,6 +40,7 @@ from discord.ext.commands.view import StringView
 from community_features import FeedbackModal
 from user_experience import HelpHomeView, PersonProfileModal, help_home_embed
 from runtime_guard import user_operation
+from sakamichi_members import SAKAMICHI_MEMBERS, member_surname_kana_sort_key
 
 ADMIN_ROLE_ID = _env_int("PHOTO_BOT_ADMIN_ROLE_ID", 0, minimum=0)
 ADMIN_ROLE_NAME = os.getenv("PHOTO_BOT_ADMIN_ROLE_NAME", "PhotoBot Admin").strip() or "PhotoBot Admin"
@@ -372,6 +373,13 @@ class PhotoSourceSelectView(discord.ui.View):
 
     @discord.ui.button(label="ブログ", emoji="📚", style=discord.ButtonStyle.primary)
     async def blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.person_only:
+            await interaction.response.send_message(
+                "グループを選んでください。",
+                view=BlogPersonGroupView(interaction.user.id),
+                ephemeral=True,
+            )
+            return
         await self._open(interaction, "blog")
 
     @discord.ui.button(label="Instagram", emoji="📸", style=discord.ButtonStyle.primary)
@@ -381,6 +389,294 @@ class PhotoSourceSelectView(discord.ui.View):
     @discord.ui.button(label="両方", emoji="🔎", style=discord.ButtonStyle.success)
     async def all_sources(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._open(interaction, "all")
+
+
+class BlogPersonSearchState:
+    def __init__(
+        self,
+        owner_id: int,
+        *,
+        group_name: str = "",
+        generation_name: str = "",
+        person_name: str = "",
+        sort_order: str = "latest",
+        start_period: str = "",
+        end_period: str = "",
+    ) -> None:
+        self.owner_id = int(owner_id)
+        self.group_name = str(group_name)
+        self.generation_name = str(generation_name)
+        self.person_name = str(person_name)
+        self.sort_order = "oldest" if sort_order == "oldest" else "latest"
+        self.start_period = str(start_period)
+        self.end_period = str(end_period)
+
+
+class OwnedPersonSearchView(discord.ui.View):
+    def __init__(self, owner_id: int, *, timeout: float = 300) -> None:
+        super().__init__(timeout=timeout)
+        self.owner_id = int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await _reply(interaction, "この人物検索画面は操作した本人専用です。")
+        return False
+
+
+class BlogPersonGroupSelect(discord.ui.Select):
+    def __init__(self, owner_id: int) -> None:
+        options = [
+            discord.SelectOption(label=group, value=group, emoji="👥")
+            for group in SAKAMICHI_MEMBERS
+        ]
+        super().__init__(
+            placeholder="グループを選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.owner_id = int(owner_id)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        group = self.values[0]
+        await interaction.response.edit_message(
+            content=f"**{group}** の期・区分を選んでください。",
+            view=BlogPersonGenerationView(interaction.user.id, group),
+        )
+
+
+class BlogPersonGroupView(OwnedPersonSearchView):
+    def __init__(self, owner_id: int) -> None:
+        super().__init__(owner_id)
+        self.add_item(BlogPersonGroupSelect(owner_id))
+
+
+class BlogPersonGenerationSelect(discord.ui.Select):
+    def __init__(self, owner_id: int, group_name: str) -> None:
+        generations = list(SAKAMICHI_MEMBERS.get(group_name, {}))
+        options = [
+            discord.SelectOption(label=name[:100], value=name)
+            for name in generations[:25]
+        ]
+        super().__init__(
+            placeholder="期・区分を選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.owner_id = int(owner_id)
+        self.group_name = group_name
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        generation = self.values[0]
+        await interaction.response.edit_message(
+            content=f"**{self.group_name} / {generation}** のメンバーを選んでください。",
+            view=BlogPersonMemberView(
+                interaction.user.id,
+                self.group_name,
+                generation,
+            ),
+        )
+
+
+class BlogPersonGenerationView(OwnedPersonSearchView):
+    def __init__(self, owner_id: int, group_name: str) -> None:
+        super().__init__(owner_id)
+        self.add_item(BlogPersonGenerationSelect(owner_id, group_name))
+
+    @discord.ui.button(label="グループへ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content="グループを選んでください。",
+            view=BlogPersonGroupView(self.owner_id),
+        )
+
+
+class BlogPersonMemberSelect(discord.ui.Select):
+    def __init__(
+        self,
+        owner_id: int,
+        group_name: str,
+        generation_name: str,
+    ) -> None:
+        names = list(
+            SAKAMICHI_MEMBERS
+            .get(group_name, {})
+            .get(generation_name, [])
+        )
+        names.sort(key=member_surname_kana_sort_key)
+        options = [
+            discord.SelectOption(
+                label=name[:100],
+                value=name,
+                emoji="👤",
+            )
+            for name in names[:25]
+        ]
+        super().__init__(
+            placeholder="メンバーを選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.owner_id = int(owner_id)
+        self.group_name = group_name
+        self.generation_name = generation_name
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state = BlogPersonSearchState(
+            interaction.user.id,
+            group_name=self.group_name,
+            generation_name=self.generation_name,
+            person_name=self.values[0],
+        )
+        await interaction.response.edit_message(
+            content=(
+                f"👤 **{state.person_name}**\n"
+                "ブログ写真の並び順・期間を選んでください。"
+            ),
+            view=BlogPersonPeriodView(state),
+        )
+
+
+class BlogPersonMemberView(OwnedPersonSearchView):
+    def __init__(
+        self,
+        owner_id: int,
+        group_name: str,
+        generation_name: str,
+    ) -> None:
+        super().__init__(owner_id)
+        self.group_name = group_name
+        self.add_item(
+            BlogPersonMemberSelect(
+                owner_id,
+                group_name,
+                generation_name,
+            )
+        )
+
+    @discord.ui.button(label="期・区分へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=f"**{self.group_name}** の期・区分を選んでください。",
+            view=BlogPersonGenerationView(self.owner_id, self.group_name),
+        )
+
+
+class BlogPersonPeriodModal(discord.ui.Modal):
+    def __init__(self, state: BlogPersonSearchState, *, range_mode: bool) -> None:
+        super().__init__(
+            title="ブログ期間を指定",
+            timeout=300,
+        )
+        self.state = state
+        self.range_mode = range_mode
+        self.start_input = discord.ui.TextInput(
+            label="開始年月" if range_mode else "年月",
+            placeholder="例: 2024-04" if range_mode else "例: 2024 または 2024-04",
+            max_length=7,
+        )
+        self.add_item(self.start_input)
+        self.end_input = None
+        if range_mode:
+            self.end_input = discord.ui.TextInput(
+                label="終了年月",
+                placeholder="例: 2025-03",
+                max_length=7,
+            )
+            self.add_item(self.end_input)
+
+    @staticmethod
+    def _valid(value: str) -> bool:
+        text = str(value or "").strip().replace("/", "-").replace(".", "-")
+        if re.fullmatch(r"\d{4}", text):
+            return True
+        match = re.fullmatch(r"(\d{4})-(\d{1,2})", text)
+        return bool(match and 1 <= int(match.group(2)) <= 12)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        start = str(self.start_input.value or "").strip().replace("/", "-").replace(".", "-")
+        end = (
+            str(self.end_input.value or "").strip().replace("/", "-").replace(".", "-")
+            if self.end_input is not None
+            else start
+        )
+
+        if not self._valid(start) or not self._valid(end):
+            await interaction.response.send_message(
+                "⚠️ `2024` または `2024-04` の形式で入力してください。",
+                ephemeral=True,
+            )
+            return
+
+        self.state.start_period = start
+        self.state.end_period = end
+        await _run_blog_person_search(interaction, self.state)
+
+
+async def _run_blog_person_search(
+    interaction: discord.Interaction,
+    state: BlogPersonSearchState,
+) -> None:
+    from combined_photo_search import send_blog_person_search
+
+    await send_blog_person_search(
+        interaction,
+        state.person_name,
+        sort_order=state.sort_order,
+        start_period=state.start_period,
+        end_period=state.end_period,
+    )
+
+
+class BlogPersonPeriodView(OwnedPersonSearchView):
+    def __init__(self, state: BlogPersonSearchState) -> None:
+        super().__init__(state.owner_id)
+        self.state = state
+
+    @discord.ui.button(label="最新順", emoji="⬇️", style=discord.ButtonStyle.primary)
+    async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.sort_order = "latest"
+        await _run_blog_person_search(interaction, self.state)
+
+    @discord.ui.button(label="古い順", emoji="⬆️", style=discord.ButtonStyle.primary)
+    async def oldest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.sort_order = "oldest"
+        await _run_blog_person_search(interaction, self.state)
+
+    @discord.ui.button(label="年・月を指定", emoji="📅", style=discord.ButtonStyle.secondary)
+    async def month(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            BlogPersonPeriodModal(self.state, range_mode=False)
+        )
+
+    @discord.ui.button(label="期間を指定", emoji="🗓️", style=discord.ButtonStyle.secondary)
+    async def period(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(
+            BlogPersonPeriodModal(self.state, range_mode=True)
+        )
+
+    @discord.ui.button(label="全期間", emoji="♻️", style=discord.ButtonStyle.secondary)
+    async def all_periods(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.start_period = ""
+        self.state.end_period = ""
+        await _run_blog_person_search(interaction, self.state)
+
+    @discord.ui.button(label="メンバー選択へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=(
+                f"**{self.state.group_name} / {self.state.generation_name}** "
+                "のメンバーを選んでください。"
+            ),
+            view=BlogPersonMemberView(
+                self.owner_id,
+                self.state.group_name,
+                self.state.generation_name,
+            ),
+        )
 
 
 async def send_source_selector(interaction: discord.Interaction, *, person_only: bool = False) -> None:
