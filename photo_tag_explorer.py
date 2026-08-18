@@ -1046,20 +1046,20 @@ class ExplorerView(OwnedView):
             button.callback = callback
             self.add_item(button)
 
-        name_button = discord.ui.Button(label="人物名入力", emoji="🔤", style=discord.ButtonStyle.secondary, row=2)
+        name_button = discord.ui.Button(label="人物名入力", emoji="🔤", style=discord.ButtonStyle.secondary, row=3)
         async def name_callback(interaction: discord.Interaction) -> None:
             await interaction.response.send_modal(PersonNameModal(self.state))
         name_button.callback = name_callback
         self.add_item(name_button)
 
-        tag_input_button = discord.ui.Button(label="タグ名入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=2)
+        tag_input_button = discord.ui.Button(label="タグ名入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=3)
         async def tag_input_callback(interaction: discord.Interaction) -> None:
             await interaction.response.send_modal(SearchTagModal(self.state))
         tag_input_button.callback = tag_input_callback
         self.add_item(tag_input_button)
 
         mode_label = "人物：全員" if self.state.person_match_mode == "and" else "人物：いずれか"
-        mode_button = discord.ui.Button(label=mode_label, emoji="👥", style=discord.ButtonStyle.primary, row=2)
+        mode_button = discord.ui.Button(label=mode_label, emoji="👥", style=discord.ButtonStyle.primary, row=3)
         async def mode_callback(interaction: discord.Interaction) -> None:
             self.state.person_match_mode = "or" if self.state.person_match_mode == "and" else "and"
             view = ExplorerView(self.state)
@@ -1068,7 +1068,7 @@ class ExplorerView(OwnedView):
         self.add_item(mode_button)
 
         has_conditions = any(self.state.selections.values())
-        remove_button = discord.ui.Button(label="条件を個別解除", emoji="➖", style=discord.ButtonStyle.secondary, row=2, disabled=not has_conditions)
+        remove_button = discord.ui.Button(label="条件を個別解除", emoji="➖", style=discord.ButtonStyle.secondary, row=3, disabled=not has_conditions)
         async def remove_callback(interaction: discord.Interaction) -> None:
             view = ConditionRemoveView(self.state)
             await interaction.response.edit_message(
@@ -1079,7 +1079,7 @@ class ExplorerView(OwnedView):
         self.add_item(remove_button)
 
         count = len(self.state.result_ids())
-        search_button = discord.ui.Button(label=f"{count:,}枚を検索"[:80], emoji="🔍", style=discord.ButtonStyle.success, row=3, disabled=count == 0)
+        search_button = discord.ui.Button(label=f"{count:,}枚を検索"[:80], emoji="🔍", style=discord.ButtonStyle.success, row=4, disabled=count == 0)
         async def search_callback(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
             results = await asyncio.to_thread(
@@ -1111,7 +1111,7 @@ class ExplorerView(OwnedView):
         search_button.callback = search_callback
         self.add_item(search_button)
 
-        reset_button = discord.ui.Button(label="全解除", emoji="🧹", style=discord.ButtonStyle.danger, row=3, disabled=not has_conditions)
+        reset_button = discord.ui.Button(label="全解除", emoji="🧹", style=discord.ButtonStyle.danger, row=4, disabled=not has_conditions)
         async def reset_callback(interaction: discord.Interaction) -> None:
             self.state.clear()
             view = ExplorerView(self.state)
@@ -1119,7 +1119,7 @@ class ExplorerView(OwnedView):
         reset_button.callback = reset_callback
         self.add_item(reset_button)
 
-        close_button = discord.ui.Button(label="終了", emoji="✖️", style=discord.ButtonStyle.secondary, row=3)
+        close_button = discord.ui.Button(label="終了", emoji="✖️", style=discord.ButtonStyle.secondary, row=4)
         async def close_callback(interaction: discord.Interaction) -> None:
             for item in self.children:
                 item.disabled = True
