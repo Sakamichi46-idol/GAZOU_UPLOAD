@@ -18,7 +18,6 @@ from discord.ext import commands
 
 from person_labels import format_people_for_users
 from photo_database import get_connection, get_photo_image
-from photo_search import get_display_image_url
 
 
 def _now() -> str:
@@ -419,7 +418,13 @@ def person_profile(name: str) -> dict[str, Any]:
 
 
 def _display_url(row: dict[str, Any]) -> str:
-    """Bucket署名URLを優先し、利用できない場合だけ元画像URLへ戻す。"""
+    """Bucket署名URLを優先し、利用できない場合だけ元画像URLへ戻す。
+
+    photo_search は user_experience を import するため、ここで遅延 import して
+    起動時の循環 import を防ぐ。
+    """
+
+    from photo_search import get_display_image_url
 
     return get_display_image_url(row)
 
