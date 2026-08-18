@@ -5517,6 +5517,122 @@ def _normalize_blog_admin_rows(rows: list[Any]) -> list[dict[str, Any]]:
     return result
 
 
+def get_blog_workflow_stats_for_admin() -> dict[str, int]:
+    """ブログ単位解析の実績を集計する。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            WITH per_blog AS (
+                SELECT
+                    pb.id,
+                    COALESCE(pb.is_hidden, 0) AS is_hidden,
+                    COALESCE(pb.hidden_reason, '') AS hidden_reason,
+                    COUNT(DISTINCT CASE
+                        WHEN pi.id IS NOT NULL
+                         AND pi.download_status NOT IN ('invalid_url', 'permanent_failed')
+                        THEN pi.id
+                    END) AS reviewable_images,
+                    COUNT(DISTINCT CASE
+                        WHEN pi.analysis_status IN ('completed', 'review')
+                         AND pi.download_status NOT IN ('invalid_url', 'permanent_failed')
+                        THEN pi.id
+                    END) AS ai_done_images,
+                    COUNT(DISTINCT CASE
+                        WHEN prq.review_type = 'person_identity'
+                         AND prq.status = 'completed'
+                        THEN prq.image_id
+                    END) AS review_completed_images,
+                    COUNT(DISTINCT CASE
+                        WHEN prq.review_type = 'person_identity'
+                         AND prq.status = 'skipped'
+                        THEN prq.image_id
+                    END) AS review_skipped_images
+                FROM photo_blogs pb
+                LEFT JOIN photo_images pi
+                  ON pi.blog_id = pb.id
+                LEFT JOIN photo_review_queue prq
+                  ON prq.image_id = pi.id
+                GROUP BY pb.id
+            )
+            SELECT
+                SUM(CASE
+                    WHEN is_hidden = 0 AND reviewable_images > 0
+                    THEN 1 ELSE 0 END
+                ) AS review_target_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND reviewable_images > 0
+                     AND (review_completed_images > 0 OR review_skipped_images > 0)
+                    THEN 1 ELSE 0 END
+                ) AS review_started_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND reviewable_images > 0
+                     AND review_completed_images >= reviewable_images
+                    THEN 1 ELSE 0 END
+                ) AS review_completed_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND reviewable_images > 0
+                     AND review_completed_images = 0
+                     AND review_skipped_images = 0
+                    THEN 1 ELSE 0 END
+                ) AS review_unstarted_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND review_skipped_images > 0
+                    THEN 1 ELSE 0 END
+                ) AS blogs_with_skipped_photos,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                    THEN review_skipped_images ELSE 0 END
+                ) AS skipped_photos,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND ai_done_images > 0
+                    THEN 1 ELSE 0 END
+                ) AS ai_started_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                     AND reviewable_images > 0
+                     AND ai_done_images >= reviewable_images
+                    THEN 1 ELSE 0 END
+                ) AS ai_completed_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 0
+                    THEN reviewable_images ELSE 0 END
+                ) AS review_target_images,
+                SUM(CASE
+                    WHEN is_hidden = 1
+                    THEN 1 ELSE 0 END
+                ) AS hidden_blogs,
+                SUM(CASE
+                    WHEN is_hidden = 1
+                     AND hidden_reason = 'MANUAL_HIDE'
+                    THEN 1 ELSE 0 END
+                ) AS manual_hidden_blogs
+            FROM per_blog
+            """
+        ).fetchone()
+
+    keys = (
+        "review_target_blogs",
+        "review_started_blogs",
+        "review_completed_blogs",
+        "review_unstarted_blogs",
+        "blogs_with_skipped_photos",
+        "skipped_photos",
+        "ai_started_blogs",
+        "ai_completed_blogs",
+        "review_target_images",
+        "hidden_blogs",
+        "manual_hidden_blogs",
+    )
+    if row is None:
+        return {key: 0 for key in keys}
+    return {key: int(row[key] or 0) for key in keys}
+
+
 def get_latest_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     """最新記事を人物確認進捗付きで返す。"""
     safe_limit = max(1, min(int(limit), 25))
