@@ -434,6 +434,35 @@ def run()->dict:
         'photo_search↔user_experience の起動時循環importを防止する',
     ))
 
+    control_panel_text=(ROOT/'control_panel.py').read_text(encoding='utf-8') if (ROOT/'control_panel.py').exists() else ''
+    combined_search_text=(ROOT/'combined_photo_search.py').read_text(encoding='utf-8') if (ROOT/'combined_photo_search.py').exists() else ''
+    review_view_text=(ROOT/'photo_review_view.py').read_text(encoding='utf-8') if (ROOT/'photo_review_view.py').exists() else ''
+    checks.append((
+        'user_blog_person_search_is_selection_based',
+        'class BlogPersonGroupView' in control_panel_text
+        and 'class BlogPersonGenerationView' in control_panel_text
+        and 'class BlogPersonMemberView' in control_panel_text
+        and 'グループを選んでください。' in control_panel_text,
+        'ユーザーパネルのブログ人物検索をグループ→期→メンバー選択式にする',
+    ))
+    checks.append((
+        'user_blog_person_search_has_period_sort',
+        'label="最新順"' in control_panel_text
+        and 'label="古い順"' in control_panel_text
+        and 'label="年・月を指定"' in control_panel_text
+        and 'label="期間を指定"' in control_panel_text
+        and 'def send_blog_person_search' in combined_search_text,
+        '選択したメンバーを最新順・古い順・年月・期間で絞り込める',
+    ))
+    checks.append((
+        'person_set_apply_has_pagination',
+        'PERSON_SET_APPLY_PAGE_SIZE = 25' in review_view_text
+        and 'label="次へ"' in review_view_text
+        and 'label="前へ"' in review_view_text
+        and 'count_person_sets' in review_view_text,
+        '保存済み人物セット26件目以降へ前へ/次へで移動できる',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
