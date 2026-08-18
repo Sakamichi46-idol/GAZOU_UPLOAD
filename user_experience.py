@@ -18,6 +18,7 @@ from discord.ext import commands
 
 from person_labels import format_people_for_users
 from photo_database import get_connection, get_photo_image
+from photo_search import get_display_image_url
 
 
 def _now() -> str:
@@ -418,14 +419,9 @@ def person_profile(name: str) -> dict[str, Any]:
 
 
 def _display_url(row: dict[str, Any]) -> str:
-    """Bucketの公開URLを優先し、なければ元画像URLを使う。"""
+    """Bucket署名URLを優先し、利用できない場合だけ元画像URLへ戻す。"""
 
-    return str(
-        row.get("bucket_public_url")
-        or row.get("public_url")
-        or row.get("image_url")
-        or ""
-    ).strip()
+    return get_display_image_url(row)
 
 
 def photo_embed(
@@ -935,10 +931,16 @@ class ExploreView(discord.ui.View):
         title: str,
     ) -> None:
         if not rows:
-            await interaction.response.send_message(
-                "表示できる写真がありません。",
-                ephemeral=True,
-            )
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "表示できる写真がありません。",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "表示できる写真がありません。",
+                    ephemeral=True,
+                )
             return
 
         view = SimplePhotoListView(
@@ -947,11 +949,18 @@ class ExploreView(discord.ui.View):
             title=title,
         )
 
-        await interaction.response.send_message(
-            embed=view.embed(),
-            view=view,
-            ephemeral=True,
-        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                embed=view.embed(),
+                view=view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                embed=view.embed(),
+                view=view,
+                ephemeral=True,
+            )
 
     @discord.ui.button(
         label="ランダム",
