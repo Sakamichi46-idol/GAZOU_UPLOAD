@@ -1009,14 +1009,36 @@ def promote_provisional(image_id: int, admin_user_id: int) -> list[str]:
         con.commit()
     return names
 
-def load_person_sets(limit: int = 25) -> list[dict[str, Any]]:
+def count_person_sets() -> int:
     init_advanced_admin_schema()
     with closing(get_connection()) as con:
+        row = con.execute(
+            "SELECT COUNT(*) FROM photo_person_sets"
+        ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def load_person_sets(
+    limit: int = 25,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    init_advanced_admin_schema()
+    safe_limit = max(1, min(int(limit), 25))
+    safe_offset = max(0, int(offset))
+    with closing(get_connection()) as con:
         rows = con.execute(
-            "SELECT id,set_name,people_json FROM photo_person_sets ORDER BY updated_at DESC LIMIT ?",
-            (max(1, min(int(limit), 25)),),
+            """
+            SELECT id,set_name,people_json
+            FROM photo_person_sets
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (safe_limit, safe_offset),
         ).fetchall()
-    return [{"id": int(r[0]), "name": str(r[1]), "people": _safe_json_list(r[2])} for r in rows]
+    return [
+        {"id": int(r[0]), "name": str(r[1]), "people": _safe_json_list(r[2])}
+        for r in rows
+    ]
 
 class SnapshotRestoreSelect(discord.ui.Select):
     def __init__(self, owner_id: int):
