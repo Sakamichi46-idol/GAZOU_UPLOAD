@@ -463,6 +463,18 @@ def run()->dict:
         '保存済み人物セット26件目以降へ前へ/次へで移動できる',
     ))
 
+    tag_explorer_text=(ROOT/'photo_tag_explorer.py').read_text(encoding='utf-8') if (ROOT/'photo_tag_explorer.py').exists() else ''
+    checks.append((
+        'tag_explorer_component_rows_fit_discord_limit',
+        'label="人物名入力", emoji="🔤", style=discord.ButtonStyle.secondary, row=3' in tag_explorer_text
+        and 'label="タグ名入力", emoji="⌨️", style=discord.ButtonStyle.secondary, row=3' in tag_explorer_text
+        and 'label="条件を個別解除", emoji="➖", style=discord.ButtonStyle.secondary, row=3' in tag_explorer_text
+        and 'emoji="🔍", style=discord.ButtonStyle.success, row=4' in tag_explorer_text
+        and 'label="全解除", emoji="🧹", style=discord.ButtonStyle.danger, row=4' in tag_explorer_text
+        and 'label="終了", emoji="✖️", style=discord.ButtonStyle.secondary, row=4' in tag_explorer_text,
+        'タグ検索トップの各rowをDiscordの最大5幅以内に収める',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
