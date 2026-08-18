@@ -26,6 +26,7 @@ from photo_database import (
     get_error_blogs_for_admin,
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
+    get_blog_workflow_stats_for_admin,
     reset_blog_processing_errors_for_admin,
     set_confirmed_image_people,
 )
@@ -360,6 +361,71 @@ class BlogDashboardView(AdminWorkflowView):
         await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_error_blogs_for_admin, 500)
         await _show_blog_list(interaction, "⚠️ エラー記事", blogs)
+
+    @discord.ui.button(label="処理件数", emoji="📊", style=discord.ButtonStyle.secondary)
+    async def stats(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        stats = await asyncio.to_thread(get_blog_workflow_stats_for_admin)
+
+        embed = discord.Embed(
+            title="📊 ブログ処理実績",
+            color=0x5865F2,
+        )
+        embed.description = (
+            "ブログ単位解析の実績を、AI解析と人物確認に分けて集計しています。\n"
+            "「スキップあり」は写真単位の保留、「ブログ除外」は記事そのものを対象外にした件数です。"
+        )
+        safe_add_field(
+            embed,
+            name="🤖 AI解析",
+            value=(
+                f"解析ありブログ **{stats['ai_started_blogs']:,}件**\n"
+                f"全画像解析済み **{stats['ai_completed_blogs']:,}件**"
+            ),
+            inline=True,
+            context="blog_workflow_stats.ai",
+        )
+        safe_add_field(
+            embed,
+            name="✅ 人物確認",
+            value=(
+                f"着手済みブログ **{stats['review_started_blogs']:,}件**\n"
+                f"完了ブログ **{stats['review_completed_blogs']:,}件**\n"
+                f"未着手 **{stats['review_unstarted_blogs']:,}件**"
+            ),
+            inline=True,
+            context="blog_workflow_stats.review",
+        )
+        safe_add_field(
+            embed,
+            name="⏭️ スキップ",
+            value=(
+                f"スキップ写真あり **{stats['blogs_with_skipped_photos']:,}ブログ**\n"
+                f"スキップ写真 **{stats['skipped_photos']:,}枚**\n"
+                f"ブログ除外 **{stats['hidden_blogs']:,}件**"
+            ),
+            inline=True,
+            context="blog_workflow_stats.skip",
+        )
+        safe_add_field(
+            embed,
+            name="📚 対象",
+            value=(
+                f"人物確認対象ブログ **{stats['review_target_blogs']:,}件**\n"
+                f"対象写真 **{stats['review_target_images']:,}枚**"
+            ),
+            inline=False,
+            context="blog_workflow_stats.target",
+        )
+        if stats["manual_hidden_blogs"]:
+            embed.set_footer(
+                text=(
+                    f"ブログ除外 {stats['hidden_blogs']:,}件のうち、"
+                    f"管理者が手動で除外したものは {stats['manual_hidden_blogs']:,}件です。"
+                )
+            )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def _show_blog_list(interaction: discord.Interaction, heading: str, blogs: list[dict[str, Any]]) -> None:
@@ -994,7 +1060,12 @@ class BlogPhotoSelect(discord.ui.Select):
                 except Exception:
                     desc = people
             else:
-                desc = "スキップ済み" if status == "skipped" else "未確認"
+                if status == "completed":
+                    desc = "人物なし"
+                elif status == "skipped":
+                    desc = "スキップ済み"
+                else:
+                    desc = "未確認"
             options.append(discord.SelectOption(label=f"{icon} {idx}枚目", value=str(item["image_id"]), description=desc[:100]))
         super().__init__(placeholder="確認する写真を選択", min_values=1, max_values=1, options=options, row=0)
         self.parent_view = parent
@@ -1016,7 +1087,14 @@ class BulkPhotoSelect(discord.ui.Select):
         for item in rows:
             iid=int(item["image_id"]); num=int(item.get("image_index") or 0)
             status=str(item.get("review_status") or "pending")
-            opts.append(discord.SelectOption(label=f"{num}枚目",value=str(iid),description=("登録済み" if status=="completed" else "スキップ済み" if status=="skipped" else "未確認"),default=iid in parent.selected_ids))
+            people = str(item.get("confirmed_people") or "").strip()
+            if status == "completed":
+                description = people or "人物なし"
+            elif status == "skipped":
+                description = "スキップ済み"
+            else:
+                description = "未確認"
+            opts.append(discord.SelectOption(label=f"{num}枚目",value=str(iid),description=description[:100],default=iid in parent.selected_ids))
         super().__init__(placeholder="一括確定する写真を複数選択",min_values=0,max_values=len(opts),options=opts,row=0)
     async def callback(self,interaction:discord.Interaction)->None:
         page_ids={int(x["image_id"]) for x in self.parent_view.page_rows()}
