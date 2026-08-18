@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import closing
 from typing import Any
 
 import aiohttp
 import discord
 
-from photo_database import search_photo_images
+from photo_database import get_connection, search_photo_images
 from photo_search import get_display_image_url, shorten_text
 
 API_URL = str(os.getenv('INSTAGRAM_SEARCH_API_URL', '') or '').rstrip('/')
@@ -30,6 +32,199 @@ def _blog_results(query: str, limit: int) -> list[dict[str, Any]]:
             'message_url': row.get('discord_message_url') or '',
         })
     return normalized
+
+
+def _normalize_period_bounds(value: str, *, end: bool) -> str | None:
+    text = str(value or "").strip().replace("/", "-").replace(".", "-")
+    if not text:
+        return None
+    parts = text.split("-")
+    if len(parts) == 1 and len(parts[0]) == 4 and parts[0].isdigit():
+        year = int(parts[0])
+        return f"{year:04d}-12-31" if end else f"{year:04d}-01-01"
+    if (
+        len(parts) == 2
+        and len(parts[0]) == 4
+        and parts[0].isdigit()
+        and parts[1].isdigit()
+    ):
+        year = int(parts[0])
+        month = int(parts[1])
+        if not 1 <= month <= 12:
+            return None
+        if end:
+            if month == 12:
+                return f"{year:04d}-12-31"
+            next_month = month + 1
+            return f"{year:04d}-{next_month:02d}-01"
+        return f"{year:04d}-{month:02d}-01"
+    return None
+
+
+def _blog_person_results(
+    person_name: str,
+    *,
+    sort_order: str = "latest",
+    start_period: str = "",
+    end_period: str = "",
+    limit: int = SEARCH_LIMIT,
+) -> list[dict[str, Any]]:
+    clean_name = str(person_name or "").strip()
+    if not clean_name:
+        return []
+
+    where_parts = [
+        """
+        (
+            EXISTS (
+                SELECT 1
+                FROM photo_image_people pip
+                WHERE pip.image_id = photo_images.id
+                  AND pip.person_name = ?
+                  AND pip.relation_status IN ('confirmed', 'candidate')
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM photo_faces pf
+                JOIN photo_face_candidates pfc ON pfc.face_id = pf.id
+                JOIN photo_people pp ON pp.id = pfc.person_id
+                WHERE pf.image_id = photo_images.id
+                  AND pp.person_name = ?
+                  AND pfc.candidate_rank = 1
+            )
+        )
+        """
+    ]
+    params: list[Any] = [clean_name, clean_name]
+
+    start_bound = _normalize_period_bounds(start_period, end=False) if start_period else None
+    end_bound = _normalize_period_bounds(end_period or start_period, end=True) if (end_period or start_period) else None
+
+    # published_at は YYYY年MM月DD日 / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD の
+    # いずれでも年・月・日の開始位置が同じため、substrで比較用キーを作れる。
+    date_key = (
+        "substr(photo_blogs.published_at,1,4) || '-' || "
+        "substr(photo_blogs.published_at,6,2) || '-' || "
+        "substr(photo_blogs.published_at,9,2)"
+    )
+
+    if start_bound:
+        where_parts.append(f"{date_key} >= ?")
+        params.append(start_bound)
+
+    if end_bound:
+        # 年月指定の終了境界が翌月1日の場合もあるので <= ではなく < に寄せるため、
+        # 12月末/年指定のような明示末日は 23:59 相当としてその日を含める。
+        if end_bound.endswith("-31"):
+            where_parts.append(f"{date_key} <= ?")
+        else:
+            where_parts.append(f"{date_key} < ?")
+        params.append(end_bound)
+
+    direction = "ASC" if str(sort_order).lower() == "oldest" else "DESC"
+    safe_limit = max(1, min(int(limit), 50))
+
+    with closing(get_connection()) as con:
+        rows = con.execute(
+            f"""
+            SELECT
+                photo_images.*,
+                photo_blogs.blog_url,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = photo_images.id
+                      AND pip.relation_status = 'confirmed'
+                ), '') AS confirmed_people,
+                COALESCE((
+                    SELECT GROUP_CONCAT(person_name, '、')
+                    FROM photo_image_people pip
+                    WHERE pip.image_id = photo_images.id
+                      AND pip.relation_status = 'candidate'
+                ), '') AS candidate_people
+            FROM photo_images
+            INNER JOIN photo_blogs
+              ON photo_blogs.id = photo_images.blog_id
+            WHERE
+                photo_images.download_status = 'completed'
+                AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
+                AND {" AND ".join(where_parts)}
+            ORDER BY
+                {date_key} {direction},
+                photo_images.image_index {"ASC" if direction == "ASC" else "DESC"},
+                photo_images.id {direction}
+            LIMIT ?
+            """,
+            tuple(params + [safe_limit]),
+        ).fetchall()
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        data = dict(row)
+        normalized.append({
+            'source': 'blog',
+            'id': data.get('id'),
+            'image_url': get_display_image_url(data),
+            'title': data.get('title') or 'ブログ写真',
+            'author': data.get('member_name') or '不明',
+            'people': data.get('confirmed_people') or data.get('candidate_people') or '',
+            'date': data.get('published_at') or '',
+            'source_url': data.get('blog_url') or '',
+            'message_url': data.get('discord_message_url') or '',
+        })
+    return normalized
+
+
+async def send_blog_person_search(
+    interaction: discord.Interaction,
+    person_name: str,
+    *,
+    sort_order: str = "latest",
+    start_period: str = "",
+    end_period: str = "",
+) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+    results = await asyncio.to_thread(
+        _blog_person_results,
+        person_name,
+        sort_order=sort_order,
+        start_period=start_period,
+        end_period=end_period,
+        limit=SEARCH_LIMIT,
+    )
+
+    if not results:
+        await interaction.followup.send(
+            "該当するブログ写真が見つかりませんでした。",
+            ephemeral=True,
+        )
+        return
+
+    period_text = "全期間"
+    if start_period:
+        period_text = start_period
+        if end_period and end_period != start_period:
+            period_text += f"〜{end_period}"
+
+    order_text = "古い順" if sort_order == "oldest" else "最新順"
+    query_text = f"{person_name} / {order_text} / {period_text}"
+    view = CombinedSearchView(
+        owner_id=interaction.user.id,
+        results=results,
+        query=query_text,
+    )
+
+    await interaction.followup.send(
+        embed=view.embed(),
+        view=view,
+        ephemeral=True,
+    )
 
 
 async def _instagram_results(query: str, limit: int) -> tuple[list[dict[str, Any]], str]:
