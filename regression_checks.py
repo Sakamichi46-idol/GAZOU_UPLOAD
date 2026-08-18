@@ -400,6 +400,31 @@ def run()->dict:
         '写真スキップとブログ除外を別集計する',
     ))
 
+    ux_text=(ROOT/'user_experience.py').read_text(encoding='utf-8') if (ROOT/'user_experience.py').exists() else ''
+    review_text=(ROOT/'photo_review_view.py').read_text(encoding='utf-8') if (ROOT/'photo_review_view.py').exists() else ''
+    advanced_text=(ROOT/'advanced_admin_features.py').read_text(encoding='utf-8') if (ROOT/'advanced_admin_features.py').exists() else ''
+    explorer_text=(ROOT/'photo_tag_explorer.py').read_text(encoding='utf-8') if (ROOT/'photo_tag_explorer.py').exists() else ''
+    checks.append((
+        'explore_defer_uses_followup',
+        'if interaction.response.is_done()' in ux_text and 'interaction.followup.send' in ux_text,
+        'ランダム・今日の1枚はdefer後に二重responseしない',
+    ))
+    checks.append((
+        'explore_uses_bucket_presigned_url',
+        'from photo_search import get_display_image_url' in ux_text and 'return get_display_image_url(row)' in ux_text,
+        'ランダム・今日の1枚でBucket署名URLを利用できる',
+    ))
+    checks.append((
+        'person_set_apply_pagination',
+        'PERSON_SET_APPLY_PAGE_SIZE = 25' in review_text and 'label="次へ"' in review_text and 'count_person_sets' in advanced_text,
+        '保存済み人物セット26件目以降へページ送りできる',
+    ))
+    checks.append((
+        'member_result_period_sort',
+        'label="並び順・期間"' in explorer_text and 'label="最新順"' in explorer_text and 'label="古い順"' in explorer_text and 'label="期間を指定"' in explorer_text,
+        '人物検索結果を最新順・古い順・期間で絞り込める',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
