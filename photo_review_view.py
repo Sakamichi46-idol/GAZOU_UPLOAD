@@ -31,7 +31,7 @@ from photo_database import (
 )
 from sakamichi_members import SAKAMICHI_MEMBERS, iter_members
 from advanced_admin_features import (
-    HOLD_REASON_LABELS, create_people_snapshot, save_hold_reason, save_provisional_people, load_person_sets,
+    HOLD_REASON_LABELS, create_people_snapshot, save_hold_reason, save_provisional_people, load_person_sets, count_person_sets,
 )
 from operation_locks import resource_lock
 
@@ -1206,9 +1206,65 @@ class PersonSetApplySelect(discord.ui.Select):
             view=SelectedPeopleView(state),
         )
 
+PERSON_SET_APPLY_PAGE_SIZE = 25
+
+
 class PersonSetApplyView(discord.ui.View):
-    def __init__(self, review_view: "PersonReviewView", sets: list[dict[str, Any]]):
-        super().__init__(timeout=300); self.add_item(PersonSetApplySelect(review_view,sets))
+    def __init__(
+        self,
+        review_view: "PersonReviewView",
+        sets: list[dict[str, Any]],
+        *,
+        page: int = 0,
+        total: int = 0,
+    ):
+        super().__init__(timeout=300)
+        self.review_view = review_view
+        self.page = max(0, int(page))
+        self.total = max(0, int(total))
+        if sets:
+            self.add_item(PersonSetApplySelect(review_view, sets))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = (self.page + 1) * PERSON_SET_APPLY_PAGE_SIZE >= self.total
+
+    @classmethod
+    async def create(
+        cls,
+        review_view: "PersonReviewView",
+        page: int = 0,
+    ) -> "PersonSetApplyView":
+        total = await asyncio.to_thread(count_person_sets)
+        max_page = max(0, (total - 1) // PERSON_SET_APPLY_PAGE_SIZE) if total else 0
+        safe_page = max(0, min(int(page), max_page))
+        sets = await asyncio.to_thread(
+            load_person_sets,
+            PERSON_SET_APPLY_PAGE_SIZE,
+            safe_page * PERSON_SET_APPLY_PAGE_SIZE,
+        )
+        return cls(review_view, sets, page=safe_page, total=total)
+
+    def content(self) -> str:
+        if self.total <= 0:
+            return "人物セットがまだ登録されていません。"
+        start = self.page * PERSON_SET_APPLY_PAGE_SIZE + 1
+        end = min(self.total, start + PERSON_SET_APPLY_PAGE_SIZE - 1)
+        pages = max(1, (self.total + PERSON_SET_APPLY_PAGE_SIZE - 1) // PERSON_SET_APPLY_PAGE_SIZE)
+        return (
+            "使用する人物セットを選んでください。\n"
+            f"表示 **{start}〜{end}/{self.total}件**（**{self.page + 1}/{pages}ページ**）"
+        )
+
+    @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        view = await PersonSetApplyView.create(self.review_view, self.page - 1)
+        await interaction.edit_original_response(content=view.content(), view=view)
+
+    @discord.ui.button(label="次へ", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        view = await PersonSetApplyView.create(self.review_view, self.page + 1)
+        await interaction.edit_original_response(content=view.content(), view=view)
 
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
@@ -1447,11 +1503,19 @@ class PersonReviewView(discord.ui.View):
 
     @discord.ui.button(label="人物セット", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
     async def use_person_set(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
-        sets=await asyncio.to_thread(load_person_sets,25)
-        if not sets:
-            await interaction.followup.send("人物セットがまだ登録されていません。",ephemeral=True);return
-        await interaction.followup.send("使用する人物セットを選んでください。",view=PersonSetApplyView(self,sets),ephemeral=True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = await PersonSetApplyView.create(self, 0)
+        if view.total <= 0:
+            await interaction.followup.send(
+                "人物セットがまだ登録されていません。",
+                ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            view.content(),
+            view=view,
+            ephemeral=True,
+        )
 
 
 async def send_person_review(
