@@ -1243,6 +1243,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
 
         completed = 0
         review = 0
+        waiting_person_review = 0
         failed_count = 0
 
         for item in targets:
@@ -1255,6 +1256,8 @@ def register_photo_commands(bot: commands.Bot) -> None:
                 completed += 1
             elif status == "review":
                 review += 1
+            elif status == "waiting_person_review":
+                waiting_person_review += 1
             else:
                 failed_count += 1
 
@@ -1263,7 +1266,7 @@ def register_photo_commands(bot: commands.Bot) -> None:
             "✅ 再解析終了\n"
             f"成功: **{success}件** / 対象 **{len(targets)}件**\n"
             f"（completed: {completed}件 / review: {review}件 / "
-            f"failed: {failed_count}件）"
+            f"人物確認待ち: {waiting_person_review}件 / failed: {failed_count}件）"
         )
 
     @bot.command(name="ai_retry_id")
