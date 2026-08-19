@@ -12,7 +12,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
 
-from photo_database import get_connection
+from photo_database import get_ai_review_gate_stats, get_connection, get_pending_analysis_images
 
 DEFAULT_AUTO_API = str(os.getenv("PHOTO_AI_AUTO_API_ENABLED", "0")).lower() in {"1", "true", "yes", "on"}
 DEFAULT_DAILY_LIMIT = max(int(os.getenv("PHOTO_AI_DAILY_IMAGE_LIMIT", "20") or 20), 0)
@@ -241,44 +241,21 @@ def finish_api_attempt(attempt_id: int, *, status: str, reason: str = "") -> Non
 
 
 def simulate_pending_api_usage(limit: int = 500) -> dict[str, Any]:
-    """未解析画像をAPIへ送らずに分類する。
-
-    キャッシュ再利用可能数と、実際にAPI送信候補になる枚数をSQLiteだけで計算する。
-    ローカル顔認識は人物確認用の別処理なので、この画像タグ解析シミュレーションには
-    含めず、誤解を避けるため0件として明示する。
-    """
+    """人物確認完了ブログだけを対象に、API送信予定をローカル分類する。"""
     init_ai_cost_control_schema()
     safe_limit = max(1, min(int(limit or 500), 5000))
     status = get_ai_cost_status()
-    with closing(get_connection()) as con:
-        rows = con.execute(
-            """
-            SELECT i.id, TRIM(COALESCE(i.image_hash,'')) AS image_hash
-            FROM photo_images i
-            JOIN photo_blogs b ON b.id=i.blog_id
-            WHERE i.download_status='completed'
-              AND i.analysis_status='pending'
-              AND (COALESCE(i.local_path,'')<>'' OR COALESCE(i.bucket_key,'')<>'')
-              AND COALESCE(b.is_hidden,0)=0
-            ORDER BY i.id ASC
-            LIMIT ?
-            """,
-            (safe_limit,),
-        ).fetchall()
-        total_pending = int(con.execute(
-            """SELECT COUNT(*) FROM photo_images i
-               JOIN photo_blogs b ON b.id=i.blog_id
-               WHERE i.download_status='completed'
-                 AND i.analysis_status='pending'
-                 AND (COALESCE(i.local_path,'')<>'' OR COALESCE(i.bucket_key,'')<>'')
-                 AND COALESCE(b.is_hidden,0)=0"""
-        ).fetchone()[0] or 0)
+    rows = get_pending_analysis_images(safe_limit)
+    gate_stats = get_ai_review_gate_stats()
+    total_pending = int(gate_stats.get('ready_pending', 0) or 0)
+    waiting_person_review = int(gate_stats.get('waiting_person_review', 0) or 0)
 
+    with closing(get_connection()) as con:
         cache_count = 0
         no_hash_count = 0
         for row in rows:
-            image_id = int(row[0])
-            image_hash = str(row[1] or '')
+            image_id = int(row['id'])
+            image_hash = str(row.get('image_hash') or '')
             if not image_hash:
                 no_hash_count += 1
                 continue
@@ -309,6 +286,8 @@ def simulate_pending_api_usage(limit: int = 500) -> dict[str, Any]:
     blocked = api_candidates - sendable_now
 
     reasons: list[str] = []
+    if waiting_person_review:
+        reasons.append(f'人物確認未完了のため待機中: {waiting_person_review}枚')
     if not int(status.get('auto_api_enabled', 0)):
         reasons.append('自動API解析がOFFです。')
     if int(status.get('is_paused', 0)):
@@ -320,6 +299,8 @@ def simulate_pending_api_usage(limit: int = 500) -> dict[str, Any]:
 
     return {
         'total_pending': total_pending,
+        'waiting_person_review': waiting_person_review,
+        'all_pending': int(gate_stats.get('total_pending', 0) or 0),
         'inspected': inspected,
         'limit': safe_limit,
         'cache_reuse': cache_count,
