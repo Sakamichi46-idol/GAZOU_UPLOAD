@@ -503,6 +503,30 @@ def run()->dict:
         '人物検索の20枚制限を廃止しブログ単位ページングにする',
     ))
 
+    photo_db_text=(ROOT/'photo_database.py').read_text(encoding='utf-8')
+    analyzer_text=(ROOT/'photo_ai_analyzer.py').read_text(encoding='utf-8')
+    cost_text=(ROOT/'ai_cost_control.py').read_text(encoding='utf-8')
+    checks.append((
+        'ai_requires_completed_person_review_blog',
+        'def get_blog_person_review_gate' in photo_db_text
+        and "gate_review.review_type = 'person_identity'" in photo_db_text
+        and "gate_review.status = 'completed'" in photo_db_text
+        and 'get_image_ai_review_gate(image_id)' in analyzer_text
+        and '"waiting_person_review"' in analyzer_text,
+        'AI解析は人物確認100%完了ブログだけ許可する',
+    ))
+    checks.append((
+        'ai_pending_queue_is_review_gated',
+        "gate_review.status = 'completed'" in photo_db_text.split('def get_pending_analysis_images',1)[1],
+        '一括AI解析キューも人物確認完了ブログだけ取得する',
+    ))
+    checks.append((
+        'ai_preview_uses_same_review_gate',
+        'get_pending_analysis_images(safe_limit)' in cost_text
+        and "waiting_person_review" in cost_text,
+        'AI解析前プレビューも実処理と同じ人物確認ゲートを使う',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
