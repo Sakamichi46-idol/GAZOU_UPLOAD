@@ -362,6 +362,9 @@ async def process_photo_blog(
                 result["analyzed"] += 1
             elif analysis_status == "review":
                 result["analysis_review"] += 1
+            elif analysis_status == "waiting_person_review":
+                # 新着保存直後は人物確認未完了が通常。失敗には数えない。
+                pass
             else:
                 result["analysis_failed"] += 1
         except Exception as error:
