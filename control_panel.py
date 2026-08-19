@@ -399,6 +399,7 @@ class BlogPersonSearchState:
         group_name: str = "",
         generation_name: str = "",
         person_name: str = "",
+        match_mode: str = "poster",
         sort_order: str = "latest",
         start_period: str = "",
         end_period: str = "",
@@ -407,6 +408,7 @@ class BlogPersonSearchState:
         self.group_name = str(group_name)
         self.generation_name = str(generation_name)
         self.person_name = str(person_name)
+        self.match_mode = "subject" if str(match_mode).lower() == "subject" else "poster"
         self.sort_order = "oldest" if sort_order == "oldest" else "latest"
         self.start_period = str(start_period)
         self.end_period = str(end_period)
@@ -534,9 +536,9 @@ class BlogPersonMemberSelect(discord.ui.Select):
         await interaction.response.edit_message(
             content=(
                 f"👤 **{state.person_name}**\n"
-                "ブログ写真の並び順・期間を選んでください。"
+                "どの条件で人物検索するか選んでください。"
             ),
-            view=BlogPersonPeriodView(state),
+            view=BlogPersonMatchModeView(state),
         )
 
 
@@ -562,6 +564,50 @@ class BlogPersonMemberView(OwnedPersonSearchView):
         await interaction.response.edit_message(
             content=f"**{self.group_name}** の期・区分を選んでください。",
             view=BlogPersonGenerationView(self.owner_id, self.group_name),
+        )
+
+
+class BlogPersonMatchModeView(OwnedPersonSearchView):
+    def __init__(self, state: BlogPersonSearchState) -> None:
+        super().__init__(state.owner_id)
+        self.state = state
+
+    @discord.ui.button(label="投稿者で探す", emoji="✍️", style=discord.ButtonStyle.primary)
+    async def poster(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.match_mode = "poster"
+        await interaction.response.edit_message(
+            content=(
+                f"👤 **{self.state.person_name}**\n"
+                "検索方法: **投稿者で探す**\n"
+                "並び順・期間を選んでください。"
+            ),
+            view=BlogPersonPeriodView(self.state),
+        )
+
+    @discord.ui.button(label="写っている人物で探す", emoji="📷", style=discord.ButtonStyle.success)
+    async def subject(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.match_mode = "subject"
+        await interaction.response.edit_message(
+            content=(
+                f"👤 **{self.state.person_name}**\n"
+                "検索方法: **写っている人物で探す**\n"
+                "並び順・期間を選んでください。"
+            ),
+            view=BlogPersonPeriodView(self.state),
+        )
+
+    @discord.ui.button(label="メンバー選択へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            content=(
+                f"**{self.state.group_name} / {self.state.generation_name}** "
+                "のメンバーを選んでください。"
+            ),
+            view=BlogPersonMemberView(
+                self.owner_id,
+                self.state.group_name,
+                self.state.generation_name,
+            ),
         )
 
 
@@ -625,6 +671,7 @@ async def _run_blog_person_search(
     await send_blog_person_search(
         interaction,
         state.person_name,
+        match_mode=state.match_mode,
         sort_order=state.sort_order,
         start_period=state.start_period,
         end_period=state.end_period,
@@ -664,18 +711,14 @@ class BlogPersonPeriodView(OwnedPersonSearchView):
         self.state.end_period = ""
         await _run_blog_person_search(interaction, self.state)
 
-    @discord.ui.button(label="メンバー選択へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="検索方法へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
             content=(
-                f"**{self.state.group_name} / {self.state.generation_name}** "
-                "のメンバーを選んでください。"
+                f"👤 **{self.state.person_name}**\n"
+                "どの条件で人物検索するか選んでください。"
             ),
-            view=BlogPersonMemberView(
-                self.owner_id,
-                self.state.group_name,
-                self.state.generation_name,
-            ),
+            view=BlogPersonMatchModeView(self.state),
         )
 
 
