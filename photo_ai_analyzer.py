@@ -30,6 +30,7 @@ from photo_database import (
     copy_ai_result,
     find_reusable_analysis_by_hash,
     get_pending_analysis_images,
+    get_image_ai_review_gate,
     get_photo_image,
     save_ai_analysis,
     save_ai_tag,
@@ -1489,6 +1490,25 @@ def analyze_photo_image_sync(
             f"画像IDが見つかりません: {image_id}"
         )
 
+    # 有料API・キャッシュ再利用を含むAI解析の前に、
+    # 画像が属するブログの人物確認が100%完了していることを必須にする。
+    review_gate = get_image_ai_review_gate(image_id)
+    if not review_gate.get("is_completed"):
+        reason = str(review_gate.get("reason") or "人物確認待ち")
+        # analysis_status は pending のまま維持し、人物確認完了後のバッチ対象に残す。
+        update_image_analysis_status(image_id, "pending", reason[:1000])
+        return {
+            "image_id": image_id,
+            "status": "waiting_person_review",
+            "api_sent": False,
+            "waiting_person_review": True,
+            "blog_id": int(review_gate.get("blog_id") or 0),
+            "review_completed": int(review_gate.get("completed") or 0),
+            "review_total": int(review_gate.get("total") or 0),
+            "review_pending": int(review_gate.get("pending") or 0),
+            "reason": reason,
+        }
+
     image_path = normalize_text(
         image.get(
             "local_path",
@@ -1746,6 +1766,7 @@ async def analyze_pending_images(
     review = 0
     failed = 0
     blocked = 0
+    waiting_person_review = 0
     cache_reused = 0
     api_sent = 0
     blocked_reasons: dict[str, int] = {}
@@ -1781,6 +1802,8 @@ async def analyze_pending_images(
             review += 1
         elif status == "blocked":
             blocked += 1
+        elif status == "waiting_person_review":
+            waiting_person_review += 1
             reason = str(result.get("reason") or "理由不明")
             blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
         else:
@@ -1797,6 +1820,7 @@ async def analyze_pending_images(
         "review": review,
         "failed": failed,
         "blocked": blocked,
+        "waiting_person_review": waiting_person_review,
         "cache_reused": cache_reused,
         "api_sent": api_sent,
         "blocked_reasons": blocked_reasons,
