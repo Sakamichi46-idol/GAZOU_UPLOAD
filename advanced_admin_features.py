@@ -154,7 +154,8 @@ class ManualAnalyzeConfirmView(discord.ui.View):
         safe_add_field(e, name="結果", value=(
             f"検出 **{result.get('found',0)}**\nAPI送信 **{result.get('api_sent',0)}**\n"
             f"キャッシュ **{result.get('cache_reused',0)}**\n完了 **{result.get('completed',0)}**\n"
-            f"確認待ち **{result.get('review',0)}**\nスキップ **{result.get('blocked',0)}**\n"
+            f"確認待ち **{result.get('review',0)}**\n人物確認待ち **{result.get('waiting_person_review',0)}**\n"
+            f"スキップ **{result.get('blocked',0)}**\n"
             f"失敗 **{result.get('failed',0)}**"
         ), inline=False)
         safe_add_field(e, name="スキップ理由", value=reason_text, inline=False)
@@ -171,7 +172,8 @@ async def send_manual_preview(interaction: discord.Interaction, limit: int) -> N
     result = await asyncio.to_thread(simulate_pending_api_usage, limit)
     e = discord.Embed(title=f"🧮 手動解析前の確認（最大{limit}件）", color=0xFEE75C)
     safe_add_field(e, name="送信予定", value=(
-        f"確認対象 **{result.get('inspected',0)}**\nキャッシュ再利用 **{result.get('cache_reuse',0)}**\n"
+        f"確認対象 **{result.get('inspected',0)}**\n人物確認待ち **{result.get('waiting_person_review',0)}**\n"
+        f"キャッシュ再利用 **{result.get('cache_reuse',0)}**\n"
         f"API送信候補 **{result.get('api_candidates',0)}**\n現在送信可能 **{result.get('api_sendable_now',0)}**"
     ), inline=False)
     safe_add_field(e, name="残り上限", value=(
