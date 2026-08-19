@@ -475,6 +475,34 @@ def run()->dict:
         'タグ検索トップの各rowをDiscordの最大5幅以内に収める',
     ))
 
+    control_panel_text=(ROOT/'control_panel.py').read_text(encoding='utf-8') if (ROOT/'control_panel.py').exists() else ''
+    combined_search_text=(ROOT/'combined_photo_search.py').read_text(encoding='utf-8') if (ROOT/'combined_photo_search.py').exists() else ''
+    checks.append((
+        'blog_person_search_supports_poster_or_subject',
+        'class BlogPersonMatchModeView' in control_panel_text
+        and 'label="投稿者で探す"' in control_panel_text
+        and 'label="写っている人物で探す"' in control_panel_text
+        and 'match_mode=state.match_mode' in control_panel_text
+        and 'match_mode: str = "poster"' in combined_search_text,
+        '人物検索で投稿者/写っている人物を選択できる',
+    ))
+    checks.append((
+        'blog_person_search_groups_by_blog',
+        'def _blog_person_grouped_results' in combined_search_text
+        and 'class GroupedBlogResultView' in combined_search_text
+        and '"images": []' in combined_search_text
+        and 'blog_id not in grouped' in combined_search_text,
+        '人物検索結果を同一ブログ単位でまとめる',
+    ))
+    grouped_part = combined_search_text.split('def _blog_person_grouped_results',1)[1].split('def _blog_group_embed',1)[0] if 'def _blog_person_grouped_results' in combined_search_text else ''
+    checks.append((
+        'blog_person_search_no_twenty_image_limit',
+        'LIMIT ?' not in grouped_part
+        and 'BLOG_GROUP_PAGE_SIZE = 5' in combined_search_text
+        and 'BLOG_IMAGE_BATCH_SIZE = 10' in combined_search_text,
+        '人物検索の20枚制限を廃止しブログ単位ページングにする',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
