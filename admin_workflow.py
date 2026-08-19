@@ -1525,7 +1525,7 @@ class BlogArticleView(AdminWorkflowView):
         if not ids:
             await interaction.followup.send("✅ 対象画像はありません。", ephemeral=True)
             return
-        ok = review = failed = 0
+        ok = review = failed = waiting_person_review = 0
         errors: list[str] = []
         for image_id in ids:
             try:
@@ -1535,6 +1535,8 @@ class BlogArticleView(AdminWorkflowView):
                         review += 1
                     elif result.get("status") == "completed":
                         ok += 1
+                    elif result.get("status") == "waiting_person_review":
+                        waiting_person_review += 1
                     else:
                         failed += 1
                 else:
@@ -1546,7 +1548,8 @@ class BlogArticleView(AdminWorkflowView):
                     errors.append(f"ID {image_id}: {type(error).__name__}: {error}")
         text = (
             f"✅ 処理完了\n対象 **{len(ids)}枚** / 成功 **{ok}枚** / "
-            f"確認待ち **{review}枚** / 失敗 **{failed}枚**"
+            f"AI確認待ち **{review}枚** / 人物確認待ち **{waiting_person_review}枚** / "
+            f"失敗 **{failed}枚**"
         )
         if errors:
             text += "\n" + "\n".join(errors)
