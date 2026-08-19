@@ -11,7 +11,12 @@ import aiohttp
 import discord
 
 from photo_database import get_connection, search_photo_images
-from photo_search import get_display_image_url, shorten_text
+from photo_search import (
+    build_photo_attachment_files,
+    close_discord_files,
+    get_display_image_url,
+    shorten_text,
+)
 
 API_URL = str(os.getenv('INSTAGRAM_SEARCH_API_URL', '') or '').rstrip('/')
 API_TOKEN = str(os.getenv('INSTAGRAM_SEARCH_API_TOKEN', '') or '').strip()
@@ -168,7 +173,9 @@ def _blog_person_grouped_results(
         grouped[blog_id]["images"].append({
             "id": data.get("id"),
             "image_index": int(data.get("image_index") or 0),
-            "image_url": get_display_image_url(data),
+            "image_url": data.get("image_url") or "",
+            "local_path": data.get("local_path") or "",
+            "bucket_key": data.get("bucket_key") or "",
             "people": data.get("confirmed_people") or "",
             "message_url": data.get("discord_message_url") or "",
         })
@@ -199,6 +206,45 @@ def _blog_group_embed(
     return embed
 
 
+class BlogPageSelect(discord.ui.Select):
+    def __init__(self, parent: "GroupedBlogResultView") -> None:
+        self.parent_view = parent
+        start_no = parent.page * BLOG_GROUP_PAGE_SIZE
+        options: list[discord.SelectOption] = []
+        for offset, group in enumerate(parent.page_groups):
+            title = str(group.get("title") or "ブログ")
+            date = str(group.get("date") or "日付不明")
+            count = len(group.get("images") or [])
+            options.append(
+                discord.SelectOption(
+                    label=f"{start_no + offset + 1}. {title}"[:100],
+                    value=str(start_no + offset),
+                    description=f"{date} / {count}枚"[:100],
+                )
+            )
+        super().__init__(
+            placeholder="表示するブログを選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        index = int(self.values[0])
+        detail = BlogDetailView(
+            self.parent_view.owner_id,
+            self.parent_view.groups,
+            person_name=self.parent_view.person_name,
+            match_mode=self.parent_view.match_mode,
+            sort_order=self.parent_view.sort_order,
+            start_period=self.parent_view.start_period,
+            end_period=self.parent_view.end_period,
+            index=index,
+        )
+        await interaction.response.edit_message(embed=detail.embed(), view=detail)
+
+
 class GroupedBlogResultView(discord.ui.View):
     def __init__(
         self,
@@ -222,6 +268,8 @@ class GroupedBlogResultView(discord.ui.View):
         self.end_period = end_period
         total_pages = max(1, math.ceil(len(groups) / BLOG_GROUP_PAGE_SIZE))
         self.page = max(0, min(int(page), total_pages - 1))
+        if self.page_groups:
+            self.add_item(BlogPageSelect(self))
         self.previous.disabled = self.page <= 0
         self.next.disabled = self.page >= total_pages - 1
 
@@ -266,6 +314,7 @@ class GroupedBlogResultView(discord.ui.View):
                 f"**期間:** {period_text}\n"
                 f"**合計:** {len(self.groups):,}ブログ / {total_images:,}枚\n\n"
                 + "\n\n".join(lines)
+                + "\n\n下のメニューから、表示するブログを1件選んでください。"
             ),
             color=0x57F287,
         )
@@ -273,40 +322,6 @@ class GroupedBlogResultView(discord.ui.View):
             text=f"{self.page + 1}/{total_pages}ページ ・ 1ページ最大{BLOG_GROUP_PAGE_SIZE}ブログ"
         )
         return embed
-
-    @discord.ui.button(label="このページの画像を表示", emoji="🖼️", style=discord.ButtonStyle.primary, row=0)
-    async def show_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        start_no = self.page * BLOG_GROUP_PAGE_SIZE
-        for offset, group in enumerate(self.page_groups):
-            images = list(group.get("images") or [])
-            await interaction.followup.send(
-                embed=_blog_group_embed(
-                    group,
-                    person_name=self.person_name,
-                    match_mode=self.match_mode,
-                    blog_index=start_no + offset,
-                    total_blogs=len(self.groups),
-                ),
-                ephemeral=True,
-            )
-            for batch_start in range(0, len(images), BLOG_IMAGE_BATCH_SIZE):
-                batch_embeds: list[discord.Embed] = []
-                for image in images[batch_start:batch_start + BLOG_IMAGE_BATCH_SIZE]:
-                    image_url = str(image.get("image_url") or "").strip()
-                    if not image_url:
-                        continue
-                    image_embed = discord.Embed(
-                        description=(
-                            f"画像ID `{image.get('id')}`"
-                            + (f"\n人物: {image.get('people')}" if image.get("people") else "")
-                        ),
-                        color=0x2B2D31,
-                    )
-                    image_embed.set_image(url=image_url)
-                    batch_embeds.append(image_embed)
-                if batch_embeds:
-                    await interaction.followup.send(embeds=batch_embeds, ephemeral=True)
 
     @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -327,6 +342,115 @@ class GroupedBlogResultView(discord.ui.View):
             end_period=self.end_period, page=self.page + 1,
         )
         await interaction.response.edit_message(embed=new_view.summary_embed(), view=new_view)
+
+
+class BlogDetailView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        groups: list[dict[str, Any]],
+        *,
+        person_name: str,
+        match_mode: str,
+        sort_order: str,
+        start_period: str,
+        end_period: str,
+        index: int,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.groups = groups
+        self.person_name = person_name
+        self.match_mode = match_mode
+        self.sort_order = sort_order
+        self.start_period = start_period
+        self.end_period = end_period
+        self.index = max(0, min(int(index), len(groups) - 1))
+        self.previous_blog.disabled = self.index <= 0
+        self.next_blog.disabled = self.index >= len(groups) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この検索結果は検索した本人だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+    @property
+    def group(self) -> dict[str, Any]:
+        return self.groups[self.index]
+
+    def embed(self) -> discord.Embed:
+        return _blog_group_embed(
+            self.group,
+            person_name=self.person_name,
+            match_mode=self.match_mode,
+            blog_index=self.index,
+            total_blogs=len(self.groups),
+        )
+
+    def _new(self, index: int) -> "BlogDetailView":
+        return BlogDetailView(
+            self.owner_id, self.groups,
+            person_name=self.person_name,
+            match_mode=self.match_mode,
+            sort_order=self.sort_order,
+            start_period=self.start_period,
+            end_period=self.end_period,
+            index=index,
+        )
+
+    @discord.ui.button(label="写真をまとめて表示", emoji="🖼️", style=discord.ButtonStyle.primary, row=0)
+    async def show_images(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        images = list(self.group.get("images") or [])
+        if not images:
+            await interaction.followup.send("このブログには表示できる写真がありません。", ephemeral=True)
+            return
+
+        sent = 0
+        # Discordの添付グリッドを使うため9枚ずつ。同一ブログ内では連続して送る。
+        for start in range(0, len(images), 9):
+            files = await build_photo_attachment_files(images[start:start + 9])
+            if not files:
+                continue
+            try:
+                await interaction.followup.send(files=files, ephemeral=True)
+                sent += len(files)
+            finally:
+                close_discord_files(files)
+
+        if sent == 0:
+            await interaction.followup.send(
+                "写真を取得できませんでした。保存先または画像URLを確認してください。",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="前のブログ", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous_blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = self._new(self.index - 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="次のブログ", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next_blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = self._new(self.index + 1)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="一覧へ戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_to_list(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        page = self.index // BLOG_GROUP_PAGE_SIZE
+        view = GroupedBlogResultView(
+            self.owner_id, self.groups,
+            person_name=self.person_name,
+            match_mode=self.match_mode,
+            sort_order=self.sort_order,
+            start_period=self.start_period,
+            end_period=self.end_period,
+            page=page,
+        )
+        await interaction.response.edit_message(embed=view.summary_embed(), view=view)
 
 
 async def send_blog_person_search(
