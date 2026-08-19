@@ -1583,6 +1583,123 @@ def get_photo_image(
         )
 
 
+
+def get_blog_person_review_gate(blog_id: int) -> dict[str, Any]:
+    """AI解析前に使うブログ単位の人物確認ゲートを返す。
+
+    人物確認対象は terminal 除外画像を除く全画像。
+    各画像に person_identity / completed のレビュー行がある場合のみ完了とする。
+    1枚に複数人物が確定登録されていても、画像単位レビューが completed なら1枚完了。
+    pending / skipped / キュー未作成が1枚でもあればブログ全体を未完了とする。
+    """
+    target_blog_id = int(blog_id)
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS reviewable_images,
+                SUM(CASE WHEN EXISTS (
+                    SELECT 1
+                    FROM photo_review_queue prq
+                    WHERE prq.image_id = pi.id
+                      AND prq.review_type = 'person_identity'
+                      AND prq.status = 'completed'
+                ) THEN 1 ELSE 0 END) AS completed_images
+            FROM photo_images pi
+            JOIN photo_blogs pb ON pb.id = pi.blog_id
+            WHERE pi.blog_id = ?
+              AND COALESCE(pb.is_hidden, 0) = 0
+              AND COALESCE(pi.download_status, '')
+                  NOT IN ('invalid_url', 'permanent_failed')
+            """,
+            (target_blog_id,),
+        ).fetchone()
+
+    total = int((row['reviewable_images'] if row else 0) or 0)
+    completed = int((row['completed_images'] if row else 0) or 0)
+    pending = max(0, total - completed)
+    return {
+        'blog_id': target_blog_id,
+        'total': total,
+        'completed': completed,
+        'pending': pending,
+        'is_completed': total > 0 and completed >= total,
+    }
+
+
+def get_image_ai_review_gate(image_id: int) -> dict[str, Any]:
+    """画像が属するブログの人物確認が完了しているか返す。"""
+    target_image_id = int(image_id)
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            "SELECT blog_id FROM photo_images WHERE id = ? LIMIT 1",
+            (target_image_id,),
+        ).fetchone()
+    if row is None:
+        return {
+            'image_id': target_image_id,
+            'blog_id': 0,
+            'total': 0,
+            'completed': 0,
+            'pending': 0,
+            'is_completed': False,
+            'reason': '画像が見つかりません。',
+        }
+
+    gate = get_blog_person_review_gate(int(row['blog_id']))
+    gate['image_id'] = target_image_id
+    if gate['is_completed']:
+        gate['reason'] = ''
+    else:
+        gate['reason'] = (
+            '人物確認が完了していないブログのためAI解析待機: '
+            f"{gate['completed']}/{gate['total']}枚完了 / 残り{gate['pending']}枚"
+        )
+    return gate
+
+
+def get_ai_review_gate_stats() -> dict[str, int]:
+    """AI未解析画像を人物確認完了/待機に分けて集計する。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            WITH eligible_blogs AS (
+                SELECT pb.id
+                FROM photo_blogs pb
+                JOIN photo_images pi ON pi.blog_id = pb.id
+                WHERE COALESCE(pb.is_hidden, 0) = 0
+                  AND COALESCE(pi.download_status, '')
+                      NOT IN ('invalid_url', 'permanent_failed')
+                GROUP BY pb.id
+                HAVING COUNT(*) > 0
+                   AND COUNT(*) = SUM(CASE WHEN EXISTS (
+                        SELECT 1
+                        FROM photo_review_queue prq
+                        WHERE prq.image_id = pi.id
+                          AND prq.review_type = 'person_identity'
+                          AND prq.status = 'completed'
+                   ) THEN 1 ELSE 0 END)
+            )
+            SELECT
+                COUNT(*) AS total_pending,
+                SUM(CASE WHEN i.blog_id IN (SELECT id FROM eligible_blogs)
+                         THEN 1 ELSE 0 END) AS ready_pending
+            FROM photo_images i
+            JOIN photo_blogs b ON b.id = i.blog_id
+            WHERE i.download_status = 'completed'
+              AND i.analysis_status = 'pending'
+              AND (COALESCE(i.local_path,'') <> '' OR COALESCE(i.bucket_key,'') <> '')
+              AND COALESCE(b.is_hidden, 0) = 0
+            """
+        ).fetchone()
+    total = int((row['total_pending'] if row else 0) or 0)
+    ready = int((row['ready_pending'] if row else 0) or 0)
+    return {
+        'total_pending': total,
+        'ready_pending': ready,
+        'waiting_person_review': max(0, total - ready),
+    }
+
 def get_pending_analysis_images(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -1628,6 +1745,26 @@ def get_pending_analysis_images(
 
             AND
                 (photo_images.local_path != '' OR photo_images.bucket_key != '')
+
+            AND
+                COALESCE(photo_blogs.is_hidden, 0) = 0
+
+            -- AI解析は、同じブログ内の人物確認対象画像がすべて
+            -- person_identity / completed になった後だけ許可する。
+            AND NOT EXISTS (
+                SELECT 1
+                FROM photo_images gate_image
+                WHERE gate_image.blog_id = photo_images.blog_id
+                  AND COALESCE(gate_image.download_status, '')
+                      NOT IN ('invalid_url', 'permanent_failed')
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM photo_review_queue gate_review
+                      WHERE gate_review.image_id = gate_image.id
+                        AND gate_review.review_type = 'person_identity'
+                        AND gate_review.status = 'completed'
+                  )
+            )
 
             ORDER BY
                 CASE COALESCE((SELECT mode FROM photo_ai_priority_settings WHERE id=1), 'oldest')
