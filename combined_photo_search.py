@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+from collections import OrderedDict
 import os
 from contextlib import closing
 from typing import Any
@@ -14,6 +16,8 @@ from photo_search import get_display_image_url, shorten_text
 API_URL = str(os.getenv('INSTAGRAM_SEARCH_API_URL', '') or '').rstrip('/')
 API_TOKEN = str(os.getenv('INSTAGRAM_SEARCH_API_TOKEN', '') or '').strip()
 SEARCH_LIMIT = max(1, min(int(os.getenv('COMBINED_SEARCH_LIMIT', '20')), 50))
+BLOG_GROUP_PAGE_SIZE = 5
+BLOG_IMAGE_BATCH_SIZE = 10
 
 
 def _blog_results(query: str, limit: int) -> list[dict[str, Any]]:
@@ -61,74 +65,69 @@ def _normalize_period_bounds(value: str, *, end: bool) -> str | None:
     return None
 
 
-def _blog_person_results(
+def _blog_person_grouped_results(
     person_name: str,
     *,
+    match_mode: str = "poster",
     sort_order: str = "latest",
     start_period: str = "",
     end_period: str = "",
-    limit: int = SEARCH_LIMIT,
 ) -> list[dict[str, Any]]:
+    """人物検索結果をブログ単位でまとめて返す。
+
+    poster: 選択メンバーが投稿したブログの全保存写真。
+    subject: 選択メンバーが「確認済み人物」として登録された写真のみ。
+    """
     clean_name = str(person_name or "").strip()
     if not clean_name:
         return []
 
-    where_parts = [
-        """
-        (
-            EXISTS (
-                SELECT 1
-                FROM photo_image_people pip
-                WHERE pip.image_id = photo_images.id
-                  AND pip.person_name = ?
-                  AND pip.relation_status IN ('confirmed', 'candidate')
-            )
-            OR EXISTS (
-                SELECT 1
-                FROM photo_faces pf
-                JOIN photo_face_candidates pfc ON pfc.face_id = pf.id
-                JOIN photo_people pp ON pp.id = pfc.person_id
-                WHERE pf.image_id = photo_images.id
-                  AND pp.person_name = ?
-                  AND pfc.candidate_rank = 1
-            )
-        )
-        """
-    ]
-    params: list[Any] = [clean_name, clean_name]
-
+    clean_mode = "subject" if str(match_mode).lower() == "subject" else "poster"
     start_bound = _normalize_period_bounds(start_period, end=False) if start_period else None
     end_bound = _normalize_period_bounds(end_period or start_period, end=True) if (end_period or start_period) else None
-
-    # published_at は YYYY年MM月DD日 / YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD の
-    # いずれでも年・月・日の開始位置が同じため、substrで比較用キーを作れる。
     date_key = (
         "substr(photo_blogs.published_at,1,4) || '-' || "
         "substr(photo_blogs.published_at,6,2) || '-' || "
         "substr(photo_blogs.published_at,9,2)"
     )
-
+    where_parts = [
+        "photo_images.download_status = 'completed'",
+        "(photo_images.local_path != '' OR photo_images.bucket_key != '')",
+        "COALESCE(photo_blogs.is_hidden, 0) = 0",
+    ]
+    params: list[Any] = []
+    if clean_mode == "poster":
+        where_parts.append("photo_blogs.member_name = ?")
+        params.append(clean_name)
+    else:
+        where_parts.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM photo_image_people pip
+                WHERE pip.image_id = photo_images.id
+                  AND pip.person_name = ?
+                  AND pip.relation_status = 'confirmed'
+            )
+            """
+        )
+        params.append(clean_name)
     if start_bound:
         where_parts.append(f"{date_key} >= ?")
         params.append(start_bound)
-
     if end_bound:
-        # 年月指定の終了境界が翌月1日の場合もあるので <= ではなく < に寄せるため、
-        # 12月末/年指定のような明示末日は 23:59 相当としてその日を含める。
         if end_bound.endswith("-31"):
             where_parts.append(f"{date_key} <= ?")
         else:
             where_parts.append(f"{date_key} < ?")
         params.append(end_bound)
-
     direction = "ASC" if str(sort_order).lower() == "oldest" else "DESC"
-    safe_limit = max(1, min(int(limit), 50))
-
     with closing(get_connection()) as con:
         rows = con.execute(
             f"""
             SELECT
                 photo_images.*,
+                photo_blogs.id AS blog_id,
                 photo_blogs.blog_url,
                 photo_blogs.group_name,
                 photo_blogs.member_name,
@@ -139,93 +138,229 @@ def _blog_person_results(
                     FROM photo_image_people pip
                     WHERE pip.image_id = photo_images.id
                       AND pip.relation_status = 'confirmed'
-                ), '') AS confirmed_people,
-                COALESCE((
-                    SELECT GROUP_CONCAT(person_name, '、')
-                    FROM photo_image_people pip
-                    WHERE pip.image_id = photo_images.id
-                      AND pip.relation_status = 'candidate'
-                ), '') AS candidate_people
+                ), '') AS confirmed_people
             FROM photo_images
             INNER JOIN photo_blogs
               ON photo_blogs.id = photo_images.blog_id
-            WHERE
-                photo_images.download_status = 'completed'
-                AND (photo_images.local_path != '' OR photo_images.bucket_key != '')
-                AND {" AND ".join(where_parts)}
+            WHERE {" AND ".join(where_parts)}
             ORDER BY
                 {date_key} {direction},
-                photo_images.image_index {"ASC" if direction == "ASC" else "DESC"},
-                photo_images.id {direction}
-            LIMIT ?
+                photo_blogs.id {direction},
+                photo_images.image_index ASC,
+                photo_images.id ASC
             """,
-            tuple(params + [safe_limit]),
+            tuple(params),
         ).fetchall()
-
-    normalized: list[dict[str, Any]] = []
+    grouped: OrderedDict[int, dict[str, Any]] = OrderedDict()
     for row in rows:
         data = dict(row)
-        normalized.append({
-            'source': 'blog',
-            'id': data.get('id'),
-            'image_url': get_display_image_url(data),
-            'title': data.get('title') or 'ブログ写真',
-            'author': data.get('member_name') or '不明',
-            'people': data.get('confirmed_people') or data.get('candidate_people') or '',
-            'date': data.get('published_at') or '',
-            'source_url': data.get('blog_url') or '',
-            'message_url': data.get('discord_message_url') or '',
+        blog_id = int(data.get("blog_id") or 0)
+        if blog_id not in grouped:
+            grouped[blog_id] = {
+                "blog_id": blog_id,
+                "title": data.get("title") or "ブログ",
+                "author": data.get("member_name") or "不明",
+                "group_name": data.get("group_name") or "",
+                "date": data.get("published_at") or "",
+                "source_url": data.get("blog_url") or "",
+                "images": [],
+            }
+        grouped[blog_id]["images"].append({
+            "id": data.get("id"),
+            "image_index": int(data.get("image_index") or 0),
+            "image_url": get_display_image_url(data),
+            "people": data.get("confirmed_people") or "",
+            "message_url": data.get("discord_message_url") or "",
         })
-    return normalized
+    return list(grouped.values())
+
+
+def _blog_group_embed(
+    group: dict[str, Any],
+    *,
+    person_name: str,
+    match_mode: str,
+    blog_index: int,
+    total_blogs: int,
+) -> discord.Embed:
+    mode_text = "投稿者" if match_mode == "poster" else "写っている人物"
+    embed = discord.Embed(
+        title=str(group.get("title") or "ブログ")[:256],
+        description=(
+            f"**投稿者:** {group.get('author') or '不明'}\n"
+            f"**投稿日:** {group.get('date') or '不明'}\n"
+            f"**検索:** {mode_text} = {person_name}\n"
+            f"**該当写真:** {len(group.get('images') or []):,}枚"
+        ),
+        color=0x5865F2,
+        url=(group.get("source_url") or None),
+    )
+    embed.set_footer(text=f"ブログ {blog_index + 1}/{total_blogs}")
+    return embed
+
+
+class GroupedBlogResultView(discord.ui.View):
+    def __init__(
+        self,
+        owner_id: int,
+        groups: list[dict[str, Any]],
+        *,
+        person_name: str,
+        match_mode: str,
+        sort_order: str,
+        start_period: str,
+        end_period: str,
+        page: int = 0,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.owner_id = int(owner_id)
+        self.groups = groups
+        self.person_name = person_name
+        self.match_mode = match_mode
+        self.sort_order = sort_order
+        self.start_period = start_period
+        self.end_period = end_period
+        total_pages = max(1, math.ceil(len(groups) / BLOG_GROUP_PAGE_SIZE))
+        self.page = max(0, min(int(page), total_pages - 1))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= total_pages - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この検索結果は検索した本人だけが操作できます。",
+            ephemeral=True,
+        )
+        return False
+
+    @property
+    def page_groups(self) -> list[dict[str, Any]]:
+        start = self.page * BLOG_GROUP_PAGE_SIZE
+        return self.groups[start:start + BLOG_GROUP_PAGE_SIZE]
+
+    def summary_embed(self) -> discord.Embed:
+        total_pages = max(1, math.ceil(len(self.groups) / BLOG_GROUP_PAGE_SIZE))
+        total_images = sum(len(group.get("images") or []) for group in self.groups)
+        mode_text = "投稿者で探す" if self.match_mode == "poster" else "写っている人物で探す"
+        order_text = "古い順" if self.sort_order == "oldest" else "最新順"
+        period_text = "全期間"
+        if self.start_period:
+            period_text = self.start_period
+            if self.end_period and self.end_period != self.start_period:
+                period_text += f"〜{self.end_period}"
+        start_no = self.page * BLOG_GROUP_PAGE_SIZE
+        lines = []
+        for offset, group in enumerate(self.page_groups):
+            lines.append(
+                f"**{start_no + offset + 1}. {group.get('title') or 'ブログ'}**\n"
+                f"{group.get('date') or '日付不明'} / "
+                f"{group.get('author') or '投稿者不明'} / "
+                f"{len(group.get('images') or []):,}枚"
+            )
+        embed = discord.Embed(
+            title=f"👤 {self.person_name} のブログ写真",
+            description=(
+                f"**検索方法:** {mode_text}\n"
+                f"**並び順:** {order_text}\n"
+                f"**期間:** {period_text}\n"
+                f"**合計:** {len(self.groups):,}ブログ / {total_images:,}枚\n\n"
+                + "\n\n".join(lines)
+            ),
+            color=0x57F287,
+        )
+        embed.set_footer(
+            text=f"{self.page + 1}/{total_pages}ページ ・ 1ページ最大{BLOG_GROUP_PAGE_SIZE}ブログ"
+        )
+        return embed
+
+    @discord.ui.button(label="このページの画像を表示", emoji="🖼️", style=discord.ButtonStyle.primary, row=0)
+    async def show_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        start_no = self.page * BLOG_GROUP_PAGE_SIZE
+        for offset, group in enumerate(self.page_groups):
+            images = list(group.get("images") or [])
+            await interaction.followup.send(
+                embed=_blog_group_embed(
+                    group,
+                    person_name=self.person_name,
+                    match_mode=self.match_mode,
+                    blog_index=start_no + offset,
+                    total_blogs=len(self.groups),
+                ),
+                ephemeral=True,
+            )
+            for batch_start in range(0, len(images), BLOG_IMAGE_BATCH_SIZE):
+                batch_embeds: list[discord.Embed] = []
+                for image in images[batch_start:batch_start + BLOG_IMAGE_BATCH_SIZE]:
+                    image_url = str(image.get("image_url") or "").strip()
+                    if not image_url:
+                        continue
+                    image_embed = discord.Embed(
+                        description=(
+                            f"画像ID `{image.get('id')}`"
+                            + (f"\n人物: {image.get('people')}" if image.get("people") else "")
+                        ),
+                        color=0x2B2D31,
+                    )
+                    image_embed.set_image(url=image_url)
+                    batch_embeds.append(image_embed)
+                if batch_embeds:
+                    await interaction.followup.send(embeds=batch_embeds, ephemeral=True)
+
+    @discord.ui.button(label="前へ", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        new_view = GroupedBlogResultView(
+            self.owner_id, self.groups,
+            person_name=self.person_name, match_mode=self.match_mode,
+            sort_order=self.sort_order, start_period=self.start_period,
+            end_period=self.end_period, page=self.page - 1,
+        )
+        await interaction.response.edit_message(embed=new_view.summary_embed(), view=new_view)
+
+    @discord.ui.button(label="次へ", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        new_view = GroupedBlogResultView(
+            self.owner_id, self.groups,
+            person_name=self.person_name, match_mode=self.match_mode,
+            sort_order=self.sort_order, start_period=self.start_period,
+            end_period=self.end_period, page=self.page + 1,
+        )
+        await interaction.response.edit_message(embed=new_view.summary_embed(), view=new_view)
 
 
 async def send_blog_person_search(
     interaction: discord.Interaction,
     person_name: str,
     *,
+    match_mode: str = "poster",
     sort_order: str = "latest",
     start_period: str = "",
     end_period: str = "",
 ) -> None:
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True, thinking=True)
-
-    results = await asyncio.to_thread(
-        _blog_person_results,
+    groups = await asyncio.to_thread(
+        _blog_person_grouped_results,
         person_name,
+        match_mode=match_mode,
         sort_order=sort_order,
         start_period=start_period,
         end_period=end_period,
-        limit=SEARCH_LIMIT,
     )
-
-    if not results:
-        await interaction.followup.send(
-            "該当するブログ写真が見つかりませんでした。",
-            ephemeral=True,
-        )
+    if not groups:
+        await interaction.followup.send("該当するブログ写真が見つかりませんでした。", ephemeral=True)
         return
-
-    period_text = "全期間"
-    if start_period:
-        period_text = start_period
-        if end_period and end_period != start_period:
-            period_text += f"〜{end_period}"
-
-    order_text = "古い順" if sort_order == "oldest" else "最新順"
-    query_text = f"{person_name} / {order_text} / {period_text}"
-    view = CombinedSearchView(
-        owner_id=interaction.user.id,
-        results=results,
-        query=query_text,
+    view = GroupedBlogResultView(
+        interaction.user.id,
+        groups,
+        person_name=person_name,
+        match_mode=match_mode,
+        sort_order=sort_order,
+        start_period=start_period,
+        end_period=end_period,
     )
-
-    await interaction.followup.send(
-        embed=view.embed(),
-        view=view,
-        ephemeral=True,
-    )
-
+    await interaction.followup.send(embed=view.summary_embed(), view=view, ephemeral=True)
 
 async def _instagram_results(query: str, limit: int) -> tuple[list[dict[str, Any]], str]:
     if not API_URL or not API_TOKEN:
