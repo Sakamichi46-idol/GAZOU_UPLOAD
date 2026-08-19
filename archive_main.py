@@ -1124,6 +1124,10 @@ async def archive_photos_and_analyze(
                     "analysis_review"
                 ] += 1
 
+            elif status == "waiting_person_review":
+                # 人物確認完了後にAI解析するため、失敗扱いにしない。
+                pass
+
             else:
 
                 result[
