@@ -29,6 +29,7 @@ from photo_database import (
     clear_ai_tags,
     copy_ai_result,
     find_reusable_analysis_by_hash,
+    get_connection,
     get_pending_analysis_images,
     get_image_ai_review_gate,
     get_photo_image,
