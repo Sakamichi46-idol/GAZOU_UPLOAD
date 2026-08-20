@@ -220,6 +220,16 @@ def run()->dict:
         'AI解析後のローカル顔候補更新に失敗:' in analyzer and 'summary["error"]' in analyzer,
         'ローカル顔候補生成失敗をAI解析本体から分離',
     ))
+    analyzer_db_imports = set()
+    for node in analyzer_tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module == 'photo_database':
+            analyzer_db_imports.update(alias.asname or alias.name for alias in node.names)
+    checks.append((
+        'ai_post_analysis_face_refresh_has_db_connection_import',
+        'get_connection' in analyzer_db_imports
+        and 'with get_connection() as con:' in analyzer,
+        'AI解析後のローカル顔候補更新でget_connectionを正しくimport',
+    ))
 
     diag_errors = check_face_candidate_diagnostics()
     checks.append((
