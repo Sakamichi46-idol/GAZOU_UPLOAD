@@ -279,10 +279,15 @@ class ReviewAdminView(AdminWorkflowView):
             view=BlogDashboardView(),
         )
 
-    @discord.ui.button(label="確定済みを見直す", emoji="🔍", style=discord.ButtonStyle.success)
-    async def audit_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+    @discord.ui.button(label="ブログ別の確定を見直す", emoji="📖", style=discord.ButtonStyle.success)
+    async def audit_blog_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from confirmed_identity_audit_view import send_confirmed_identity_audit
-        await send_confirmed_identity_audit(interaction)
+        await send_confirmed_identity_audit(interaction, mode="blog")
+
+    @discord.ui.button(label="顔ごとの確定を見直す", emoji="🙂", style=discord.ButtonStyle.success)
+    async def audit_face_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from confirmed_identity_audit_view import send_confirmed_identity_audit
+        await send_confirmed_identity_audit(interaction, mode="face")
 
     @discord.ui.button(label="スキップ済みを再確認", emoji="⏭️", style=discord.ButtonStyle.secondary)
     async def skipped(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
