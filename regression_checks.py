@@ -537,6 +537,50 @@ def run()->dict:
         'AI解析前プレビューも実処理と同じ人物確認ゲートを使う',
     ))
 
+    face_review_text=(ROOT/'photo_face_review_view.py').read_text(encoding='utf-8') if (ROOT/'photo_face_review_view.py').exists() else ''
+    photo_db_text=(ROOT/'photo_database.py').read_text(encoding='utf-8') if (ROOT/'photo_database.py').exists() else ''
+    admin_workflow_text=(ROOT/'admin_workflow.py').read_text(encoding='utf-8') if (ROOT/'admin_workflow.py').exists() else ''
+    checks.append((
+        'face_review_has_no_face_completion',
+        'label="顔なし"' in face_review_text
+        and 'def complete_face_review_no_face' in photo_db_text
+        and "confirmation_status = 'not_a_face'" in photo_db_text,
+        '顔ではない切り抜きを人物未登録の完了状態にできる',
+    ))
+    checks.append((
+        'face_review_is_single_continuous_card',
+        '顔確認は常に1件だけ表示' in face_review_text
+        and 'async def _advance' in face_review_text
+        and 'attachments=[file]' in face_review_text
+        and '"face_review", "1"' in admin_workflow_text,
+        '顔確認を1件ずつ表示し判定後に同じ画面で次へ進める',
+    ))
+    checks.append((
+        'face_review_supports_undo_and_correction',
+        'label="直前を取り消す"' in face_review_text
+        and 'label="確定済みを修正"' in face_review_text
+        and 'def reopen_face_review' in photo_db_text,
+        '誤登録の直前取り消しと確定済み修正ができる',
+    ))
+    checks.append((
+        'face_review_has_large_image_and_original',
+        'def _prepare_face_review_image' in face_review_text
+        and 'min_side: int = 720' in face_review_text
+        and 'label="元画像を見る"' in face_review_text,
+        '顔切り抜きを拡大し元画像も確認できる',
+    ))
+    checks.append((
+        'face_review_skipped_can_be_reopened',
+        'label="保留済み顔を再確認"' in admin_workflow_text
+        and 'def reopen_oldest_skipped_face_review' in photo_db_text,
+        '保留済み顔を再確認へ戻せる',
+    ))
+    checks.append((
+        'face_review_logger_is_defined',
+        'LOGGER = logging.getLogger(__name__)' in face_review_text,
+        '顔レビューの例外ログでLOGGER未定義にならない',
+    ))
+
     failed=[c for c in checks if not c[1]]
     return {'ok':not failed,'total':len(checks),'failed':failed,'checks':checks}
 if __name__=='__main__':
