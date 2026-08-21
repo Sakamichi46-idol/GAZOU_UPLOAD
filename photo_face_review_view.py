@@ -113,7 +113,7 @@ def build_face_review_embed(
     candidates: list[dict[str, Any]],
 ) -> discord.Embed:
     embed = discord.Embed(
-        title="👤 顔の人物確認",
+        title="🙂 顔ごとに人物を確認",
         description=("顔を1件ずつ確認します。候補・投稿者・メンバー選択から確定してください。"
                      "顔ではない切り抜きは **🚫 顔なし** を選べます。候補はローカル処理による参考値です。"),
         color=discord.Color.blue(),
@@ -158,7 +158,7 @@ def build_completed_embed(
     person_name: str,
     user: discord.abc.User,
 ) -> discord.Embed:
-    embed = discord.Embed(title="✅ 顔レビュー完了", color=discord.Color.green())
+    embed = discord.Embed(title="✅ 顔の人物確定完了", color=discord.Color.green())
     safe_add_field(embed, name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
     safe_add_field(embed, name="画像ID", value=str(review.get("image_id", "不明")), inline=True)
     safe_add_field(embed, name="確定人物", value=person_name, inline=False)
@@ -584,6 +584,8 @@ class FaceReviewFinalConfirmView(discord.ui.View):
 
     @discord.ui.button(label="この内容で確定", emoji="✅", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        # 最終確認は補助用エフェメラルなので、処理後に残さない。
+        # 元の顔確認カードは parent_view._advance() が次の1件へ更新する。
         await interaction.response.defer(ephemeral=True, thinking=True)
         self.done = True
         self.stop()
@@ -596,19 +598,26 @@ class FaceReviewFinalConfirmView(discord.ui.View):
             await self.parent_view._commit_person(
                 interaction, self.person_id, self.person_name, self.note)
         try:
-            await interaction.edit_original_response(
-                content="✅ 確定しました。顔確認画面を次の1件へ更新しました。",
-                embed=None, view=None)
+            await interaction.delete_original_response()
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-            pass
+            try:
+                await interaction.edit_original_response(content=None, embed=None, view=None)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
 
     @discord.ui.button(label="選び直す", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        # 選び直す場合も最終確認カードだけを消し、元の顔確認カードへ戻る。
         self.done = True
         self.stop()
-        await interaction.response.edit_message(
-            content="↩️ 確定しませんでした。元の顔確認画面から選び直してください。",
-            embed=None, view=None)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            try:
+                await interaction.edit_original_response(content=None, embed=None, view=None)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
 
 class FaceReviewView(discord.ui.View):
     def __init__(
@@ -667,7 +676,7 @@ class FaceReviewView(discord.ui.View):
         next_review = await _next_pending_review(exclude_face_id=completed_face_id)
         if next_review is None:
             embed = discord.Embed(
-                title="✅ 顔確認の確認待ちはありません",
+                title="✅ 顔ごとの人物確認は完了です",
                 description=(f"直前: 顔ID **{completed_face_id}** → "
                              f"**{discord.utils.escape_markdown(completed_label)}**\n"
                              "必要なら管理メニューから確定済み修正を行えます。"),
@@ -884,7 +893,7 @@ class FaceReviewView(discord.ui.View):
         embed.description = "↩️ 直前の確定を取り消しました。もう一度この顔を確認してください。\n\n" + (embed.description or "")
         await interaction.edit_original_response(embed=embed, view=view, attachments=[file])
 
-    @discord.ui.button(label="確定済みを修正", emoji="🛠️", style=discord.ButtonStyle.secondary, row=2)
+    @discord.ui.button(label="顔IDを指定して修正", emoji="🛠️", style=discord.ButtonStyle.secondary, row=2)
     async def correction_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ConfirmedFaceCorrectionModal())
 
