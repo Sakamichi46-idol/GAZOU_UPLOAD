@@ -141,7 +141,7 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
         title = "⏭️ スキップ済み写真の再確認"
         description = "以前スキップした写真です。今回、人物情報を確定してください。"
     else:
-        title = "🖼️ 写真の人物確認"
+        title = "🖼️ 写真に写る人物を確認"
         description = "写真に写っている人物を確認してください。複数人の選択にも対応しています。"
     embed = discord.Embed(
         title=title,
@@ -187,7 +187,7 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
 
 
 def build_completed_embed(review: dict[str, Any], names: list[str], reviewer: discord.abc.User) -> discord.Embed:
-    embed = discord.Embed(title="✅ 人物確認完了", description="写真に写っている人物を確定しました。", color=SUCCESS_EMBED_COLOR)
+    embed = discord.Embed(title="✅ 写真の人物確定完了", description="写真に写っている人物を確定しました。", color=SUCCESS_EMBED_COLOR)
     safe_add_field(embed, name="画像ID", value=str(review.get("image_id", 0)), inline=True)
     safe_add_field(embed, name="確定人物", value=format_people_for_users("、".join(names)) if names else "人物なし", inline=False)
     safe_add_field(embed, name="確認者", value=discord.utils.escape_markdown(normalize_text(getattr(reviewer, "display_name", reviewer.name))), inline=False)
@@ -195,7 +195,7 @@ def build_completed_embed(review: dict[str, Any], names: list[str], reviewer: di
 
 
 def build_skipped_embed(review: dict[str, Any], reviewer: discord.abc.User) -> discord.Embed:
-    embed = discord.Embed(title="⏭️ 人物確認をスキップしました", color=SKIP_EMBED_COLOR)
+    embed = discord.Embed(title="⏭️ 写真人物確認をスキップしました", color=SKIP_EMBED_COLOR)
     safe_add_field(embed, name="画像ID", value=str(review.get("image_id", 0)), inline=True)
     safe_add_field(embed, name="操作した人", value=normalize_text(getattr(reviewer, "display_name", reviewer.name)), inline=False)
     return embed
@@ -1152,7 +1152,15 @@ class FinalPersonConfirmView(discord.ui.View):
 
     @discord.ui.button(label="選び直す", emoji="↩️", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="↩️ 確定せず、元のレビュー画面に戻りました。", view=None)
+        # 最終確認は補助エフェメラルなので、選び直すときは消して元カードへ戻す。
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.delete_original_response()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            try:
+                await interaction.edit_original_response(content=None, embed=None, view=None)
+            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+                pass
         self.stop()
 
 
