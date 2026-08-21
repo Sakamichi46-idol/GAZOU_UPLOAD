@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 from typing import Any
+
+from PIL import Image
 
 import discord
 from discord.ext import commands
 from embed_safety import safe_add_field
+from photo_search import get_display_image_url
 
 from local_face_recognition import (
     FaceEngineUnavailable,
@@ -17,11 +21,16 @@ from photo_image_repair import repair_photo_image
 from sakamichi_members import SAKAMICHI_MEMBERS
 from photo_database import (
     complete_face_review,
+    complete_face_review_no_face,
+    get_face_review_by_face_id,
     get_face_candidates,
     get_pending_face_reviews,
     get_person_by_name,
+    reopen_face_review,
     skip_face_review,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _text(value: Any) -> str:
@@ -55,13 +64,58 @@ async def _load_candidates(review: dict[str, Any]) -> list[dict[str, Any]]:
     return (await asyncio.to_thread(get_face_candidates, face_id))[:5]
 
 
+def _prepare_face_review_image(data: bytes, min_side: int = 720) -> bytes:
+    """Discord確認用だけ顔切り抜きを拡大する。認識用データ自体は変更しない。"""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return data
+            scale = max(1.0, float(min_side) / float(max(width, height)))
+            if scale > 1.0:
+                image = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=94, optimize=True)
+            return output.getvalue()
+    except Exception:
+        return data
+
+
+async def _load_review_image(review: dict[str, Any]) -> tuple[bytes, str]:
+    """顔切り抜きを取得し、必要なら元画像を1度だけ修復して再試行する。"""
+    try:
+        data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
+        return _prepare_face_review_image(data), "face_review.jpg"
+    except FileNotFoundError as first_error:
+        repair_result = await repair_photo_image(int(review["image_id"]))
+        if repair_result.get("success"):
+            data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
+            return _prepare_face_review_image(data), "face_review.jpg"
+        raise FileNotFoundError(
+            f"{first_error} / repair: {repair_result.get('error') or '修復失敗'}"
+        )
+
+
+async def _next_pending_review(exclude_face_id: int = 0) -> dict[str, Any] | None:
+    rows = await asyncio.to_thread(get_pending_face_reviews, 50)
+    for row in rows:
+        if int(row.get("face_id") or 0) != int(exclude_face_id or 0):
+            return row
+    return None
+
+
 def build_face_review_embed(
     review: dict[str, Any],
     candidates: list[dict[str, Any]],
 ) -> discord.Embed:
     embed = discord.Embed(
         title="👤 顔の人物確認",
-        description="候補・投稿者ボタン、またはメンバー選択メニューから確定してください。候補はローカル処理による参考値です。",
+        description=("顔を1件ずつ確認します。候補・投稿者・メンバー選択から確定してください。"
+                     "顔ではない切り抜きは **🚫 顔なし** を選べます。候補はローカル処理による参考値です。"),
         color=discord.Color.blue(),
     )
     safe_add_field(embed, name="顔ID", value=str(review.get("face_id", "不明")), inline=True)
@@ -95,7 +149,7 @@ def build_face_review_embed(
     if review.get("blog_url"):
         safe_add_field(embed, name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
     embed.set_image(url="attachment://face_review.jpg")
-    embed.set_footer(text="OpenAI APIは使用しません。最終確定は必ず画像を見て行ってください。")
+    embed.set_footer(text="1件ずつ表示します。確定・顔なし・保留の後は自動で次へ進みます。OpenAI APIは使用しません。")
     return embed
 
 
@@ -128,10 +182,11 @@ class FacePersonModal(discord.ui.Modal, title="顔の人物を指定"):
             self.person_name.default = current_name[:100]
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         name = _text(self.person_name.value)
         person = await asyncio.to_thread(get_person_by_name, name)
         if not person:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ 人物マスターに **{discord.utils.escape_markdown(name)}** は見つかりません。名前を確認してください。",
                 ephemeral=True,
             )
@@ -378,6 +433,8 @@ class ConfirmedFaceEditView(discord.ui.View):
         person_name: str,
         note: str,
     ) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         await asyncio.to_thread(
             complete_face_review,
             int(self.review["face_id"]),
@@ -398,14 +455,9 @@ class ConfirmedFaceEditView(discord.ui.View):
 
         escaped = discord.utils.escape_markdown(self.current_person_name)
         if interaction.message is not None and self.message is not None and interaction.message.id == self.message.id:
-            await interaction.response.edit_message(embed=embed, view=self)
-        elif interaction.message is not None:
-            await interaction.response.edit_message(
-                content=f"✅ 顔ID **{self.review.get('face_id', '不明')}** の登録人物を **{escaped}** に更新しました。",
-                view=None,
-            )
+            await interaction.edit_original_response(embed=embed, view=self)
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"✅ 顔ID **{self.review.get('face_id', '不明')}** の登録人物を **{escaped}** に更新しました。",
                 ephemeral=True,
             )
@@ -445,6 +497,66 @@ class ConfirmedFaceEditView(discord.ui.View):
         await interaction.response.send_modal(FacePersonModal(self))
 
 
+class ConfirmedFaceCorrectionModal(discord.ui.Modal, title="確定済みの顔を修正"):
+    face_id_input = discord.ui.TextInput(
+        label="顔ID",
+        placeholder="例: 10541",
+        max_length=20,
+    )
+    person_name_input = discord.ui.TextInput(
+        label="新しい人物名（顔でない場合は『顔なし』）",
+        placeholder="例: 山下葉留花 / 顔なし",
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            face_id = int(_text(self.face_id_input.value))
+        except ValueError:
+            await interaction.followup.send("⚠️ 顔IDは数字で入力してください。", ephemeral=True)
+            return
+
+        review = await asyncio.to_thread(get_face_review_by_face_id, face_id)
+        if not review:
+            await interaction.followup.send(f"⚠️ 顔ID **{face_id}** は見つかりません。", ephemeral=True)
+            return
+
+        name = _text(self.person_name_input.value)
+        if name in {"顔なし", "なし", "顔ではない", "not_a_face"}:
+            await asyncio.to_thread(
+                complete_face_review_no_face,
+                face_id,
+                _reviewer(interaction.user),
+                "確定済み修正: 顔なし",
+            )
+            await interaction.followup.send(
+                f"✅ 顔ID **{face_id}** を **顔なし** に修正しました。",
+                ephemeral=True,
+            )
+            return
+
+        person = await asyncio.to_thread(get_person_by_name, name)
+        if not person:
+            await interaction.followup.send(
+                f"⚠️ 人物マスターに **{discord.utils.escape_markdown(name)}** は見つかりません。",
+                ephemeral=True,
+            )
+            return
+
+        await asyncio.to_thread(
+            complete_face_review,
+            face_id,
+            int(person["id"]),
+            _reviewer(interaction.user),
+            "確定済み修正モーダル",
+        )
+        await interaction.followup.send(
+            f"✅ 顔ID **{face_id}** を **{discord.utils.escape_markdown(_text(person['person_name']))}** に修正しました。",
+            ephemeral=True,
+        )
+
+
 class FaceReviewView(discord.ui.View):
     def __init__(
         self,
@@ -452,6 +564,8 @@ class FaceReviewView(discord.ui.View):
         candidates: list[dict[str, Any]],
         *,
         owner_id: int,
+        previous_face_id: int | None = None,
+        previous_label: str = "",
     ) -> None:
         super().__init__(timeout=None)
         self.review = review
@@ -459,6 +573,9 @@ class FaceReviewView(discord.ui.View):
         self.message: discord.Message | None = None
         self.finished = False
         self.candidates = list(candidates or [])
+        self.previous_face_id = int(previous_face_id) if previous_face_id else None
+        self.previous_label = _text(previous_label)
+
         if candidates:
             self.add_item(CandidateSelect(self, candidates))
 
@@ -467,14 +584,83 @@ class FaceReviewView(discord.ui.View):
         if member_name:
             self.author_button.label = f"投稿者: {_short(member_name, 60)}"
 
+        self.undo_button.disabled = self.previous_face_id is None
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("このレビューは開始した本人だけが操作できます。", ephemeral=True)
+            await interaction.response.send_message(
+                "このレビューは開始した本人だけが操作できます。",
+                ephemeral=True,
+            )
             return False
         if self.finished:
-            await interaction.response.send_message("この顔レビューはすでに完了しています。", ephemeral=True)
+            await interaction.response.send_message(
+                "この顔レビューはすでに処理済みです。",
+                ephemeral=True,
+            )
             return False
         return True
+
+    async def _defer(self, interaction: discord.Interaction) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False, thinking=False)
+
+    async def _advance(
+        self,
+        interaction: discord.Interaction,
+        *,
+        completed_face_id: int,
+        completed_label: str,
+    ) -> None:
+        """現在のメッセージを次の顔レビューへ差し替える。確認待ちがなければ完了表示にする。"""
+        next_review = await _next_pending_review(exclude_face_id=completed_face_id)
+        if next_review is None:
+            embed = discord.Embed(
+                title="✅ 顔確認の確認待ちはありません",
+                description=(
+                    f"直前: 顔ID **{completed_face_id}** → **{discord.utils.escape_markdown(completed_label)}**\n"
+                    "必要なら管理メニューから確定済み修正を行えます。"
+                ),
+                color=discord.Color.green(),
+            )
+            await interaction.edit_original_response(embed=embed, view=None, attachments=[])
+            return
+
+        try:
+            candidates = await _load_candidates(next_review)
+            data, filename = await _load_review_image(next_review)
+        except Exception as error:
+            LOGGER.exception("次の顔レビュー読み込みに失敗しました face_id=%s", next_review.get("face_id"))
+            await interaction.edit_original_response(
+                embed=discord.Embed(
+                    title="⚠️ 次の顔を表示できませんでした",
+                    description=f"`{type(error).__name__}: {_short(error, 1200)}`",
+                    color=discord.Color.orange(),
+                ),
+                view=None,
+                attachments=[],
+            )
+            return
+
+        next_view = FaceReviewView(
+            next_review,
+            candidates,
+            owner_id=self.owner_id,
+            previous_face_id=completed_face_id,
+            previous_label=completed_label,
+        )
+        next_view.message = interaction.message
+        file = discord.File(io.BytesIO(data), filename=filename)
+        embed = build_face_review_embed(next_review, candidates)
+        embed.description = (
+            f"✅ 直前: 顔ID **{completed_face_id}** → **{discord.utils.escape_markdown(completed_label)}**\n\n"
+            + (embed.description or "")
+        )
+        await interaction.edit_original_response(
+            embed=embed,
+            view=next_view,
+            attachments=[file],
+        )
 
     async def complete(
         self,
@@ -483,6 +669,7 @@ class FaceReviewView(discord.ui.View):
         person_name: str,
         note: str,
     ) -> None:
+        await self._defer(interaction)
         await asyncio.to_thread(
             complete_face_review,
             int(self.review["face_id"]),
@@ -521,34 +708,31 @@ class FaceReviewView(discord.ui.View):
             )
         except Exception:
             LOGGER.exception("AI判断・監査ログの保存に失敗しました")
+
         self.finished = True
         self.stop()
-        embed = build_completed_embed(self.review, person_name, interaction.user)
-        embed.description = "人物を確定しました。必要なら、下のボタンから登録人物を再編集できます。"
-        edit_view = ConfirmedFaceEditView(
-            self.review,
-            owner_id=self.owner_id,
-            person_id=int(person_id),
-            person_name=person_name,
+        await self._advance(
+            interaction,
+            completed_face_id=int(self.review["face_id"]),
+            completed_label=person_name,
         )
-        edit_view.message = interaction.message
-        await interaction.response.edit_message(embed=embed, view=edit_view)
-
 
     async def complete_from_member_select(
         self,
         interaction: discord.Interaction,
         person_name: str,
     ) -> None:
-        """階層式セレクトメニューで選ばれた人物を確定し、元レビューも更新する。"""
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
         person = await asyncio.to_thread(get_person_by_name, person_name)
         if not person:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ 人物マスターに **{discord.utils.escape_markdown(person_name)}** が見つかりません。",
                 ephemeral=True,
             )
             return
 
+        # 元の顔レビューのメッセージに対して確定・次表示を行う。
         await asyncio.to_thread(
             complete_face_review,
             int(self.review["face_id"]),
@@ -556,70 +740,59 @@ class FaceReviewView(discord.ui.View):
             _reviewer(interaction.user),
             "階層式メンバー選択メニュー",
         )
-        # 階層式選択でも、候補採用・修正の実測履歴を必ず残す。
-        try:
-            from admin_operations import record_ai_decision, write_audit
-            top = self.candidates[0] if self.candidates else {}
-            suggested_name = _text(top.get("person_name"))
-            confidence = float(top.get("confidence") or 0)
-            if not self.candidates:
-                decision = "no_candidate"
-            elif int(top.get("person_id") or 0) == int(person["id"]):
-                decision = "accepted"
-            else:
-                decision = "corrected"
-            await asyncio.to_thread(
-                record_ai_decision, interaction.user.id,
-                int(self.review.get("image_id") or 0), int(self.review["face_id"]), decision,
-                suggested_person=suggested_name, confirmed_person=_text(person["person_name"]),
-                confidence=confidence,
-            )
-            await asyncio.to_thread(
-                write_audit, interaction.user.id, "face_person_confirm",
-                target_type="face", target_id=int(self.review["face_id"]),
-                detail=f"{suggested_name or '候補なし'} -> {_text(person['person_name'])} ({decision})",
-            )
-        except Exception:
-            pass
         self.finished = True
         self.stop()
+
         person_name_text = _text(person["person_name"])
-        embed = build_completed_embed(self.review, person_name_text, interaction.user)
-        embed.description = "人物を確定しました。必要なら、元の顔レビュー画面から登録人物を再編集できます。"
-        edit_view = ConfirmedFaceEditView(
-            self.review,
-            owner_id=self.owner_id,
-            person_id=int(person["id"]),
-            person_name=person_name_text,
-        )
-        edit_view.message = self.message
-        if self.message is not None:
-            try:
-                await self.message.edit(embed=embed, view=edit_view)
-            except discord.HTTPException:
-                pass
-        try:
-            await interaction.response.defer()
-            await interaction.delete_original_response()
-        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-            try:
-                await interaction.edit_original_response(content=None, embed=None, view=None)
-            except (discord.HTTPException, discord.NotFound, discord.Forbidden):
-                pass
-        try:
-            notice = await interaction.followup.send(
+        if self.message is None:
+            await interaction.followup.send(
                 f"✅ **{discord.utils.escape_markdown(person_name_text)}** で確定しました。",
                 ephemeral=True,
-                wait=True,
             )
-            await asyncio.sleep(2.5)
-            await notice.delete()
+            return
+
+        next_review = await _next_pending_review(exclude_face_id=int(self.review["face_id"]))
+        if next_review is None:
+            await self.message.edit(
+                embed=discord.Embed(
+                    title="✅ 顔確認の確認待ちはありません",
+                    description=f"直前: 顔ID **{self.review['face_id']}** → **{discord.utils.escape_markdown(person_name_text)}**",
+                    color=discord.Color.green(),
+                ),
+                view=None,
+                attachments=[],
+            )
+        else:
+            try:
+                candidates = await _load_candidates(next_review)
+                data, filename = await _load_review_image(next_review)
+                next_view = FaceReviewView(
+                    next_review,
+                    candidates,
+                    owner_id=self.owner_id,
+                    previous_face_id=int(self.review["face_id"]),
+                    previous_label=person_name_text,
+                )
+                next_view.message = self.message
+                file = discord.File(io.BytesIO(data), filename=filename)
+                embed = build_face_review_embed(next_review, candidates)
+                embed.description = (
+                    f"✅ 直前: 顔ID **{self.review['face_id']}** → **{discord.utils.escape_markdown(person_name_text)}**\n\n"
+                    + (embed.description or "")
+                )
+                await self.message.edit(embed=embed, view=next_view, attachments=[file])
+            except Exception:
+                LOGGER.exception("階層式メンバー選択後の次レビュー表示に失敗しました")
+
+        try:
+            await interaction.edit_original_response(content="✅ 確定しました。元の顔確認画面は次の1件へ進みました。", view=None)
         except (discord.HTTPException, discord.NotFound, discord.Forbidden):
             pass
 
     @discord.ui.button(label="投稿者で確定", emoji="📝", style=discord.ButtonStyle.primary, row=1)
     async def author_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False, thinking=False)
         member_name = _text(self.review.get("member_name"))
         person = await asyncio.to_thread(get_person_by_name, member_name)
         if not person:
@@ -628,7 +801,12 @@ class FaceReviewView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        await self.complete(interaction, int(person["id"]), _text(person["person_name"]), "ブログ投稿者ボタン")
+        await self.complete(
+            interaction,
+            int(person["id"]),
+            _text(person["person_name"]),
+            "ブログ投稿者ボタン",
+        )
 
     @discord.ui.button(label="別人物を選択", emoji="👥", style=discord.ButtonStyle.secondary, row=1)
     async def other_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -643,9 +821,28 @@ class FaceReviewView(discord.ui.View):
     async def name_input_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(FacePersonModal(self))
 
-    @discord.ui.button(label="今回は保留", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="顔なし", emoji="🚫", style=discord.ButtonStyle.danger, row=1)
+    async def no_face_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False, thinking=False)
+        await asyncio.to_thread(
+            complete_face_review_no_face,
+            int(self.review["face_id"]),
+            _reviewer(interaction.user),
+            "Discord顔レビュー: 顔なし",
+        )
+        self.finished = True
+        self.stop()
+        await self._advance(
+            interaction,
+            completed_face_id=int(self.review["face_id"]),
+            completed_label="顔なし",
+        )
+
+    @discord.ui.button(label="今回は保留", emoji="⏭️", style=discord.ButtonStyle.secondary, row=2)
     async def skip_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False, thinking=False)
         await asyncio.to_thread(
             skip_face_review,
             int(self.review["face_id"]),
@@ -654,88 +851,107 @@ class FaceReviewView(discord.ui.View):
         )
         self.finished = True
         self.stop()
-        embed = discord.Embed(title="⏭️ 顔レビューを保留しました", color=discord.Color.orange())
-        safe_add_field(embed, name="顔ID", value=str(self.review.get("face_id", "不明")), inline=True)
-        safe_add_field(embed, name="画像ID", value=str(self.review.get("image_id", "不明")), inline=True)
-        await interaction.edit_original_response(embed=embed, view=None)
+        await self._advance(
+            interaction,
+            completed_face_id=int(self.review["face_id"]),
+            completed_label="保留",
+        )
+
+    @discord.ui.button(label="元画像を見る", emoji="🖼️", style=discord.ButtonStyle.secondary, row=2)
+    async def original_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        image_url = await asyncio.to_thread(get_display_image_url, self.review)
+        embed = discord.Embed(
+            title=f"🖼️ 元画像 / 画像ID {self.review.get('image_id', '不明')}",
+            color=discord.Color.blurple(),
+        )
+        if image_url:
+            embed.set_image(url=image_url)
+        if self.review.get("blog_url"):
+            safe_add_field(
+                embed,
+                name="ブログ",
+                value=f"[元のブログを開く]({self.review['blog_url']})",
+                inline=False,
+            )
+        if not image_url:
+            embed.description = "画像URLを作成できませんでした。元ブログから確認してください。"
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="直前を取り消す", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
+    async def undo_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.previous_face_id is None:
+            await interaction.response.send_message("取り消せる直前操作はありません。", ephemeral=True)
+            return
+        await self._defer(interaction)
+        face_id = int(self.previous_face_id)
+        await asyncio.to_thread(
+            reopen_face_review,
+            face_id,
+            _reviewer(interaction.user),
+            f"直前操作を取り消し: {self.previous_label}",
+        )
+        review = await asyncio.to_thread(get_face_review_by_face_id, face_id)
+        if not review:
+            await interaction.followup.send("⚠️ 取り消した顔を再表示できませんでした。", ephemeral=True)
+            return
+        candidates = await _load_candidates(review)
+        data, filename = await _load_review_image(review)
+        view = FaceReviewView(review, candidates, owner_id=self.owner_id)
+        view.message = interaction.message
+        file = discord.File(io.BytesIO(data), filename=filename)
+        embed = build_face_review_embed(review, candidates)
+        embed.description = "↩️ 直前の確定を取り消しました。もう一度この顔を確認してください。\n\n" + (embed.description or "")
+        await interaction.edit_original_response(embed=embed, view=view, attachments=[file])
+
+    @discord.ui.button(label="確定済みを修正", emoji="🛠️", style=discord.ButtonStyle.secondary, row=2)
+    async def correction_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(ConfirmedFaceCorrectionModal())
 
     async def on_timeout(self) -> None:
-        for item in self.children:
-            item.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
+        # timeout=None のため通常は呼ばれない。将来timeoutを変更しても操作不能化しない。
+        return
 
 
 async def send_face_review_batch(ctx: commands.Context, limit: int = 1) -> int:
-    """確認待ちの顔を、切り出し画像と操作UI付きで送る。"""
-    limit = max(1, min(int(limit), 5))
-    # 取得不能な古いレビューを飛ばしても、要求件数ぶん表示できるよう多めに取得する。
-    fetch_limit = min(max(limit * 10, 20), 100)
-    reviews = await asyncio.to_thread(get_pending_face_reviews, fetch_limit)
+    """顔確認は常に1件だけ表示し、判定後に同じメッセージで次へ進む。"""
+    reviews = await asyncio.to_thread(get_pending_face_reviews, 50)
     if not reviews:
         await ctx.send("✅ 顔の確認待ちはありません。")
         return 0
 
-    sent = 0
     for review in reviews:
-        candidates = await _load_candidates(review)
         try:
-            data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
+            candidates = await _load_candidates(review)
+            data, filename = await _load_review_image(review)
         except FileNotFoundError as error:
-            # 保存情報が欠けた古い画像は、元URLまたは元記事から自動修復して一度だけ再試行する。
-            repair_result = await repair_photo_image(int(review["image_id"]))
-            if repair_result.get("success"):
-                try:
-                    data, _ = await asyncio.to_thread(get_face_crop_bytes, int(review["face_id"]))
-                    await ctx.send(
-                        f"🔧 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）の元画像を"
-                        "自動修復しました。"
-                    )
-                except Exception as retry_error:
-                    error = retry_error
-                else:
-                    error = None
-
-            if error is not None:
-                # 修復不能な古い顔データが先頭に残り続け、レビュー全体が止まらないよう保留へ移す。
-                repair_error = str(repair_result.get("error") or "修復できませんでした。")
-                await asyncio.to_thread(
-                    skip_face_review,
-                    int(review["face_id"]),
-                    "system: unavailable source image",
-                    (
-                        f"確認画像を取得できず自動修復にも失敗したため保留: "
-                        f"{type(error).__name__}: {error} / repair: {repair_error}"
-                    ),
-                )
-                await ctx.send(
-                    f"⚠️ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）は元画像の"
-                    "自動修復にも失敗したため、保留へ移しました。\n"
-                    f"`{repair_error[:1200]}`"
-                )
-                continue
+            await asyncio.to_thread(
+                skip_face_review,
+                int(review["face_id"]),
+                "system: unavailable source image",
+                f"確認画像を取得できないため保留: {type(error).__name__}: {error}",
+            )
+            continue
         except Exception as error:
+            LOGGER.exception("顔レビュー画像の作成に失敗 face_id=%s", review.get("face_id"))
             await ctx.send(
                 f"❌ 顔ID **{review['face_id']}**（画像ID **{review['image_id']}**）の確認画像を作成できませんでした: "
-                f"`{type(error).__name__}: {error}`"
+                f"`{type(error).__name__}: {_short(error, 900)}`"
             )
             continue
 
         view = FaceReviewView(review, candidates, owner_id=ctx.author.id)
-        file = discord.File(io.BytesIO(data), filename="face_review.jpg")
+        file = discord.File(io.BytesIO(data), filename=filename)
         message = await ctx.send(
             embed=build_face_review_embed(review, candidates),
             view=view,
             file=file,
         )
         view.message = message
-        sent += 1
-        if sent >= limit:
-            break
-    return sent
+        return 1
+
+    await ctx.send("⚠️ 表示可能な顔確認項目がありませんでした。取得不能な項目は保留へ移しました。")
+    return 0
 
 
 def build_fast_review_embed(
