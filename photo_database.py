@@ -1623,7 +1623,7 @@ def get_blog_person_review_gate(blog_id: int) -> dict[str, Any]:
         'total': total,
         'completed': completed,
         'pending': pending,
-        'is_completed': total > 0 and completed >= total,
+        'is_completed': total == 0 or completed >= total,
     }
 
 
@@ -5426,8 +5426,8 @@ def search_photo_images_by_person_with_candidates(person_name: str, limit: int =
 def get_blog_authors_for_admin(group_name: str = '', limit: int = 500) -> list[dict[str, Any]]:
     """投稿者ごとの記事数と人物確認完了記事数を返す。
 
-    記事内の全画像について人物確認が完了している場合のみ、その記事を
-    「完了」として数える。画像0件の記事は未完了扱いにする。
+    記事内の全画像について人物確認が完了している場合、その記事を
+    「完了」として数える。画像0件の記事は確認対象が存在しないため完了扱いにする。
     """
     group_name = str(group_name or '').strip()
     params: list[Any] = []
@@ -5462,11 +5462,11 @@ def get_blog_authors_for_admin(group_name: str = '', limit: int = 500) -> list[d
                 group_name,
                 COUNT(*) AS blog_count,
                 SUM(CASE
-                    WHEN image_count > 0 AND completed_image_count >= image_count THEN 1
+                    WHEN image_count = 0 OR completed_image_count >= image_count THEN 1
                     ELSE 0
                 END) AS completed_blog_count,
                 SUM(CASE
-                    WHEN image_count = 0 OR completed_image_count < image_count THEN 1
+                    WHEN image_count > 0 AND completed_image_count < image_count THEN 1
                     ELSE 0
                 END) AS pending_blog_count,
                 MAX(published_at) AS latest_published_at
@@ -5784,7 +5784,8 @@ def _normalize_blog_admin_rows(rows: list[Any]) -> list[dict[str, Any]]:
         item["progress_completed"] = effective_completed
         item["progress_pending"] = effective_pending
         item["progress_percent"] = max(0, min(percent, 100))
-        item["is_completed"] = effective_total > 0 and effective_completed >= effective_total
+        # 画像0件は人物確認する対象がないため、0/0=100% の完了記事として扱う。
+        item["is_completed"] = effective_total == 0 or effective_completed >= effective_total
         item["is_unprocessed"] = effective_total > 0 and effective_completed < effective_total
     return result
 
