@@ -3167,6 +3167,141 @@ def complete_face_review(
         )
 
 
+def complete_face_review_no_face(
+    face_id: int,
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> None:
+    """誤検出など、実際には顔ではない領域としてレビューを完了する。
+
+    人物は登録せず、photo_faces.confirmation_status を not_a_face にして
+    学習用の確定顔から明示的に除外する。
+    """
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            UPDATE photo_face_reviews
+            SET status = 'completed',
+                selected_person_id = NULL,
+                reviewed_by = ?,
+                review_note = ?,
+                reviewed_at = ?,
+                updated_at = ?
+            WHERE face_id = ?
+            """,
+            (reviewed_by, review_note, now, now, int(face_id)),
+        )
+        connection.execute(
+            """
+            UPDATE photo_faces
+            SET confirmed_person_id = NULL,
+                confirmation_status = 'not_a_face',
+                confirmed_by = ?,
+                confirmed_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (reviewed_by, now, now, int(face_id)),
+        )
+        connection.commit()
+
+
+def reopen_face_review(
+    face_id: int,
+    reviewed_by: str = "",
+    review_note: str = "",
+) -> None:
+    """確定・顔なし・保留済みの顔を未確認へ戻す。直前操作の取り消しにも使う。"""
+    now = utc_now_text()
+    with closing(get_connection()) as connection:
+        connection.execute(
+            """
+            UPDATE photo_face_reviews
+            SET status = 'pending',
+                selected_person_id = NULL,
+                reviewed_by = ?,
+                review_note = ?,
+                reviewed_at = '',
+                updated_at = ?
+            WHERE face_id = ?
+            """,
+            (reviewed_by, review_note, now, int(face_id)),
+        )
+        connection.execute(
+            """
+            UPDATE photo_faces
+            SET confirmed_person_id = NULL,
+                confirmation_status = 'unconfirmed',
+                confirmed_by = '',
+                confirmed_at = '',
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, int(face_id)),
+        )
+        connection.commit()
+
+
+def get_face_review_by_face_id(face_id: int) -> dict[str, Any] | None:
+    """状態を問わず、顔レビュー表示に必要な情報を1件取得する。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                photo_face_reviews.*,
+                photo_faces.image_id,
+                photo_faces.face_index,
+                photo_faces.box_x,
+                photo_faces.box_y,
+                photo_faces.box_width,
+                photo_faces.box_height,
+                photo_faces.confirmation_status,
+                photo_images.local_path,
+                photo_images.bucket_key,
+                photo_images.file_name,
+                photo_images.image_url,
+                photo_images.download_status,
+                photo_images.download_error,
+                photo_blogs.blog_url,
+                photo_blogs.group_name,
+                photo_blogs.member_name,
+                photo_blogs.title,
+                photo_blogs.published_at
+            FROM photo_face_reviews
+            JOIN photo_faces ON photo_faces.id = photo_face_reviews.face_id
+            JOIN photo_images ON photo_images.id = photo_faces.image_id
+            JOIN photo_blogs ON photo_blogs.id = photo_images.blog_id
+            WHERE photo_face_reviews.face_id = ?
+            """,
+            (int(face_id),),
+        ).fetchone()
+        return row_to_dict(row)
+
+
+def reopen_oldest_skipped_face_review(reviewed_by: str = "") -> int | None:
+    """最も古い保留済み顔を1件だけ未確認へ戻し、そのface_idを返す。"""
+    with closing(get_connection()) as connection:
+        row = connection.execute(
+            """
+            SELECT face_id
+            FROM photo_face_reviews
+            WHERE status = 'skipped'
+            ORDER BY reviewed_at ASC, id ASC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return None
+    face_id = int(row['face_id'])
+    reopen_face_review(
+        face_id,
+        reviewed_by=reviewed_by,
+        review_note='保留済みを再確認',
+    )
+    return face_id
+
+
 def skip_face_review(
     face_id: int,
     reviewed_by: str = "",
