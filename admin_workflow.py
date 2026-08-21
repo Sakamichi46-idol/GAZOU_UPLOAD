@@ -168,14 +168,14 @@ class CategoryAdminView(AdminWorkflowView):
     async def photo(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message("📷 写真管理", view=PhotoAdminView(), ephemeral=True)
 
-    @discord.ui.button(label="人物確認", emoji="✅", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="人物・顔チェック", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_message("✅ 人物確認", view=ReviewAdminView(), ephemeral=True)
+        await interaction.response.send_message("✅ 人物・顔チェック", view=ReviewAdminView(), ephemeral=True)
 
-    @discord.ui.button(label="ブログ単位解析", emoji="📖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ブログ別の解析・確認", emoji="📖", style=discord.ButtonStyle.success)
     async def blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message(
-            "📖 **ブログ単位解析**\n記事の探し方を選択してください。",
+            "📖 **ブログ別の解析・確認**\n記事の探し方を選択してください。",
             view=BlogDashboardView(),
             ephemeral=True,
         )
@@ -236,7 +236,7 @@ class PhotoAdminView(AdminWorkflowView):
     async def analyze(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ImageIdModal("ai_retry_id", "写真1枚をAI再解析"))
 
-    @discord.ui.button(label="顔認証", emoji="🙂", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="顔を検出・照合", emoji="🙂", style=discord.ButtonStyle.secondary)
     async def face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_modal(ImageIdModal("face_scan", "写真1枚を顔認証"))
 
@@ -251,7 +251,7 @@ class ReviewAdminView(AdminWorkflowView):
     def __init__(self):
         super().__init__()
 
-    @discord.ui.button(label="人物確認を開始", emoji="✅", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="写真の人物を確認", emoji="🖼️", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         count = await send_person_review_batch(
@@ -262,24 +262,29 @@ class ReviewAdminView(AdminWorkflowView):
         )
         if count:
             await interaction.followup.send(
-                "✅ 人物確認を1枚ずつ開始しました。確定・スキップすると画面が消え、自動で次へ進みます。",
+                "🖼️ 写真ごとの人物確認を開始しました。確定・スキップ後は自動で次へ進みます。",
                 ephemeral=True,
             )
 
-    @discord.ui.button(label="顔確認を開始", emoji="🙂", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="顔ごとに人物を確認", emoji="🙂", style=discord.ButtonStyle.primary)
     async def face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import invoke_existing_command
 
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
-    @discord.ui.button(label="ブログ単位人物確認", emoji="📖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ブログ別に人物を確認", emoji="📖", style=discord.ButtonStyle.success)
     async def blog_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
-            content="📖 **ブログ単位人物確認**\n記事の探し方を選択してください。",
+            content="📖 **ブログ別の人物確認**\n記事の探し方を選択してください。",
             view=BlogDashboardView(),
         )
 
-    @discord.ui.button(label="スキップ済みを表示", emoji="⏭️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="確定済みを見直す", emoji="🔍", style=discord.ButtonStyle.success)
+    async def audit_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from confirmed_identity_audit_view import send_confirmed_identity_audit
+        await send_confirmed_identity_audit(interaction)
+
+    @discord.ui.button(label="スキップ済みを再確認", emoji="⏭️", style=discord.ButtonStyle.secondary)
     async def skipped(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         count = await send_person_review_batch(
@@ -294,7 +299,7 @@ class ReviewAdminView(AdminWorkflowView):
                 ephemeral=True,
             )
 
-    @discord.ui.button(label="保留済み顔を再確認", emoji="🔁", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="保留した顔を再確認", emoji="🔁", style=discord.ButtonStyle.secondary)
     async def skipped_face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         from photo_database import reopen_oldest_skipped_face_review
@@ -312,7 +317,7 @@ class ReviewAdminView(AdminWorkflowView):
         )
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
-    @discord.ui.button(label="AI推定人物で検索", emoji="🤖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="人物名で写真を検索", emoji="🔎", style=discord.ButtonStyle.success)
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import CommandArgumentsModal
 
@@ -539,7 +544,7 @@ class ProgressBlogSelectView(AdminWorkflowView):
     @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
-            content="📖 **ブログ単位解析**\n記事の探し方を選択してください。",
+            content="📖 **ブログ別の解析・確認**\n記事の探し方を選択してください。",
             embed=None,
             view=BlogDashboardView(),
         )
@@ -1440,7 +1445,7 @@ class BlogArticleView(AdminWorkflowView):
         view = BlogPhotoBrowserView(self.blog_id, rows)
         await interaction.edit_original_response(content=view.text(), embed=None, view=view)
 
-    @discord.ui.button(label="人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="写真の人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         count = await send_blog_person_review_batch(
@@ -1452,7 +1457,7 @@ class BlogArticleView(AdminWorkflowView):
         )
         if count:
             await interaction.followup.send(
-                "✅ このブログの人物確認を1枚ずつ開始しました。確定・スキップすると画面が消え、自動で次へ進みます。",
+                "✅ このブログの写真人物確認を開始しました。確定・スキップ後は自動で次へ進みます。",
                 ephemeral=True,
             )
 
@@ -1465,11 +1470,11 @@ class BlogArticleView(AdminWorkflowView):
             return
         await interaction.edit_original_response(content=None, embed=_article_embed(blog), view=BlogArticleView(self.blog_id, browser_state=self.browser_state))
 
-    @discord.ui.button(label="未解析だけAI人物判定", emoji="🤖", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="未解析写真をAI解析", emoji="🤖", style=discord.ButtonStyle.secondary)
     async def ai_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._run(interaction, "ai", True)
 
-    @discord.ui.button(label="未処理だけ顔認証", emoji="🙂", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="未処理写真の顔を検出", emoji="🙂", style=discord.ButtonStyle.secondary)
     async def face_pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._run(interaction, "face", True)
 
@@ -1527,7 +1532,7 @@ class BlogArticleView(AdminWorkflowView):
             )
             return
         await interaction.response.edit_message(
-            content="📖 **ブログ単位解析**\n記事の探し方を選択してください。",
+            content="📖 **ブログ別の解析・確認**\n記事の探し方を選択してください。",
             embed=None,
             view=BlogDashboardView(),
         )
