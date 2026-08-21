@@ -497,7 +497,7 @@ class ProgressBlogSelect(discord.ui.Select):
                 label=title,
                 value=str(blog["id"]),
                 description=description[:100],
-                emoji="⚠️" if errors else ("✅" if percent == 100 and total > 0 else "📖"),
+                emoji="⚠️" if errors else ("✅" if percent == 100 else "📖"),
             ))
         super().__init__(placeholder="記事を選択", options=options)
 
@@ -779,7 +779,7 @@ class BlogArticleSelect(discord.ui.Select):
                 label=str(blog.get("title") or "無題")[:100],
                 value=str(blog["id"]),
                 description=description[:100],
-                emoji="⚠️" if errors else ("✅" if percent == 100 and total > 0 else "📖"),
+                emoji="⚠️" if errors else ("✅" if percent == 100 else "📖"),
             ))
         if not options:
             options = [discord.SelectOption(label="条件に一致する記事はありません", value="__none__")]
