@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import closing
-from typing import Any
+from typing import Any, Literal
 
 import discord
 
@@ -15,6 +15,7 @@ from photo_database import (
 from photo_search import build_photo_attachment_files
 
 PAGE_SIZE = 9
+AuditMode = Literal["blog", "face"]
 
 
 def _text(value: Any) -> str:
@@ -36,84 +37,90 @@ def _split_people(value: Any) -> list[str]:
     return result
 
 
-def get_confirmed_identity_audit_rows(limit: int = 500) -> list[dict[str, Any]]:
-    """写真単位・顔単位の手動確定結果を新しい順でまとめて返す。"""
+def _mode_label(mode: AuditMode) -> str:
+    return "ブログ別の人物確定" if mode == "blog" else "顔ごとの人物確定"
+
+
+def _mode_title(mode: AuditMode) -> str:
+    return "📖 ブログ別の確定人物を見直す" if mode == "blog" else "🙂 顔ごとの確定人物を見直す"
+
+
+def get_confirmed_identity_audit_rows(
+    mode: AuditMode,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """指定モードの手動確定結果だけを新しい順で返す。"""
     safe_limit = max(1, min(int(limit), 2000))
+
     with closing(get_connection()) as con:
-        image_rows = con.execute(
-            """
-            SELECT
-                'image' AS audit_kind,
-                i.id AS image_id,
-                NULL AS face_id,
-                i.image_index,
-                i.local_path,
-                i.image_url,
-                i.bucket_key,
-                b.id AS blog_id,
-                b.blog_url,
-                b.group_name,
-                b.member_name,
-                b.title,
-                b.published_at,
-                q.reviewed_at AS confirmed_at,
-                GROUP_CONCAT(p.person_name, '、') AS confirmed_name,
-                NULL AS confirmed_person_id
-            FROM photo_images i
-            JOIN photo_blogs b ON b.id=i.blog_id
-            JOIN photo_review_queue q ON q.image_id=i.id
-            LEFT JOIN photo_image_people p
-              ON p.image_id=i.id AND p.relation_status='confirmed'
-            WHERE q.review_type='person_identity'
-              AND q.status='completed'
-              AND COALESCE(b.is_hidden, 0)=0
-            GROUP BY i.id
-            """
-        ).fetchall()
+        if mode == "blog":
+            rows = con.execute(
+                """
+                SELECT
+                    'image' AS audit_kind,
+                    i.id AS image_id,
+                    NULL AS face_id,
+                    i.image_index,
+                    i.local_path,
+                    i.image_url,
+                    i.bucket_key,
+                    b.id AS blog_id,
+                    b.blog_url,
+                    b.group_name,
+                    b.member_name,
+                    b.title,
+                    b.published_at,
+                    q.reviewed_at AS confirmed_at,
+                    GROUP_CONCAT(p.person_name, '、') AS confirmed_name,
+                    NULL AS confirmed_person_id
+                FROM photo_images i
+                JOIN photo_blogs b ON b.id=i.blog_id
+                JOIN photo_review_queue q ON q.image_id=i.id
+                LEFT JOIN photo_image_people p
+                  ON p.image_id=i.id AND p.relation_status='confirmed'
+                WHERE q.review_type='person_identity'
+                  AND q.status='completed'
+                  AND COALESCE(b.is_hidden, 0)=0
+                GROUP BY i.id
+                ORDER BY COALESCE(q.reviewed_at, '') DESC, i.id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT
+                    'face' AS audit_kind,
+                    i.id AS image_id,
+                    f.id AS face_id,
+                    i.image_index,
+                    i.local_path,
+                    i.image_url,
+                    i.bucket_key,
+                    b.id AS blog_id,
+                    b.blog_url,
+                    b.group_name,
+                    b.member_name,
+                    b.title,
+                    b.published_at,
+                    f.confirmed_at AS confirmed_at,
+                    COALESCE(pp.person_name, '') AS confirmed_name,
+                    f.confirmed_person_id AS confirmed_person_id
+                FROM photo_faces f
+                JOIN photo_images i ON i.id=f.image_id
+                JOIN photo_blogs b ON b.id=i.blog_id
+                LEFT JOIN photo_people pp ON pp.id=f.confirmed_person_id
+                WHERE f.confirmed_person_id IS NOT NULL
+                  AND f.confirmation_status IN ('confirmed','auto_confirmed','manually_confirmed')
+                  AND COALESCE(b.is_hidden, 0)=0
+                ORDER BY COALESCE(f.confirmed_at, '') DESC, f.id DESC
+                LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
 
-        face_rows = con.execute(
-            """
-            SELECT
-                'face' AS audit_kind,
-                i.id AS image_id,
-                f.id AS face_id,
-                i.image_index,
-                i.local_path,
-                i.image_url,
-                i.bucket_key,
-                b.id AS blog_id,
-                b.blog_url,
-                b.group_name,
-                b.member_name,
-                b.title,
-                b.published_at,
-                f.confirmed_at AS confirmed_at,
-                COALESCE(pp.person_name, '') AS confirmed_name,
-                f.confirmed_person_id AS confirmed_person_id
-            FROM photo_faces f
-            JOIN photo_images i ON i.id=f.image_id
-            JOIN photo_blogs b ON b.id=i.blog_id
-            LEFT JOIN photo_people pp ON pp.id=f.confirmed_person_id
-            WHERE f.confirmed_person_id IS NOT NULL
-              AND f.confirmation_status IN ('confirmed','auto_confirmed','manually_confirmed')
-              AND COALESCE(b.is_hidden, 0)=0
-            """
-        ).fetchall()
-
-    rows = [dict(row) for row in image_rows] + [dict(row) for row in face_rows]
-    rows.sort(
-        key=lambda row: (
-            _text(row.get("confirmed_at")),
-            int(row.get("image_id") or 0),
-            int(row.get("face_id") or 0),
-        ),
-        reverse=True,
-    )
-    return rows[:safe_limit]
-
-
-def _kind_label(row: dict[str, Any]) -> str:
-    return "写真単位" if row.get("audit_kind") == "image" else "顔単位"
+    return [dict(row) for row in rows]
 
 
 def _name_label(row: dict[str, Any]) -> str:
@@ -123,37 +130,58 @@ def _name_label(row: dict[str, Any]) -> str:
     return name or "不明"
 
 
-def _page_text(rows: list[dict[str, Any]], page: int) -> str:
+def _page_text(rows: list[dict[str, Any]], page: int, mode: AuditMode) -> str:
     total_pages = max(1, (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE)
     start = page * PAGE_SIZE
     current = rows[start : start + PAGE_SIZE]
-    lines = [
-        "🔍 **確定済み人物の見直し**",
-        "写真単位の人物確定と、顔単位の人物確定をまとめて再確認できます。",
-        "下の画像は一覧の番号と同じ順番です。修正したい項目を選択してください。",
-        "",
-    ]
+
+    if mode == "blog":
+        guide = (
+            "ブログ別の人物確認で確定した内容だけを表示しています。\n"
+            "画像と確定名を見比べ、修正したい項目を選んでください。"
+        )
+    else:
+        guide = (
+            "顔ごとの人物確認で確定した内容だけを表示しています。\n"
+            "画像と確定名を見比べ、修正したい顔を選んでください。"
+        )
+
+    lines = [_mode_title(mode), guide, ""]
     for index, row in enumerate(current, 1):
-        source = _kind_label(row)
         name = discord.utils.escape_markdown(_name_label(row))
         image_id = int(row.get("image_id") or 0)
-        face_id = int(row.get("face_id") or 0)
-        extra = f" / 顔ID {face_id}" if face_id else ""
-        lines.append(f"**{index}. [{source}] {name}** — 写真ID {image_id}{extra}")
+        if mode == "face":
+            face_id = int(row.get("face_id") or 0)
+            lines.append(f"**{index}. {name}** — 写真ID {image_id} / 顔ID {face_id}")
+        else:
+            blog_title = discord.utils.escape_markdown(_text(row.get("title")) or "無題")
+            lines.append(f"**{index}. {name}** — 写真ID {image_id} / {blog_title}")
+
     lines.append("")
     lines.append(f"ページ **{page + 1}/{total_pages}** / 全 **{len(rows)}件**")
     return "\n".join(lines)
 
 
 class AuditNameModal(discord.ui.Modal):
-    def __init__(self, parent: "ConfirmedIdentityAuditView", row: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        parent: "ConfirmedIdentityAuditView",
+        row: dict[str, Any],
+    ) -> None:
         self.parent_view = parent
         self.row = row
-        is_face = row.get("audit_kind") == "face"
-        super().__init__(title="顔の確定人物を修正" if is_face else "写真の確定人物を修正", timeout=300)
+        is_face = parent.mode == "face"
+        super().__init__(
+            title="顔の確定人物を修正" if is_face else "ブログ写真の確定人物を修正",
+            timeout=300,
+        )
         self.people = discord.ui.TextInput(
             label="人物名" if is_face else "人物名（複数は「、」区切り）",
-            placeholder="例: 岩本蓮加" if is_face else "例: 岩本蓮加、与田祐希（空欄なら人物なし）",
+            placeholder=(
+                "例: 岩本蓮加"
+                if is_face
+                else "例: 岩本蓮加、与田祐希（空欄なら人物なし）"
+            ),
             default=_text(row.get("confirmed_name"))[:4000],
             required=is_face,
             max_length=4000,
@@ -163,7 +191,8 @@ class AuditNameModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         reviewer = _reviewer(interaction.user)
-        if self.row.get("audit_kind") == "face":
+
+        if self.parent_view.mode == "face":
             name = _text(self.people.value)
             person = await asyncio.to_thread(get_person_by_name, name)
             if not person:
@@ -177,7 +206,7 @@ class AuditNameModal(discord.ui.Modal):
                 int(self.row["face_id"]),
                 int(person["id"]),
                 reviewer,
-                "確定済み一覧から再確認・修正",
+                "顔ごとの確定済み一覧から再確認・修正",
             )
         else:
             names = _split_people(self.people.value)
@@ -186,12 +215,12 @@ class AuditNameModal(discord.ui.Modal):
                 int(self.row["image_id"]),
                 names,
                 confirmed_by=reviewer,
-                note="確定済み一覧から再確認・修正",
+                note="ブログ別の確定済み一覧から再確認・修正",
             )
 
         await self.parent_view.reload()
         await interaction.followup.send(
-            "✅ 確定内容を修正しました。一覧も最新状態へ更新します。",
+            "✅ 確定内容を修正しました。元の一覧も最新状態へ更新します。",
             ephemeral=True,
         )
         try:
@@ -205,22 +234,36 @@ class AuditItemSelect(discord.ui.Select):
         self.parent_view = parent
         current = parent.current_rows()
         options: list[discord.SelectOption] = []
+
         for index, row in enumerate(current, 1):
-            label = f"{index}. {_kind_label(row)} / {_name_label(row)}"
-            detail = f"写真ID {int(row.get('image_id') or 0)}"
-            if row.get("face_id"):
-                detail += f" / 顔ID {int(row.get('face_id') or 0)}"
+            name = _name_label(row)
+            if parent.mode == "face":
+                detail = (
+                    f"写真ID {int(row.get('image_id') or 0)} / "
+                    f"顔ID {int(row.get('face_id') or 0)}"
+                )
+            else:
+                detail = (
+                    f"写真ID {int(row.get('image_id') or 0)} / "
+                    f"{_text(row.get('title')) or '無題'}"
+                )
             options.append(
                 discord.SelectOption(
-                    label=label[:100],
+                    label=f"{index}. {name}"[:100],
                     description=detail[:100],
                     value=str(index - 1),
                 )
             )
+
         if not options:
             options.append(discord.SelectOption(label="確定済みデータなし", value="none"))
+
         super().__init__(
-            placeholder="見直す項目を選択",
+            placeholder=(
+                "見直す顔を選択"
+                if parent.mode == "face"
+                else "見直すブログ写真を選択"
+            ),
             options=options,
             min_values=1,
             max_values=1,
@@ -232,25 +275,34 @@ class AuditItemSelect(discord.ui.Select):
         if self.values[0] == "none":
             await interaction.response.send_message("確定済みデータはありません。", ephemeral=True)
             return
+
         index = int(self.values[0])
         current = self.parent_view.current_rows()
         if index < 0 or index >= len(current):
             await interaction.response.send_message("対象を再取得してください。", ephemeral=True)
             return
+
         row = current[index]
-        self.parent_view.selected_row = row
         embed = discord.Embed(
-            title="🔎 確定内容の詳細",
+            title=(
+                "🙂 顔ごとの確定内容"
+                if self.parent_view.mode == "face"
+                else "📖 ブログ別の確定内容"
+            ),
             description=(
-                f"判定元: **{_kind_label(row)}**\n"
                 f"確定人物: **{discord.utils.escape_markdown(_name_label(row))}**\n"
                 f"写真ID: **{int(row.get('image_id') or 0)}**"
-                + (f" / 顔ID: **{int(row.get('face_id') or 0)}**" if row.get("face_id") else "")
+                + (
+                    f" / 顔ID: **{int(row.get('face_id') or 0)}**"
+                    if self.parent_view.mode == "face"
+                    else ""
+                )
             ),
             color=discord.Color.blurple(),
         )
         if row.get("blog_url"):
             embed.add_field(name="ブログ", value=f"[元記事を開く]({row['blog_url']})", inline=False)
+
         await interaction.response.send_message(
             embed=embed,
             view=AuditSelectedItemView(self.parent_view, row),
@@ -267,13 +319,17 @@ class AuditSelectedItemView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.parent_view.owner_id:
             return True
-        await interaction.response.send_message("この見直し画面は開いた管理者だけが操作できます。", ephemeral=True)
+        await interaction.response.send_message(
+            "この見直し画面は開いた管理者だけが操作できます。",
+            ephemeral=True,
+        )
         return False
 
-    @discord.ui.button(label="この確定内容でOK", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="この確定でOK", emoji="✅", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         reviewer = _reviewer(interaction.user)
-        if self.row.get("audit_kind") == "face":
+
+        if self.parent_view.mode == "face":
             person_id = int(self.row.get("confirmed_person_id") or 0)
             if person_id <= 0:
                 await interaction.response.send_message("確定人物IDを取得できません。", ephemeral=True)
@@ -283,7 +339,7 @@ class AuditSelectedItemView(discord.ui.View):
                 int(self.row["face_id"]),
                 person_id,
                 reviewer,
-                "確定済み一覧で再確認: 内容OK",
+                "顔ごとの確定済み一覧で再確認: 内容OK",
             )
         else:
             await asyncio.to_thread(
@@ -291,10 +347,11 @@ class AuditSelectedItemView(discord.ui.View):
                 int(self.row["image_id"]),
                 _split_people(self.row.get("confirmed_name")),
                 confirmed_by=reviewer,
-                note="確定済み一覧で再確認: 内容OK",
+                note="ブログ別の確定済み一覧で再確認: 内容OK",
             )
+
         await interaction.response.edit_message(
-            content="✅ この確定内容を再確認済みとして記録しました。",
+            content="✅ この確定内容は正しいものとして再確認しました。",
             embed=None,
             view=None,
         )
@@ -305,13 +362,19 @@ class AuditSelectedItemView(discord.ui.View):
 
 
 class ConfirmedIdentityAuditView(discord.ui.View):
-    def __init__(self, owner_id: int, rows: list[dict[str, Any]], page: int = 0) -> None:
+    def __init__(
+        self,
+        owner_id: int,
+        rows: list[dict[str, Any]],
+        mode: AuditMode,
+        page: int = 0,
+    ) -> None:
         super().__init__(timeout=900)
         self.owner_id = int(owner_id)
         self.rows = rows
+        self.mode = mode
         self.page = max(0, int(page))
         self.message: discord.Message | None = None
-        self.selected_row: dict[str, Any] | None = None
         self._rebuild_items()
 
     def current_rows(self) -> list[dict[str, Any]]:
@@ -321,6 +384,7 @@ class ConfirmedIdentityAuditView(discord.ui.View):
     def _rebuild_items(self) -> None:
         self.clear_items()
         self.add_item(AuditItemSelect(self))
+
         prev = discord.ui.Button(label="前の9件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
         nxt = discord.ui.Button(label="次の9件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
         refresh = discord.ui.Button(label="一覧を更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
@@ -340,7 +404,6 @@ class ConfirmedIdentityAuditView(discord.ui.View):
         async def refresh_cb(interaction: discord.Interaction) -> None:
             await interaction.response.defer(ephemeral=True, thinking=True)
             await self.reload()
-            self._rebuild_items()
             await self.refresh_message()
 
         prev.callback = prev_cb
@@ -353,18 +416,23 @@ class ConfirmedIdentityAuditView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id == self.owner_id:
             return True
-        await interaction.response.send_message("この一覧は開いた管理者だけが操作できます。", ephemeral=True)
+        await interaction.response.send_message(
+            "この一覧は開いた管理者だけが操作できます。",
+            ephemeral=True,
+        )
         return False
 
     async def reload(self) -> None:
-        self.rows = await asyncio.to_thread(get_confirmed_identity_audit_rows, 500)
+        self.rows = await asyncio.to_thread(
+            get_confirmed_identity_audit_rows,
+            self.mode,
+            500,
+        )
         max_page = max(0, (len(self.rows) - 1) // PAGE_SIZE)
         self.page = min(self.page, max_page)
         self._rebuild_items()
 
     async def _attachments(self) -> list[discord.File]:
-        # 同じ写真が「写真単位」と「顔単位」の両方に並ぶ場合でも、
-        # Discord添付ファイル名が重複しないよう表示順の一時IDを使う。
         prepared: list[dict[str, Any]] = []
         for index, row in enumerate(self.current_rows(), 1):
             item = dict(row)
@@ -376,7 +444,7 @@ class ConfirmedIdentityAuditView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         files = await self._attachments()
         await interaction.edit_original_response(
-            content=_page_text(self.rows, self.page),
+            content=_page_text(self.rows, self.page, self.mode),
             attachments=files,
             view=self,
         )
@@ -386,23 +454,34 @@ class ConfirmedIdentityAuditView(discord.ui.View):
             return
         files = await self._attachments()
         await self.message.edit(
-            content=_page_text(self.rows, self.page),
+            content=_page_text(self.rows, self.page, self.mode),
             attachments=files,
             view=self,
         )
 
 
-async def send_confirmed_identity_audit(interaction: discord.Interaction) -> None:
+async def send_confirmed_identity_audit(
+    interaction: discord.Interaction,
+    mode: AuditMode,
+) -> None:
+    if mode not in ("blog", "face"):
+        raise ValueError(f"unknown audit mode: {mode}")
+
     if not interaction.response.is_done():
         await interaction.response.defer(ephemeral=True, thinking=True)
-    rows = await asyncio.to_thread(get_confirmed_identity_audit_rows, 500)
+
+    rows = await asyncio.to_thread(get_confirmed_identity_audit_rows, mode, 500)
     if not rows:
-        await interaction.followup.send("✅ まだ見直せる確定済み人物データはありません。", ephemeral=True)
+        await interaction.followup.send(
+            f"✅ {_mode_label(mode)}には、まだ見直せる確定済みデータがありません。",
+            ephemeral=True,
+        )
         return
-    view = ConfirmedIdentityAuditView(interaction.user.id, rows)
+
+    view = ConfirmedIdentityAuditView(interaction.user.id, rows, mode)
     files = await view._attachments()
     message = await interaction.followup.send(
-        content=_page_text(rows, 0),
+        content=_page_text(rows, 0, mode),
         files=files,
         view=view,
         ephemeral=True,
