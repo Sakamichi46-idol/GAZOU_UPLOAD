@@ -270,7 +270,7 @@ class ReviewAdminView(AdminWorkflowView):
     async def face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import invoke_existing_command
 
-        await invoke_existing_command(interaction, "face_review", "5", admin_required=True)
+        await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
     @discord.ui.button(label="ブログ単位人物確認", emoji="📖", style=discord.ButtonStyle.success)
     async def blog_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -293,6 +293,24 @@ class ReviewAdminView(AdminWorkflowView):
                 "⏭️ スキップ済み写真を1枚ずつ表示します。人物設定が終わると自動で次へ進みます。",
                 ephemeral=True,
             )
+
+    @discord.ui.button(label="保留済み顔を再確認", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def skipped_face(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        from photo_database import reopen_oldest_skipped_face_review
+        face_id = await asyncio.to_thread(
+            reopen_oldest_skipped_face_review,
+            f"{interaction.user.display_name} ({interaction.user.id})",
+        )
+        if face_id is None:
+            await interaction.followup.send("✅ 保留済みの顔はありません。", ephemeral=True)
+            return
+        from control_panel import invoke_existing_command
+        await interaction.followup.send(
+            f"🔁 顔ID **{face_id}** を確認待ちへ戻しました。続けて顔確認を開きます。",
+            ephemeral=True,
+        )
+        await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
     @discord.ui.button(label="AI推定人物で検索", emoji="🤖", style=discord.ButtonStyle.success)
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
