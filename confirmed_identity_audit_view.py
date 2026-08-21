@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import io
 from contextlib import closing
 from typing import Any, Literal
 
 import discord
+from PIL import Image
 
+from local_face_recognition import get_face_crop_bytes
 from photo_database import (
     complete_face_review,
     get_connection,
@@ -123,6 +126,50 @@ def get_confirmed_identity_audit_rows(
     return [dict(row) for row in rows]
 
 
+
+
+def _prepare_face_audit_image(data: bytes, min_side: int = 640) -> bytes:
+    """顔見直し一覧用に、顔切り抜きを見やすい大きさへ拡大する。"""
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return data
+            scale = max(1.0, float(min_side) / float(max(width, height)))
+            if scale > 1.0:
+                image = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=92, optimize=True)
+            return output.getvalue()
+    except Exception:
+        return data
+
+
+async def _build_face_crop_file(
+    row: dict[str, Any],
+    *,
+    position: int,
+) -> discord.File | None:
+    """顔IDの座標から対象顔だけを切り抜き、Discord添付にする。"""
+    face_id = int(row.get("face_id") or 0)
+    if face_id <= 0:
+        return None
+    try:
+        data, _ = await asyncio.to_thread(get_face_crop_bytes, face_id)
+        data = await asyncio.to_thread(_prepare_face_audit_image, data)
+        return discord.File(
+            io.BytesIO(data),
+            filename=f"face_audit_{position}_{face_id}.jpg",
+        )
+    except Exception as exc:
+        print(f"顔確定見直し用の切り抜き作成エラー: face_id={face_id} / {type(exc).__name__}: {exc}")
+        return None
+
+
 def _name_label(row: dict[str, Any]) -> str:
     name = _text(row.get("confirmed_name"))
     if row.get("audit_kind") == "image" and not name:
@@ -143,7 +190,7 @@ def _page_text(rows: list[dict[str, Any]], page: int, mode: AuditMode) -> str:
     else:
         guide = (
             "顔ごとの人物確認で確定した内容だけを表示しています。\n"
-            "画像と確定名を見比べ、修正したい顔を選んでください。"
+            "対象の顔だけを切り抜いて表示しています。確定名と見比べ、修正したい顔を選んでください。"
         )
 
     lines = [_mode_title(mode), guide, ""]
@@ -303,6 +350,18 @@ class AuditItemSelect(discord.ui.Select):
         if row.get("blog_url"):
             embed.add_field(name="ブログ", value=f"[元記事を開く]({row['blog_url']})", inline=False)
 
+        if self.parent_view.mode == "face":
+            face_file = await _build_face_crop_file(row, position=1)
+            if face_file is not None:
+                embed.set_image(url=f"attachment://{face_file.filename}")
+                await interaction.response.send_message(
+                    embed=embed,
+                    file=face_file,
+                    view=AuditSelectedItemView(self.parent_view, row),
+                    ephemeral=True,
+                )
+                return
+
         await interaction.response.send_message(
             embed=embed,
             view=AuditSelectedItemView(self.parent_view, row),
@@ -433,8 +492,23 @@ class ConfirmedIdentityAuditView(discord.ui.View):
         self._rebuild_items()
 
     async def _attachments(self) -> list[discord.File]:
+        current = self.current_rows()
+
+        # 顔ごとの見直しでは元写真ではなく、確認対象の顔だけを表示する。
+        # 複数人写真でも「どの顔の確定名か」が一覧だけで分かるようにする。
+        if self.mode == "face":
+            files: list[discord.File] = []
+            for index, row in enumerate(current, 1):
+                face_file = await _build_face_crop_file(
+                    row,
+                    position=self.page * PAGE_SIZE + index,
+                )
+                if face_file is not None:
+                    files.append(face_file)
+            return files
+
         prepared: list[dict[str, Any]] = []
-        for index, row in enumerate(self.current_rows(), 1):
+        for index, row in enumerate(current, 1):
             item = dict(row)
             item["id"] = self.page * PAGE_SIZE + index
             prepared.append(item)
