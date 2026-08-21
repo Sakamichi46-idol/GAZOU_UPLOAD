@@ -16,6 +16,7 @@ from photo_database import (
     set_confirmed_image_people,
 )
 from photo_search import build_photo_attachment_files
+from sakamichi_members import SAKAMICHI_MEMBERS
 
 PAGE_SIZE = 9
 AuditMode = Literal["blog", "face"]
@@ -209,71 +210,207 @@ def _page_text(rows: list[dict[str, Any]], page: int, mode: AuditMode) -> str:
     return "\n".join(lines)
 
 
-class AuditNameModal(discord.ui.Modal):
-    def __init__(
-        self,
-        parent: "ConfirmedIdentityAuditView",
-        row: dict[str, Any],
-    ) -> None:
+class AuditPersonSelect(discord.ui.Select):
+    def __init__(self, picker: "AuditPersonPickerView", names: list[str]) -> None:
+        self.picker = picker
+        options = [
+            discord.SelectOption(
+                label=name[:100],
+                value=name[:100],
+                default=name in picker.selected_names,
+            )
+            for name in names[:25]
+        ]
+        super().__init__(
+            placeholder=(
+                "正しい人物を1人選択"
+                if picker.parent_view.mode == "face"
+                else "写っている人物を選択（複数可）"
+            ),
+            options=options,
+            min_values=1,
+            max_values=1 if picker.parent_view.mode == "face" else max(1, len(options)),
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if self.picker.parent_view.mode == "face":
+            await self.picker.apply_face_person(interaction, self.values[0])
+            return
+
+        page_names = set(self.picker.current_names())
+        self.picker.selected_names.difference_update(page_names)
+        self.picker.selected_names.update(self.values)
+        self.picker._rebuild()
+        await interaction.response.edit_message(
+            content=self.picker.page_text(),
+            view=self.picker,
+        )
+
+
+class AuditPersonPickerView(discord.ui.View):
+    PAGE_SIZE = 25
+
+    def __init__(self, parent: "ConfirmedIdentityAuditView", row: dict[str, Any]) -> None:
+        super().__init__(timeout=600)
         self.parent_view = parent
         self.row = row
-        is_face = parent.mode == "face"
-        super().__init__(
-            title="顔の確定人物を修正" if is_face else "ブログ写真の確定人物を修正",
-            timeout=300,
+        self.page = 0
+        self.names = self._member_names()
+        self.selected_names = set(_split_people(row.get("confirmed_name")))
+        self._rebuild()
+
+    def _member_names(self) -> list[str]:
+        group = _text(self.row.get("group_name"))
+        generations = SAKAMICHI_MEMBERS.get(group, {})
+        names: list[str] = []
+        for generation_names in generations.values():
+            for name in generation_names:
+                if name not in names:
+                    names.append(name)
+
+        # DBにだけ存在する人物も選択肢から落とさない。
+        with closing(get_connection()) as con:
+            db_rows = con.execute(
+                """SELECT person_name FROM photo_people
+                   WHERE is_active=1 AND (?='' OR group_name=? OR group_name='')
+                   ORDER BY person_name""",
+                (group, group),
+            ).fetchall()
+        for db_row in db_rows:
+            name = _text(db_row["person_name"])
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def current_names(self) -> list[str]:
+        start = self.page * self.PAGE_SIZE
+        return self.names[start : start + self.PAGE_SIZE]
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        current = self.current_names()
+        if current:
+            self.add_item(AuditPersonSelect(self, current))
+
+        prev = discord.ui.Button(
+            label="前の人物", emoji="◀️",
+            style=discord.ButtonStyle.secondary, row=1,
         )
-        self.people = discord.ui.TextInput(
-            label="人物名" if is_face else "人物名（複数は「、」区切り）",
-            placeholder=(
-                "例: 岩本蓮加"
-                if is_face
-                else "例: 岩本蓮加、与田祐希（空欄なら人物なし）"
-            ),
-            default=_text(row.get("confirmed_name"))[:4000],
-            required=is_face,
-            max_length=4000,
+        nxt = discord.ui.Button(
+            label="次の人物", emoji="▶️",
+            style=discord.ButtonStyle.secondary, row=1,
         )
-        self.add_item(self.people)
+        prev.disabled = self.page <= 0
+        nxt.disabled = (self.page + 1) * self.PAGE_SIZE >= len(self.names)
+        prev.callback = self.previous_page
+        nxt.callback = self.next_page
+        self.add_item(prev)
+        self.add_item(nxt)
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        reviewer = _reviewer(interaction.user)
-
-        if self.parent_view.mode == "face":
-            name = _text(self.people.value)
-            person = await asyncio.to_thread(get_person_by_name, name)
-            if not person:
-                await interaction.followup.send(
-                    f"⚠️ 人物マスターに **{discord.utils.escape_markdown(name)}** が見つかりません。正確な名前を入力してください。",
-                    ephemeral=True,
-                )
-                return
-            await asyncio.to_thread(
-                complete_face_review,
-                int(self.row["face_id"]),
-                int(person["id"]),
-                reviewer,
-                "顔ごとの確定済み一覧から再確認・修正",
+        if self.parent_view.mode == "blog":
+            confirm = discord.ui.Button(
+                label="選択した人物で確定", emoji="✅",
+                style=discord.ButtonStyle.success, row=2,
             )
-        else:
-            names = _split_people(self.people.value)
-            await asyncio.to_thread(
-                set_confirmed_image_people,
-                int(self.row["image_id"]),
-                names,
-                confirmed_by=reviewer,
-                note="ブログ別の確定済み一覧から再確認・修正",
+            none_btn = discord.ui.Button(
+                label="人物なしに修正", emoji="🚫",
+                style=discord.ButtonStyle.danger, row=2,
             )
+            confirm.callback = self.confirm_blog_people
+            none_btn.callback = self.set_none
+            self.add_item(confirm)
+            self.add_item(none_btn)
 
-        await self.parent_view.reload()
-        await interaction.followup.send(
-            "✅ 確定内容を修正しました。元の一覧も最新状態へ更新します。",
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.parent_view.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この画面は開いた管理者だけが操作できます。",
             ephemeral=True,
         )
+        return False
+
+    def page_text(self) -> str:
+        pages = max(1, (len(self.names) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        if self.parent_view.mode == "face":
+            selected = _name_label(self.row)
+            return (
+                "👤 **顔の人物を選び直す**\n"
+                f"現在: **{discord.utils.escape_markdown(selected)}**\n"
+                f"人物一覧 **{self.page + 1}/{pages}ページ**"
+            )
+        selected = "、".join(sorted(self.selected_names)) or "人物なし"
+        return (
+            "👥 **ブログ写真の人物を選び直す**\n"
+            "複数人写っている場合は複数選択できます。ページを移動しても選択は保持されます。\n"
+            f"選択中: **{discord.utils.escape_markdown(selected)}**\n"
+            f"人物一覧 **{self.page + 1}/{pages}ページ**"
+        )
+
+    async def previous_page(self, interaction: discord.Interaction) -> None:
+        self.page = max(0, self.page - 1)
+        self._rebuild()
+        await interaction.response.edit_message(content=self.page_text(), view=self)
+
+    async def next_page(self, interaction: discord.Interaction) -> None:
+        self.page += 1
+        self._rebuild()
+        await interaction.response.edit_message(content=self.page_text(), view=self)
+
+    async def apply_face_person(self, interaction: discord.Interaction, name: str) -> None:
+        person = await asyncio.to_thread(get_person_by_name, name)
+        if not person:
+            await interaction.response.send_message(
+                "人物マスターを取得できませんでした。",
+                ephemeral=True,
+            )
+            return
+        await asyncio.to_thread(
+            complete_face_review,
+            int(self.row["face_id"]),
+            int(person["id"]),
+            _reviewer(interaction.user),
+            "顔ごとの確定済み一覧から選択修正",
+        )
+        await self.parent_view.reload()
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
         try:
             await self.parent_view.refresh_message()
         except Exception:
             pass
+        await self.parent_view.cleanup_transients()
+
+    async def confirm_blog_people(self, interaction: discord.Interaction) -> None:
+        names = sorted(self.selected_names)
+        await asyncio.to_thread(
+            set_confirmed_image_people,
+            int(self.row["image_id"]),
+            names,
+            confirmed_by=_reviewer(interaction.user),
+            note="ブログ別の確定済み一覧から選択修正",
+        )
+        await self.parent_view.reload()
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        try:
+            await self.parent_view.refresh_message()
+        except Exception:
+            pass
+        await self.parent_view.cleanup_transients()
+
+    async def set_none(self, interaction: discord.Interaction) -> None:
+        self.selected_names.clear()
+        await self.confirm_blog_people(interaction)
 
 
 class AuditItemSelect(discord.ui.Select):
@@ -360,6 +497,10 @@ class AuditItemSelect(discord.ui.Select):
                     view=AuditSelectedItemView(self.parent_view, row),
                     ephemeral=True,
                 )
+                try:
+                    self.parent_view.register_transient(await interaction.original_response())
+                except Exception:
+                    pass
                 return
 
         await interaction.response.send_message(
@@ -367,6 +508,10 @@ class AuditItemSelect(discord.ui.Select):
             view=AuditSelectedItemView(self.parent_view, row),
             ephemeral=True,
         )
+        try:
+            self.parent_view.register_transient(await interaction.original_response())
+        except Exception:
+            pass
 
 
 class AuditSelectedItemView(discord.ui.View):
@@ -409,15 +554,27 @@ class AuditSelectedItemView(discord.ui.View):
                 note="ブログ別の確定済み一覧で再確認: 内容OK",
             )
 
-        await interaction.response.edit_message(
-            content="✅ この確定内容は正しいものとして再確認しました。",
-            embed=None,
-            view=None,
-        )
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        try:
+            await interaction.message.delete()
+        except Exception:
+            pass
+        await self.parent_view.cleanup_transients()
 
-    @discord.ui.button(label="人物名を修正", emoji="✏️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="人物を選び直す", emoji="👤", style=discord.ButtonStyle.primary)
     async def edit_name(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AuditNameModal(self.parent_view, self.row))
+        picker = AuditPersonPickerView(self.parent_view, self.row)
+        await interaction.response.send_message(
+            picker.page_text(),
+            view=picker,
+            ephemeral=True,
+        )
+        try:
+            message = await interaction.original_response()
+            self.parent_view.register_transient(message)
+        except Exception:
+            pass
 
 
 class ConfirmedIdentityAuditView(discord.ui.View):
@@ -434,7 +591,22 @@ class ConfirmedIdentityAuditView(discord.ui.View):
         self.mode = mode
         self.page = max(0, int(page))
         self.message: discord.Message | None = None
+        self.transient_messages: list[discord.Message] = []
         self._rebuild_items()
+
+
+    def register_transient(self, message: discord.Message) -> None:
+        if all(getattr(x, "id", None) != getattr(message, "id", None) for x in self.transient_messages):
+            self.transient_messages.append(message)
+
+    async def cleanup_transients(self) -> None:
+        messages = self.transient_messages
+        self.transient_messages = []
+        for message in messages:
+            try:
+                await message.delete()
+            except Exception:
+                pass
 
     def current_rows(self) -> list[dict[str, Any]]:
         start = self.page * PAGE_SIZE
@@ -451,11 +623,13 @@ class ConfirmedIdentityAuditView(discord.ui.View):
         nxt.disabled = (self.page + 1) * PAGE_SIZE >= len(self.rows)
 
         async def prev_cb(interaction: discord.Interaction) -> None:
+            await self.cleanup_transients()
             self.page = max(0, self.page - 1)
             self._rebuild_items()
             await self._edit(interaction)
 
         async def next_cb(interaction: discord.Interaction) -> None:
+            await self.cleanup_transients()
             self.page += 1
             self._rebuild_items()
             await self._edit(interaction)
@@ -517,7 +691,8 @@ class ConfirmedIdentityAuditView(discord.ui.View):
     async def _edit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         files = await self._attachments()
-        await interaction.edit_original_response(
+        # ページ送りは新しいエフェメラルを増やさず、現在の一覧をその場で置き換える。
+        await interaction.message.edit(
             content=_page_text(self.rows, self.page, self.mode),
             attachments=files,
             view=self,
