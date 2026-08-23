@@ -172,7 +172,7 @@ class CategoryAdminView(AdminWorkflowView):
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message("✅ 人物・顔チェック", view=ReviewAdminView(), ephemeral=True)
 
-    @discord.ui.button(label="ブログ別の解析・確認", emoji="📖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ブログ別の解析・確認", emoji="📖", style=discord.ButtonStyle.primary)
     async def blog(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message(
             "📖 **ブログ別の解析・確認**\n記事の探し方を選択してください。",
@@ -180,27 +180,37 @@ class CategoryAdminView(AdminWorkflowView):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="タグ管理", emoji="🏷️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="タグ管理", emoji="🏷️", style=discord.ButtonStyle.primary)
     async def tags(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message("🏷️ タグ管理", view=TagAdminView(), ephemeral=True)
 
-    @discord.ui.button(label="状態・修復", emoji="🛠️", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="状態・修復", emoji="🛠️", style=discord.ButtonStyle.primary)
     async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.send_message("🛠️ 状態・修復", view=StatusAdminView(), ephemeral=True)
 
 
 class TagAdminView(AdminWorkflowView):
-    @discord.ui.button(label="タグ検索", emoji="🔎", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="タグを探す", emoji="🔎", style=discord.ButtonStyle.primary)
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import invoke_existing_command
         await invoke_existing_command(interaction, "photo_tags", admin_required=True)
 
-    @discord.ui.button(label="タグマスター", emoji="🏷️", style=discord.ButtonStyle.success)
-    async def master(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        from control_panel import invoke_existing_command
-        await invoke_existing_command(interaction, "tag_master", admin_required=True)
+    @discord.ui.button(label="未承認タグを整理", emoji="🆕", style=discord.ButtonStyle.primary)
+    async def pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from tag_master_admin import send_pending_tag_panel
+        await send_pending_tag_panel(interaction)
 
-    @discord.ui.button(label="全タグ出力", emoji="📄", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="タグを統合・修正", emoji="🧩", style=discord.ButtonStyle.secondary)
+    async def merge(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from tag_master_admin import send_tag_merge_panel
+        await send_tag_merge_panel(interaction)
+
+    @discord.ui.button(label="タグの状態を見る", emoji="📊", style=discord.ButtonStyle.secondary)
+    async def status(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from tag_master_admin import send_tag_status_panel
+        await send_tag_status_panel(interaction)
+
+    @discord.ui.button(label="全タグを出力", emoji="📄", style=discord.ButtonStyle.secondary, row=1)
     async def export(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import invoke_existing_command
         await invoke_existing_command(interaction, "export_all_tags", admin_required=True)
@@ -272,19 +282,19 @@ class ReviewAdminView(AdminWorkflowView):
 
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
-    @discord.ui.button(label="ブログ別に人物を確認", emoji="📖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ブログ別に人物を確認", emoji="📖", style=discord.ButtonStyle.primary)
     async def blog_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
             content="📖 **ブログ別の人物確認**\n記事の探し方を選択してください。",
             view=BlogDashboardView(),
         )
 
-    @discord.ui.button(label="ブログ別の確定を見直す", emoji="📖", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="ブログ別の確定を見直す", emoji="🔎", style=discord.ButtonStyle.secondary)
     async def audit_blog_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from confirmed_identity_audit_view import send_confirmed_identity_audit
         await send_confirmed_identity_audit(interaction, mode="blog")
 
-    @discord.ui.button(label="顔ごとの確定を見直す", emoji="🙂", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="顔ごとの確定を見直す", emoji="🔎", style=discord.ButtonStyle.secondary)
     async def audit_face_confirmed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from confirmed_identity_audit_view import send_confirmed_identity_audit
         await send_confirmed_identity_audit(interaction, mode="face")
@@ -322,7 +332,7 @@ class ReviewAdminView(AdminWorkflowView):
         )
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
-    @discord.ui.button(label="人物名で写真を検索", emoji="🔎", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="人物名で写真を検索", emoji="🔎", style=discord.ButtonStyle.primary)
     async def search(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import CommandArgumentsModal
 
@@ -351,7 +361,7 @@ class StatusAdminView(AdminWorkflowView):
         from control_panel import invoke_existing_command
         await invoke_existing_command(interaction, "photo_storage", admin_required=True)
 
-    @discord.ui.button(label="画像0件を修復", emoji="🛠️", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="画像0件を修復", emoji="🛠️", style=discord.ButtonStyle.danger)
     async def repair(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         from control_panel import CommandArgumentsModal
         await interaction.response.send_modal(CommandArgumentsModal(
@@ -378,7 +388,7 @@ class BlogDashboardView(AdminWorkflowView):
             view=GroupSelectView(),
         )
 
-    @discord.ui.button(label="未解析記事", emoji="🆕", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="未解析記事", emoji="🆕", style=discord.ButtonStyle.primary)
     async def unprocessed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_unprocessed_blogs_for_admin, 500)
@@ -933,7 +943,7 @@ class AuthorBlogBrowserView(AdminWorkflowView):
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._reload(interaction, page=self.page + 1)
 
-    @discord.ui.button(label="未完了のみ", emoji="🆕", style=discord.ButtonStyle.success, row=3)
+    @discord.ui.button(label="未完了のみ", emoji="🆕", style=discord.ButtonStyle.secondary, row=3)
     async def pending(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await self._reload(interaction, page=0, only_unprocessed=not self.only_unprocessed)
 
@@ -1450,7 +1460,7 @@ class BlogArticleView(AdminWorkflowView):
         view = BlogPhotoBrowserView(self.blog_id, rows)
         await interaction.edit_original_response(content=view.text(), embed=None, view=view)
 
-    @discord.ui.button(label="写真の人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="写真の人物確認を開始・続ける", emoji="✅", style=discord.ButtonStyle.primary)
     async def review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         count = await send_blog_person_review_batch(
