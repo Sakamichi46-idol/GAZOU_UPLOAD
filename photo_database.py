@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from photo_search_tags import searchable_aliases
+from sakamichi_members import member_group_generation_sort_key
 
 
 # =========================
@@ -194,6 +195,80 @@ def ensure_column(
         """
     )
 
+
+
+def normalize_person_names(person_names: list[str]) -> list[str]:
+    """人物名を重複除去し、グループ→期→名字読み順で常に同じ並びへ統一する。"""
+    unique: list[str] = []
+    for value in person_names:
+        name = str(value or "").strip()
+        if name and name not in unique:
+            unique.append(name)
+    return sorted(unique, key=member_group_generation_sort_key)
+
+
+def _normalize_existing_confirmed_people_order(connection: sqlite3.Connection) -> int:
+    """既存の複数人物確定も同じ並びへ正規化する。
+
+    photo_image_people は挿入順が一覧表示の GROUP_CONCAT に反映される箇所があるため、
+    confirmed 行だけをグループ→期→名字読み順に並べ直して再挿入する。
+    """
+    image_rows = connection.execute(
+        """
+        SELECT image_id
+          FROM photo_image_people
+         WHERE relation_status='confirmed'
+         GROUP BY image_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    changed = 0
+    for image_row in image_rows:
+        image_id = int(image_row["image_id"])
+        rows = connection.execute(
+            """
+            SELECT person_name, source, confidence, confirmed_by, note, created_at, updated_at
+              FROM photo_image_people
+             WHERE image_id=? AND relation_status='confirmed'
+             ORDER BY id ASC
+            """,
+            (image_id,),
+        ).fetchall()
+        current_names = [str(row["person_name"] or "").strip() for row in rows]
+        ordered_names = normalize_person_names(current_names)
+        if current_names == ordered_names:
+            # selected_value 側だけ古い順序の可能性があるので同期する。
+            connection.execute(
+                "UPDATE photo_review_queue SET selected_value=? WHERE image_id=? AND status='completed'",
+                ("、".join(ordered_names), image_id),
+            )
+            continue
+        by_name = {str(row["person_name"]): row for row in rows}
+        connection.execute(
+            "DELETE FROM photo_image_people WHERE image_id=? AND relation_status='confirmed'",
+            (image_id,),
+        )
+        for name in ordered_names:
+            row = by_name[name]
+            connection.execute(
+                """
+                INSERT INTO photo_image_people(
+                    image_id, person_name, relation_status, source, confidence,
+                    confirmed_by, note, created_at, updated_at
+                ) VALUES (?, ?, 'confirmed', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    image_id, name, str(row["source"] or ""), float(row["confidence"] or 0),
+                    str(row["confirmed_by"] or ""), str(row["note"] or ""),
+                    str(row["created_at"] or ""), str(row["updated_at"] or ""),
+                ),
+            )
+        connection.execute(
+            "UPDATE photo_review_queue SET selected_value=? WHERE image_id=? AND status='completed'",
+            ("、".join(ordered_names), image_id),
+        )
+        changed += 1
+    return changed
 
 # =========================
 # DB初期化
@@ -1059,6 +1134,9 @@ def init_photo_db() -> None:
             (now_for_repair, now_for_repair, now_for_repair),
         )
 
+        # 既存の複数人物確定も、グループ→期→名字読み順へ統一する。
+        normalized_people_rows = _normalize_existing_confirmed_people_order(connection)
+
         # タグマスターは既存タグを物理的に書き換えず、別名・承認状態を管理する。
         from tag_master import bootstrap_from_existing
         bootstrap_from_existing(connection)
@@ -1069,6 +1147,11 @@ def init_photo_db() -> None:
         "写真検索DB初期化完了:",
         PHOTO_DB_PATH,
     )
+    if normalized_people_rows:
+        print(
+            "複数人物の確定順を正規化:",
+            f"{normalized_people_rows}画像",
+        )
 
 
 # =========================
@@ -3714,11 +3797,8 @@ def add_image_person_candidate(image_id: int, person_name: str, *, source: str =
 
 
 def set_confirmed_image_people(image_id: int, person_names: list[str], *, confirmed_by: str = "", note: str = "") -> None:
-    names=[]
-    for value in person_names:
-        name=str(value or "").strip()
-        if name and name not in names:
-            names.append(name)
+    # 選択順に依存させず、同じ人物の組み合わせは常に同じ順序で保存する。
+    names = normalize_person_names(person_names)
     now=utc_now_text()
     with closing(get_connection()) as connection:
         connection.execute("DELETE FROM photo_image_people WHERE image_id = ? AND relation_status = 'confirmed'", (image_id,))
