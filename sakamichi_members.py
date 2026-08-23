@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from typing import Iterator
 
 # このプロジェクトの現行メンバー構成を、レビュー画面用に整理した人物マスター。
@@ -216,3 +218,70 @@ def member_surname_kana_sort_key(name: str) -> tuple[str, str]:
 
     return (text, text)
 
+
+
+# 複数人物を保存・表示するときの統一順。
+# 1) 乃木坂46 → 櫻坂46 → 日向坂46
+# 2) 同一グループ内は 1期 → 2期 → 3期 ...
+# 3) 同一期内は名字の読み仮名順
+# 4) 日向坂46の「ポカ」は、日向坂メンバーの最後に固定
+# 5) 坂道3グループ以外の人物は、ポカより後ろ
+SAKAMICHI_GROUP_ORDER: dict[str, int] = {
+    "乃木坂46": 0,
+    "櫻坂46": 1,
+    "日向坂46": 2,
+}
+
+# 日向坂46公式キャラクター。人物一覧では日向坂メンバーの直後、
+# 坂道3グループ外の人物より前に置く。
+HINATA_SPECIAL_LAST_NAME = "ポカ"
+
+
+def generation_number(generation_name: str) -> int:
+    """「4期生」「卒業生(4期生)」「4期生(卒業)」などを同じ4期として扱う。"""
+    text = str(generation_name or "").strip()
+    match = re.search(r"(\d+)\s*期", text)
+    if match:
+        return int(match.group(1))
+    # 「その他」など期に属さないものは各グループ内の最後へ。
+    return 999
+
+
+def _member_group_generation_map() -> dict[str, tuple[str, str]]:
+    result: dict[str, tuple[str, str]] = {}
+    for group_name, generation_name, person_name in iter_members():
+        # 同名が万一あった場合は、人物マスターで先に現れた所属を優先する。
+        result.setdefault(person_name, (group_name, generation_name))
+    return result
+
+
+SAKAMICHI_MEMBER_META = _member_group_generation_map()
+
+
+def member_group_generation_sort_key(name: str) -> tuple[int, int, int, str, str]:
+    """人物名の統一並び順を返す。
+
+    優先順位:
+    1. 乃木坂46 → 櫻坂46 → 日向坂46
+    2. 各グループ内は期の若い順
+    3. 同一期は名字の読み仮名順
+    4. ポカは日向坂メンバーの最後
+    5. 坂道3グループ外の人物は最後
+    """
+    text = str(name or "").strip()
+
+    # ポカは日向坂46の「その他」に入っているが、期番号999という偶然に
+    # 依存せず、日向坂メンバーの直後に来ることを明示的に保証する。
+    if text == HINATA_SPECIAL_LAST_NAME:
+        return (3, 0, 0, "", text)
+
+    group_name, generation_name = SAKAMICHI_MEMBER_META.get(text, ("", ""))
+    if group_name in SAKAMICHI_GROUP_ORDER:
+        group_order = SAKAMICHI_GROUP_ORDER[group_name]
+        generation_order = generation_number(generation_name)
+        surname_kana, fallback_name = member_surname_kana_sort_key(text)
+        return (group_order, generation_order, 0, surname_kana, fallback_name)
+
+    # バナナマンなど坂道3グループ以外の人物は、ポカより後ろ。
+    surname_kana, fallback_name = member_surname_kana_sort_key(text)
+    return (4, 0, 0, surname_kana, fallback_name)
