@@ -15,11 +15,16 @@ from tag_master import (
     merge_candidates,
     merge_tags,
     rebuild_cache,
+    normalize_key,
 )
 
 
 PAGE_SIZE = 20
 
+
+# =========================
+# タグ状態
+# =========================
 
 def _summary_embed() -> discord.Embed:
     with closing(get_connection()) as con:
@@ -27,13 +32,14 @@ def _summary_embed() -> discord.Embed:
         stats = diagnostic_summary(con)
 
     embed = discord.Embed(
-        title="🏷️ タグマスター管理",
+        title="📊 タグの状態",
         color=0xF1C40F,
     )
 
     embed.description = (
-        "原文タグを削除せず、"
-        "代表タグ・同義語・承認状態・検索対象を管理します。"
+        "タグDBの現在の状態を確認する画面です。\n"
+        "整理を始める場合は「未承認タグを整理」、"
+        "似たタグをまとめる場合は「タグを統合・修正」を使ってください。"
     )
 
     embed.add_field(
@@ -67,7 +73,7 @@ def _summary_embed() -> discord.Embed:
     )
 
     embed.add_field(
-        name="低信頼割当",
+        name="AI判定が不確かなタグ",
         value=f"{stats['low_confidence']:,}件",
         inline=True,
     )
@@ -80,13 +86,17 @@ def _summary_embed() -> discord.Embed:
 
     embed.set_footer(
         text=(
-            "手動タグ > 承認済みAIタグ > 未承認AIタグ "
-            "の優先順位です。"
+            "優先順位："
+            "手動タグ ＞ 承認済みAIタグ ＞ 未承認AIタグ"
         )
     )
 
     return embed
 
+
+# =========================
+# タグ統合
+# =========================
 
 def _merge(
     source: int,
@@ -105,6 +115,83 @@ def _merge(
         con.commit()
 
 
+def _find_tag_id_by_name(
+    value: str,
+) -> tuple[int, str] | None:
+    key = normalize_key(
+        str(value or "").strip()
+    )
+
+    if not key:
+        return None
+
+    with closing(get_connection()) as con:
+        bootstrap_from_existing(con)
+
+        row = con.execute(
+            """
+            SELECT
+                m.id,
+                m.canonical_tag
+
+            FROM tag_aliases a
+
+            JOIN tag_master m
+                ON m.id = a.canonical_tag_id
+
+            WHERE a.alias_key = ?
+
+            LIMIT 1
+            """,
+            (
+                key,
+            ),
+        ).fetchone()
+
+        if row:
+            return (
+                int(row[0]),
+                str(row[1]),
+            )
+
+        row = con.execute(
+            """
+            SELECT
+                id,
+                canonical_tag
+
+            FROM tag_master
+
+            WHERE normalized_key = ?
+
+            LIMIT 1
+            """,
+            (
+                key,
+            ),
+        ).fetchone()
+
+        if row:
+            return (
+                int(row[0]),
+                str(row[1]),
+            )
+
+    return None
+
+
+def _load_merge_candidates() -> list[Any]:
+    with closing(get_connection()) as con:
+        return merge_candidates(
+            con,
+            25,
+        )
+
+
+# =========================
+# 未承認タグ取得
+# =========================
+
 def _load_pending_tags(
     page: int,
 ) -> tuple[int, list[Any]]:
@@ -118,8 +205,10 @@ def _load_pending_tags(
             con.execute(
                 """
                 SELECT COUNT(*)
+
                 FROM tag_master
-                WHERE status='pending'
+
+                WHERE status = 'pending'
                 """
             ).fetchone()[0]
             or 0
@@ -131,17 +220,25 @@ def _load_pending_tags(
                 m.id,
                 m.canonical_tag,
                 m.category,
+
                 (
                     SELECT COUNT(*)
+
                     FROM tag_aliases a
+
                     WHERE
-                        a.canonical_tag_id=m.id
+                        a.canonical_tag_id = m.id
                 ) AS aliases
+
             FROM tag_master m
-            WHERE m.status='pending'
+
+            WHERE
+                m.status = 'pending'
+
             ORDER BY
                 aliases DESC,
-                m.id
+                m.id ASC
+
             LIMIT ?
             OFFSET ?
             """,
@@ -154,13 +251,9 @@ def _load_pending_tags(
     return total, rows
 
 
-def _load_merge_candidates() -> list[Any]:
-    with closing(get_connection()) as con:
-        return merge_candidates(
-            con,
-            25,
-        )
-
+# =========================
+# 検索インデックス
+# =========================
 
 def _rebuild_search_index() -> dict[str, Any]:
     with closing(get_connection()) as con:
@@ -177,9 +270,13 @@ def _rebuild_search_index() -> dict[str, Any]:
         return result
 
 
+# =========================
+# ID指定統合
+# =========================
+
 class MergeModal(
     discord.ui.Modal,
-    title="代表タグを統合",
+    title="IDを指定してタグを統合",
 ):
     source_id = discord.ui.TextInput(
         label="統合元ID",
@@ -193,8 +290,7 @@ class MergeModal(
 
     async def on_submit(
         self,
-        interaction:
-            discord.Interaction,
+        interaction: discord.Interaction,
     ) -> None:
         try:
             source = int(
@@ -210,31 +306,22 @@ class MergeModal(
             )
 
         except ValueError:
-            await (
-                interaction.response
-                .send_message(
-                    "⚠️ 統合元IDと統合先IDは数字で入力してください。",
-                    ephemeral=True,
-                )
+            await interaction.response.send_message(
+                "⚠️ 統合元IDと統合先IDは数字で入力してください。",
+                ephemeral=True,
             )
             return
 
         if source == target:
-            await (
-                interaction.response
-                .send_message(
-                    "⚠️ 統合元と統合先に同じIDは指定できません。",
-                    ephemeral=True,
-                )
+            await interaction.response.send_message(
+                "⚠️ 統合元と統合先に同じIDは指定できません。",
+                ephemeral=True,
             )
             return
 
-        await (
-            interaction.response
-            .defer(
-                ephemeral=True,
-                thinking=True,
-            )
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
 
         try:
@@ -248,29 +335,135 @@ class MergeModal(
             )
 
         except Exception as exc:
-            await (
-                interaction.followup
-                .send(
-                    (
-                        "⚠️ 統合できませんでした。\n"
-                        f"`{type(exc).__name__}: {exc}`"
-                    ),
-                    ephemeral=True,
-                )
-            )
-            return
-
-        await (
-            interaction.followup
-            .send(
+            await interaction.followup.send(
                 (
-                    "✅ 元データを削除せず、"
-                    "別名の向き先を代表タグへ統合しました。"
+                    "⚠️ タグを統合できませんでした。\n"
+                    f"`{type(exc).__name__}: {exc}`"
                 ),
                 ephemeral=True,
             )
+            return
+
+        await interaction.followup.send(
+            (
+                "✅ タグを統合しました。\n"
+                "元の表記は削除せず、別表記として代表タグへ紐付けています。"
+            ),
+            ephemeral=True,
         )
 
+
+# =========================
+# タグ名指定統合
+# =========================
+
+class TagNameMergeModal(
+    discord.ui.Modal,
+    title="タグ名で統合",
+):
+    source_name = discord.ui.TextInput(
+        label="統合する側のタグ名",
+        placeholder="例: 制服姿",
+        max_length=100,
+    )
+
+    target_name = discord.ui.TextInput(
+        label="残す代表タグ名",
+        placeholder="例: 制服",
+        max_length=100,
+    )
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        source = await asyncio.to_thread(
+            _find_tag_id_by_name,
+            str(
+                self.source_name.value
+            ),
+        )
+
+        target = await asyncio.to_thread(
+            _find_tag_id_by_name,
+            str(
+                self.target_name.value
+            ),
+        )
+
+        if not source or not target:
+            missing = []
+
+            if not source:
+                missing.append(
+                    f"統合元「{self.source_name.value}」"
+                )
+
+            if not target:
+                missing.append(
+                    f"統合先「{self.target_name.value}」"
+                )
+
+            await interaction.followup.send(
+                (
+                    "⚠️ "
+                    + " / ".join(missing)
+                    + " が見つかりませんでした。"
+                    "タグ名を確認してください。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if source[0] == target[0]:
+            await interaction.followup.send(
+                (
+                    f"⚠️ 「{source[1]}」は"
+                    "すでに同じ代表タグです。"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await asyncio.to_thread(
+                _merge,
+                source[0],
+                target[0],
+                str(
+                    interaction.user.id
+                ),
+            )
+
+        except Exception as exc:
+            await interaction.followup.send(
+                (
+                    "⚠️ タグを統合できませんでした。\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            (
+                f"✅ **{source[1]}** を "
+                f"**{target[1]}** へ統合しました。\n"
+                "元の表記は別表記として残るため、"
+                "検索には引き続き利用できます。"
+            ),
+            ephemeral=True,
+        )
+
+
+# =========================
+# 未承認タグ選択
+# =========================
 
 class PendingTagSelect(
     discord.ui.Select
@@ -298,7 +491,8 @@ class PendingTagSelect(
                     row[0]
                 ),
                 description=(
-                    f"{row[2]} / 別表記{row[3]}件"
+                    f"{row[2] or 'カテゴリ未設定'}"
+                    f" / 別表記{row[3]}件"
                 )[:100],
             )
             for row in rows[:25]
@@ -322,15 +516,11 @@ class PendingTagSelect(
 
     async def callback(
         self,
-        interaction:
-            discord.Interaction,
+        interaction: discord.Interaction,
     ) -> None:
-        await (
-            interaction.response
-            .defer(
-                ephemeral=True,
-                thinking=True,
-            )
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
 
         ids = [
@@ -346,7 +536,6 @@ class PendingTagSelect(
             with closing(
                 get_connection()
             ) as con:
-
                 for master_id in ids:
                     if (
                         self.action
@@ -377,35 +566,66 @@ class PendingTagSelect(
             )
 
         except Exception as exc:
-            await (
-                interaction.followup
-                .send(
-                    (
-                        "⚠️ タグ状態の変更に失敗しました。\n"
-                        f"`{type(exc).__name__}: {exc}`"
-                    ),
-                    ephemeral=True,
-                )
+            await interaction.followup.send(
+                (
+                    "⚠️ タグ状態の変更に失敗しました。\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                ),
+                ephemeral=True,
             )
             return
 
         action_name = (
-            "承認"
+            "承認済み"
             if self.action == "approve"
             else "検索対象外"
         )
 
-        await (
-            interaction.followup
-            .send(
-                (
-                    f"✅ {len(ids)}件を"
-                    f"{action_name}にしました。"
-                ),
-                ephemeral=True,
+        # 成功メッセージを新しく積み上げず、
+        # 現在の未承認タグ画面そのものを更新する。
+        page = 0
+
+        parent = self.view
+
+        if parent is not None:
+            page = int(
+                getattr(
+                    parent,
+                    "page",
+                    0,
+                )
+                or 0
             )
+
+        refreshed = await PendingTagView.create(
+            self.owner_id,
+            page,
         )
 
+        # 現在ページの全項目を処理して空になった場合は
+        # ひとつ前のページへ戻す。
+        if (
+            not refreshed.rows
+            and page > 0
+        ):
+            refreshed = await PendingTagView.create(
+                self.owner_id,
+                page - 1,
+            )
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ {len(ids)}件を"
+                f"{action_name}にしました。"
+            ),
+            embed=refreshed.embed(),
+            view=refreshed,
+        )
+
+
+# =========================
+# 未承認タグ一覧
+# =========================
 
 class PendingTagView(
     discord.ui.View
@@ -435,10 +655,8 @@ class PendingTagView(
             total is None
             or rows is None
         ):
-            total, rows = (
-                _load_pending_tags(
-                    self.page
-                )
+            total, rows = _load_pending_tags(
+                self.page
             )
 
         self.total = int(
@@ -489,11 +707,9 @@ class PendingTagView(
             int(page),
         )
 
-        total, rows = (
-            await asyncio.to_thread(
-                _load_pending_tags,
-                safe_page,
-            )
+        total, rows = await asyncio.to_thread(
+            _load_pending_tags,
+            safe_page,
         )
 
         return cls(
@@ -505,8 +721,7 @@ class PendingTagView(
 
     async def interaction_check(
         self,
-        interaction:
-            discord.Interaction,
+        interaction: discord.Interaction,
     ) -> bool:
         if (
             interaction.user.id
@@ -514,12 +729,9 @@ class PendingTagView(
         ):
             return True
 
-        await (
-            interaction.response
-            .send_message(
-                "この画面は開いた管理者だけが操作できます。",
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            "この画面は開いた管理者だけが操作できます。",
+            ephemeral=True,
         )
 
         return False
@@ -539,20 +751,20 @@ class PendingTagView(
             (
                 f"`{row[0]}` "
                 f"**{row[1]}** "
-                f"— {row[2]} / "
-                f"別表記{row[3]}件"
+                f"— {row[2] or 'カテゴリ未設定'}"
+                f" / 別表記{row[3]}件"
             )
             for row in self.rows
         ]
 
         embed = discord.Embed(
-            title="🆕 未承認タグ",
+            title="🆕 未承認タグを整理",
             description=(
                 "\n".join(
                     lines
                 )
                 or
-                "未承認タグはありません。"
+                "✅ 未承認タグはありません。"
             ),
             color=0xFEE75C,
         )
@@ -582,90 +794,77 @@ class PendingTagView(
                 f"{start}〜{end}"
                 f" / {self.total}件"
                 f" ・ "
-                f"{min(self.page + 1, total_pages)}/{total_pages}ページ"
+                f"{min(self.page + 1, total_pages)}"
+                f"/{total_pages}ページ"
             )
         )
 
         return embed
 
     @discord.ui.button(
-        label="前へ",
+        label="前の20件",
         emoji="◀️",
-        style=
-            discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.secondary,
         row=2,
     )
     async def previous(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer()
+        await interaction.response.defer()
+
+        view = await PendingTagView.create(
+            self.owner_id,
+            self.page - 1,
         )
 
-        view = (
-            await PendingTagView.create(
-                self.owner_id,
-                self.page - 1,
-            )
-        )
-
-        await (
-            interaction
-            .edit_original_response(
-                embed=view.embed(),
-                view=view,
-            )
+        await interaction.edit_original_response(
+            content=None,
+            embed=view.embed(),
+            view=view,
         )
 
     @discord.ui.button(
-        label="次へ",
+        label="次の20件",
         emoji="▶️",
-        style=
-            discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.secondary,
         row=2,
     )
     async def next(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer()
+        await interaction.response.defer()
+
+        view = await PendingTagView.create(
+            self.owner_id,
+            self.page + 1,
         )
 
-        view = (
-            await PendingTagView.create(
-                self.owner_id,
-                self.page + 1,
-            )
-        )
-
-        await (
-            interaction
-            .edit_original_response(
-                embed=view.embed(),
-                view=view,
-            )
+        await interaction.edit_original_response(
+            content=None,
+            embed=view.embed(),
+            view=view,
         )
 
 
-class TagMasterView(
+# =========================
+# 共通View
+# =========================
+
+class TagMasterBaseView(
     discord.ui.View
 ):
     def __init__(
         self,
         owner_id: int,
+        *,
+        timeout: float = 900,
     ):
         super().__init__(
-            timeout=900
+            timeout=timeout
         )
 
         self.owner_id = int(
@@ -674,8 +873,7 @@ class TagMasterView(
 
     async def interaction_check(
         self,
-        interaction:
-            discord.Interaction,
+        interaction: discord.Interaction,
     ) -> bool:
         if (
             interaction.user.id
@@ -683,245 +881,388 @@ class TagMasterView(
         ):
             return True
 
-        await (
-            interaction.response
-            .send_message(
-                "この画面は開いた管理者だけが操作できます。",
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            "この画面は開いた管理者だけが操作できます。",
+            ephemeral=True,
         )
 
         return False
 
-    @discord.ui.button(
-        label="未承認タグ",
-        emoji="🆕",
-        style=
-            discord.ButtonStyle.primary,
+
+# =========================
+# タグ管理トップ画面
+# =========================
+
+def _home_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🏷️ タグ管理",
+        description=(
+            "やりたい操作を選んでください。\n\n"
+
+            "**🔍 タグを探す**\n"
+            "登録済みタグを名前から検索します。\n\n"
+
+            "**🆕 未承認タグを整理**\n"
+            "AIなどから追加された未承認タグを、"
+            "承認または検索対象外にします。\n\n"
+
+            "**🧩 タグを統合・修正**\n"
+            "似たタグや別表記を代表タグへまとめます。"
+            "通常はタグ名だけで操作できます。\n\n"
+
+            "**📊 タグの状態を見る**\n"
+            "承認済み・未承認・除外・別表記などの"
+            "件数を確認します。\n\n"
+
+            "**⚙️ 詳細管理**\n"
+            "検索インデックスの再構築など、"
+            "通常は使わない保守操作です。"
+        ),
+        color=0x5865F2,
     )
-    async def pending(
+
+    embed.set_footer(
+        text=(
+            "日常的なタグ整理と、"
+            "保守操作を分けています。"
+        )
+    )
+
+    return embed
+
+
+# =========================
+# タグ統合メニュー
+# =========================
+
+class TagMergeView(
+    TagMasterBaseView
+):
+    @discord.ui.button(
+        label="タグ名で統合",
+        emoji="🧩",
+        style=discord.ButtonStyle.primary,
+    )
+    async def merge_by_name(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer(
-                ephemeral=True,
-                thinking=True,
-            )
-        )
-
-        view = (
-            await PendingTagView.create(
-                self.owner_id
-            )
-        )
-
-        await (
-            interaction.followup
-            .send(
-                embed=view.embed(),
-                view=view,
-                ephemeral=True,
-            )
+        await interaction.response.send_modal(
+            TagNameMergeModal()
         )
 
     @discord.ui.button(
-        label="統合候補",
+        label="似ているタグ候補",
         emoji="🔗",
-        style=
-            discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.secondary,
     )
     async def candidates(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer(
-                ephemeral=True,
-                thinking=True,
-            )
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
 
         try:
-            rows = (
-                await asyncio.to_thread(
-                    _load_merge_candidates
-                )
+            rows = await asyncio.to_thread(
+                _load_merge_candidates
             )
 
         except Exception as exc:
-            await (
-                interaction.followup
-                .send(
-                    (
-                        "⚠️ 統合候補の取得に失敗しました。\n"
-                        f"`{type(exc).__name__}: {exc}`"
-                    ),
-                    ephemeral=True,
-                )
+            await interaction.followup.send(
+                (
+                    "⚠️ 統合候補の取得に失敗しました。\n"
+                    f"`{type(exc).__name__}: {exc}`"
+                ),
+                ephemeral=True,
             )
             return
 
         lines = [
             (
-                f"`{item['left_id']}` "
-                f"{item['left']} "
-                f"↔ "
-                f"`{item['right_id']}` "
-                f"{item['right']}"
-                f"（{item['similarity'] * 100:.1f}%）"
+                f"**{item['left']}** "
+                f"↔ **{item['right']}** "
+                f"（類似 {item['similarity'] * 100:.1f}%）"
             )
             for item in rows
         ]
 
-        await (
-            interaction.followup
-            .send(
-                embed=discord.Embed(
-                    title="🔗 統合候補",
-                    description=(
-                        "\n".join(
-                            lines
-                        )
-                        or
-                        "候補なし"
-                    ),
-                    color=0x5865F2,
-                ),
-                ephemeral=True,
+        embed = discord.Embed(
+            title="🔗 似ているタグ候補",
+            description=(
+                "\n".join(
+                    lines
+                )
+                or
+                "現在、統合候補はありません。"
+            ),
+            color=0x95A5A6,
+        )
+
+        embed.set_footer(
+            text=(
+                "統合する場合は"
+                "「タグ名で統合」から名前を指定してください。"
             )
         )
 
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
     @discord.ui.button(
-        label="ID指定で統合",
-        emoji="🧩",
-        style=
-            discord.ButtonStyle.success,
+        label="詳細：IDで統合",
+        emoji="🔢",
+        style=discord.ButtonStyle.secondary,
     )
-    async def merge(
+    async def merge_by_id(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .send_modal(
-                MergeModal()
-            )
+        await interaction.response.send_modal(
+            MergeModal()
         )
 
+
+# =========================
+# 詳細管理
+# =========================
+
+class TagMaintenanceView(
+    TagMasterBaseView
+):
     @discord.ui.button(
-        label="検索索引を再構築",
+        label="検索インデックスを再構築",
         emoji="🔄",
-        style=
-            discord.ButtonStyle.secondary,
+        style=discord.ButtonStyle.danger,
     )
     async def rebuild(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer(
-                ephemeral=True,
-                thinking=True,
-            )
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
 
         try:
-            result = (
-                await asyncio.to_thread(
-                    _rebuild_search_index
-                )
+            result = await asyncio.to_thread(
+                _rebuild_search_index
             )
 
         except Exception as exc:
-            await (
-                interaction.followup
-                .send(
-                    (
-                        "⚠️ 検索索引の再構築に失敗しました。\n"
-                        f"`{type(exc).__name__}: {exc}`"
-                    ),
-                    ephemeral=True,
-                )
-            )
-            return
-
-        await (
-            interaction.followup
-            .send(
+            await interaction.followup.send(
                 (
-                    "✅ 検索索引を再構築しました。\n"
-                    f"代表タグ {result['tags']:,}件\n"
-                    f"対応 {result['assignments']:,}件"
+                    "⚠️ 検索インデックスの再構築に失敗しました。\n"
+                    f"`{type(exc).__name__}: {exc}`"
                 ),
                 ephemeral=True,
             )
+            return
+
+        await interaction.followup.send(
+            (
+                "✅ 検索インデックスを再構築しました。\n"
+                f"代表タグ **{result['tags']:,}件**"
+                f" / 対応 **{result['assignments']:,}件**"
+            ),
+            ephemeral=True,
+        )
+
+
+# =========================
+# タグ管理メニュー
+# =========================
+
+class TagMasterView(
+    TagMasterBaseView
+):
+    @discord.ui.button(
+        label="未承認タグを整理",
+        emoji="🆕",
+        style=discord.ButtonStyle.primary,
+        row=0,
+    )
+    async def pending(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        view = await PendingTagView.create(
+            self.owner_id
+        )
+
+        await interaction.followup.send(
+            embed=view.embed(),
+            view=view,
+            ephemeral=True,
         )
 
     @discord.ui.button(
-        label="更新",
-        emoji="♻️",
-        style=
-            discord.ButtonStyle.secondary,
+        label="タグを統合・修正",
+        emoji="🧩",
+        style=discord.ButtonStyle.secondary,
+        row=0,
     )
-    async def refresh(
+    async def merge_menu(
         self,
-        interaction:
-            discord.Interaction,
-        _:
-            discord.ui.Button,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
     ) -> None:
-        await (
-            interaction.response
-            .defer()
+        embed = discord.Embed(
+            title="🧩 タグを統合・修正",
+            description=(
+                "通常は **タグ名で統合** を使ってください。\n\n"
+                "例：\n"
+                "`制服姿` → `制服`\n\n"
+                "似ているタグ候補を先に確認することもできます。"
+            ),
+            color=0x95A5A6,
         )
 
-        embed = (
-            await asyncio.to_thread(
-                _summary_embed
-            )
+        await interaction.response.send_message(
+            embed=embed,
+            view=TagMergeView(
+                self.owner_id
+            ),
+            ephemeral=True,
         )
 
-        await (
-            interaction
-            .edit_original_response(
-                embed=embed,
-                view=TagMasterView(
-                    self.owner_id
-                ),
-            )
+    @discord.ui.button(
+        label="タグの状態を見る",
+        emoji="📊",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def status(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
         )
+
+        embed = await asyncio.to_thread(
+            _summary_embed
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="詳細管理",
+        emoji="⚙️",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def maintenance(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        embed = discord.Embed(
+            title="⚙️ タグ詳細管理",
+            description=(
+                "通常のタグ整理では使わない保守操作です。\n\n"
+                "検索結果に明らかな不整合がある場合などに"
+                "使用してください。"
+            ),
+            color=0x95A5A6,
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=TagMaintenanceView(
+                self.owner_id
+            ),
+            ephemeral=True,
+        )
+
+
+# =========================
+# 外部呼び出し
+# =========================
+
+async def send_pending_tag_panel(
+    interaction: discord.Interaction,
+) -> None:
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    view = await PendingTagView.create(
+        interaction.user.id
+    )
+
+    await interaction.followup.send(
+        embed=view.embed(),
+        view=view,
+        ephemeral=True,
+    )
+
+
+async def send_tag_merge_panel(
+    interaction: discord.Interaction,
+) -> None:
+    embed = discord.Embed(
+        title="🧩 タグを統合・修正",
+        description=(
+            "タグ名を指定して代表タグへまとめます。\n"
+            "通常はID入力不要です。"
+        ),
+        color=0x95A5A6,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=TagMergeView(
+            interaction.user.id
+        ),
+        ephemeral=True,
+    )
+
+
+async def send_tag_status_panel(
+    interaction: discord.Interaction,
+) -> None:
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    embed = await asyncio.to_thread(
+        _summary_embed
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+    )
 
 
 async def send_tag_master_panel(
     ctx: Any,
 ) -> None:
-    embed = (
-        await asyncio.to_thread(
-            _summary_embed
-        )
-    )
-
-    await (
-        ctx.send(
-            embed=embed,
-            view=TagMasterView(
-                ctx.author.id
-            ),
-        )
+    await ctx.send(
+        embed=_home_embed(),
+        view=TagMasterView(
+            ctx.author.id
+        ),
     )
