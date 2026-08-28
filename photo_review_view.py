@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import time
 from contextlib import closing
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,13 +22,14 @@ from photo_database import (
     get_connection,
     get_pending_person_reviews,
     get_frequent_confirmed_people,
+    get_author_cooccurrence_people,
     get_skipped_person_reviews,
     save_person,
     set_confirmed_blog_people,
     set_confirmed_image_people,
     utc_now_text,
 )
-from sakamichi_members import SAKAMICHI_MEMBERS, iter_members
+from sakamichi_members import SAKAMICHI_MEMBERS, iter_members, member_group_generation_sort_key
 from advanced_admin_features import (
     HOLD_REASON_LABELS, create_people_snapshot, save_hold_reason, save_provisional_people, load_person_sets, count_person_sets,
 )
@@ -41,8 +41,6 @@ SKIP_EMBED_COLOR = discord.Color.orange()
 MAX_CANDIDATE_DISPLAY = 10
 SELECT_PAGE_SIZE = 25
 SUCCESS_NOTICE_SECONDS = 4.0
-QUICK_PEOPLE_CACHE_SECONDS = 300
-_QUICK_PEOPLE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 _SAKAMICHI_MEMBER_NAMES = {name for _group, _generation, name in iter_members()}
 
@@ -87,17 +85,47 @@ def build_people_confirmation_text(image_id: int, names: list[str]) -> str:
     )
 
 
-def get_quick_people_cached(group_name: str, limit: int = 25) -> list[dict[str, Any]]:
-    """同じグループの頻出人物を短時間キャッシュし、DB集計回数を抑える。"""
-    cache_key = normalize_text(group_name) or "__all__"
-    now = time.monotonic()
-    cached = _QUICK_PEOPLE_CACHE.get(cache_key)
-    if cached and now - cached[0] < QUICK_PEOPLE_CACHE_SECONDS:
-        return cached[1][:limit]
+def get_quick_people_for_review(review: dict[str, Any]) -> list[dict[str, Any]]:
+    """投稿者を先頭に、投稿者との共写回数順で人物候補を返す。
 
-    people = get_frequent_confirmed_people(group_name, max(limit, 25))
-    _QUICK_PEOPLE_CACHE[cache_key] = (now, people)
-    return people[:limit]
+    キャッシュは使わず、人物確認画面を作るたびSQLiteから再集計する。
+    そのため確認済み写真が増えると次に開く画面の順位も自動で変化する。
+    共写回数が同じ場合はプロジェクト共通の人物順で安定させる。
+    """
+    author = normalize_text(review.get("member_name"))
+    if not author:
+        return []
+
+    people = get_author_cooccurrence_people(author)
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in people:
+        name = normalize_text(item.get("person_name"))
+        if not name:
+            continue
+        copied = dict(item)
+        copied["cooccurrence_count"] = int(copied.get("cooccurrence_count") or 0)
+        copied["is_author"] = name == author
+        by_name[name] = copied
+
+    # 投稿者が人物マスターにまだ無い場合でも、必ず1番目に表示する。
+    if author not in by_name:
+        by_name[author] = {
+            "person_name": author,
+            "group_name": normalize_text(review.get("group_name")),
+            "generation_name": "",
+            "cooccurrence_count": 0,
+            "is_author": True,
+        }
+
+    result = list(by_name.values())
+    result.sort(
+        key=lambda item: (
+            0 if normalize_text(item.get("person_name")) == author else 1,
+            -int(item.get("cooccurrence_count") or 0),
+            member_group_generation_sort_key(normalize_text(item.get("person_name"))),
+        )
+    )
+    return result
 
 
 def build_candidate_names(review: dict[str, Any]) -> list[str]:
@@ -168,12 +196,12 @@ def build_review_embed(review: dict[str, Any], quick_people: list[dict[str, Any]
     safe_add_field(embed, name="🤖 人物候補", value=candidate_text or "候補はありません。", inline=False)
     if quick_people:
         quick_text = " / ".join(
-            f"{item.get('person_name', '')}（{int(item.get('confirmed_count') or 0)}）"
+            (f"{item.get('person_name', '')}（投稿者）" if item.get('is_author') else f"{item.get('person_name', '')}（共写{int(item.get('cooccurrence_count') or 0)}回）")
             for item in quick_people[:8]
             if normalize_text(item.get("person_name"))
         )
         if quick_text:
-            safe_add_field(embed, name="⚡ よく使う人物", value=truncate_text(quick_text, 1000), inline=False)
+            safe_add_field(embed, name="⚡ よく使う人物（投稿者＋共写回数順）", value=truncate_text(quick_text, 1000), inline=False)
     safe_add_field(embed, name="現在の確定人物", value=format_people_for_users("、".join(confirmed)) or "未確定", inline=False)
     if review.get("blog_url"):
         safe_add_field(embed, name="ブログ", value=f"[元のブログを開く]({review['blog_url']})", inline=False)
@@ -1094,40 +1122,149 @@ class BlogBulkConfirmView(discord.ui.View):
         self.stop()
 
 
-class QuickPeopleSelect(discord.ui.Select):
-    """確認回数の多い人物を、検索可能な選択メニューで素早く確定する。"""
+@dataclass
+class QuickPeopleState:
+    parent_view: "PersonReviewView"
+    people: list[dict[str, Any]]
+    owner_id: int
+    selected_names: list[str] = field(default_factory=list)
+    page: int = 0
 
-    def __init__(self, parent: "PersonReviewView", people: list[dict[str, Any]]):
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.people) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+
+    def page_people(self) -> list[dict[str, Any]]:
+        start = self.page * SELECT_PAGE_SIZE
+        return self.people[start:start + SELECT_PAGE_SIZE]
+
+    def ordered_names(self) -> list[str]:
+        return [normalize_text(item.get("person_name")) for item in self.people if normalize_text(item.get("person_name"))]
+
+    def replace_page_selection(self, values: list[str]) -> None:
+        page_names = {normalize_text(item.get("person_name")) for item in self.page_people()}
+        selected = {name for name in self.selected_names if name not in page_names}
+        selected.update(normalize_text(value) for value in values if normalize_text(value))
+        self.selected_names = [name for name in self.ordered_names() if name in selected]
+
+
+class QuickPeoplePageSelect(discord.ui.Select):
+    """1ページ最大25人。ページをまたいだ複数選択を保持する。"""
+
+    def __init__(self, state: QuickPeopleState):
+        self.state = state
+        selected = set(state.selected_names)
         options: list[discord.SelectOption] = []
-        for item in people[:25]:
+        for item in state.page_people():
             name = normalize_text(item.get("person_name"))
             if not name:
                 continue
-            count = int(item.get("confirmed_count") or 0)
+            is_author = bool(item.get("is_author"))
+            count = int(item.get("cooccurrence_count") or 0)
+            description = "ブログ投稿者（最優先）" if is_author else f"投稿者との共写 {count}回"
             options.append(
                 discord.SelectOption(
                     label=truncate_text(name, 100),
                     value=name,
-                    description=truncate_text(f"確認済み写真 {count}件", 100),
+                    description=truncate_text(description, 100),
+                    default=name in selected,
                 )
             )
+
         super().__init__(
             placeholder="よく使う人物から選択（複数可）",
-            min_values=1,
-            max_values=max(1, min(len(options), 10)),
+            min_values=0,
+            # 10人制限は設けない。Discordの1Select上限25人まで同時選択でき、
+            # 25人を超える候補はページをまたいで選択内容を保持する。
+            max_values=max(1, len(options)),
             options=options,
-            # row=2 には「保留・仮確定・人物セット」のボタンがある。
-            # DiscordではSelectが1行を専有するため、専用行へ分離する。
-            row=3,
+            row=0,
         )
-        self.parent_view = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await self.parent_view.complete_review(
-            interaction,
-            list(self.values),
-            note="よく使う人物メニューから確定",
+        self.state.replace_page_selection(list(self.values))
+        view = QuickPeoplePagedView(self.state)
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+
+class QuickPeoplePagedView(discord.ui.View):
+    """投稿者＋共写頻度ランキングから人数制限なしで人物を選ぶUI。"""
+
+    def __init__(self, state: QuickPeopleState):
+        super().__init__(timeout=600)
+        self.state = state
+        if state.page_people():
+            self.add_item(QuickPeoplePageSelect(state))
+        self.previous.disabled = state.page <= 0
+        self.next.disabled = state.page >= state.total_pages - 1
+        self.confirm.disabled = not bool(state.selected_names)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.state.owner_id:
+            return True
+        await interaction.response.send_message(
+            "この選択画面はレビュー開始者だけが操作できます。",
+            ephemeral=True,
         )
+        return False
+
+    def content(self) -> str:
+        selected = format_people_for_users("、".join(self.state.selected_names)) or "まだ選択されていません。"
+        start = self.state.page * SELECT_PAGE_SIZE + 1 if self.state.people else 0
+        end = min(len(self.state.people), start + SELECT_PAGE_SIZE - 1) if self.state.people else 0
+        return (
+            "⚡ **よく使う人物から選択（複数可）**\n"
+            "1番上はブログ投稿者、2番目以降は投稿者との共写回数が多い順です。\n"
+            "ページを移動しても選択内容は保持されます。\n\n"
+            f"表示 **{start}〜{end}/{len(self.state.people)}人** "
+            f"（**{self.state.page + 1}/{self.state.total_pages}ページ**）\n"
+            f"**選択中 {len(self.state.selected_names)}人:** {truncate_text(selected, 1400)}"
+        )
+
+    @discord.ui.button(label="前の25人", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.page = max(0, self.state.page - 1)
+        view = QuickPeoplePagedView(self.state)
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+    @discord.ui.button(label="次の25人", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.page = min(self.state.total_pages - 1, self.state.page + 1)
+        view = QuickPeoplePagedView(self.state)
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+    @discord.ui.button(label="このページを解除", emoji="🧹", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_page(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.state.replace_page_selection([])
+        view = QuickPeoplePagedView(self.state)
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+    @discord.ui.button(label="選択した人物で確定へ", emoji="✅", style=discord.ButtonStyle.success, row=2)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        names = list(self.state.selected_names)
+        if not names:
+            await interaction.response.send_message("人物を1人以上選択してください。", ephemeral=True)
+            return
+        parent = self.state.parent_view
+        note = "投稿者＋共写回数順メニューから確定"
+        if parent.session and parent.session.require_final_confirmation:
+            label = format_people_for_users("、".join(normalize_people_for_storage(names)))
+            await interaction.response.edit_message(
+                content=(
+                    f"🔎 **最終確認**\n写真ID **{parent.image_id}** を "
+                    f"**{discord.utils.escape_markdown(label)}** で確定しますか？"
+                ),
+                view=FinalPersonConfirmView(parent, names, note),
+            )
+            self.stop()
+            return
+        await parent.commit_review(interaction, names, note=note)
+        self.stop()
+
+    @discord.ui.button(label="閉じる", emoji="✖️", style=discord.ButtonStyle.secondary, row=2)
+    async def close(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="人物選択を閉じました。", view=None)
+        self.stop()
 
 
 class FinalPersonConfirmView(discord.ui.View):
@@ -1285,10 +1422,9 @@ class PersonReviewView(discord.ui.View):
         self._committed = False
         self.source_message_id = 0
         self.candidates = build_candidate_names(review)
-        self.quick_people = get_quick_people_cached(
-            normalize_text(review.get("group_name")),
-            25,
-        )
+        # 投稿者＋共写回数ランキングは画面生成時に毎回DBから取得する。
+        # 確定データが増えるたび、次に開く人物確認で順位が自然に更新される。
+        self.quick_people = get_quick_people_for_review(review)
         self.accept_candidate.disabled = not bool(self.candidates)
         has_confirmed_people = bool(split_person_names(review.get("confirmed_people", "")))
         is_skipped_review = normalize_text(review.get("review_status")) == "skipped"
@@ -1301,8 +1437,7 @@ class PersonReviewView(discord.ui.View):
             self.manual_input.label = "名前・不明人数を直接編集"
         else:
             self.manual_input.label = "名前・不明人数を入力"
-        if self.quick_people:
-            self.add_item(QuickPeopleSelect(self, self.quick_people))
+        self.quick_people_button.disabled = not bool(self.quick_people)
 
         # スキップ済み一覧では再スキップすると同じ写真が再取得され続けるため、
         # スキップボタンを無効化して必ず確定・終了のどちらかを選べるようにする。
@@ -1492,6 +1627,35 @@ class PersonReviewView(discord.ui.View):
             interaction,
             [make_unknown_other_label(1)],
             note="その他の人物が1人写っているが名前不明",
+        )
+
+    @discord.ui.button(
+        label="よく使う人物から選択（複数可）",
+        emoji="⚡",
+        style=discord.ButtonStyle.primary,
+        row=2,
+    )
+    async def quick_people_button(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not self.quick_people:
+            await interaction.response.send_message(
+                "選択できる人物がありません。",
+                ephemeral=True,
+            )
+            return
+        state = QuickPeopleState(
+            parent_view=self,
+            people=[dict(item) for item in self.quick_people],
+            owner_id=interaction.user.id,
+        )
+        view = QuickPeoplePagedView(state)
+        await interaction.response.send_message(
+            view.content(),
+            view=view,
+            ephemeral=True,
         )
 
     @discord.ui.button(label="理由を選んで保留", emoji="⏸️", style=discord.ButtonStyle.secondary, row=2)
