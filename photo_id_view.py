@@ -6,6 +6,8 @@ from contextlib import closing
 from typing import Any
 
 import discord
+
+from person_labels import normalize_people_for_storage
 from discord.ext import commands
 
 from bucket_storage import bucket_is_configured, create_presigned_get_url
@@ -152,12 +154,12 @@ def _build_embed(photo: dict[str, Any]) -> discord.Embed:
     )
 
     people = photo.get("people", [])
-    confirmed = [
+    confirmed = normalize_people_for_storage([
         _text(item.get("person_name"), "")
         for item in people
         if item.get("relation_status") == "confirmed"
         and _text(item.get("person_name"), "")
-    ]
+    ])
     candidates = [
         f"{_text(item.get('person_name'), '')} ({float(item.get('confidence') or 0) * 100:.1f}%)"
         for item in people
