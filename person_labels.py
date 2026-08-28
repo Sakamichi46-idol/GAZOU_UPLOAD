@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
+from sakamichi_members import member_group_generation_sort_key
+
 UNKNOWN_OTHER_PREFIX = "その他（名前不明）×"
 UNKNOWN_OTHER_LEGACY = {"人物不明", "その他（名前不明）", "名前不明"}
 _UNKNOWN_PATTERN = re.compile(r"^その他（名前不明）(?:×|x)?\s*(\d+)?$")
@@ -30,7 +32,13 @@ def is_unknown_other_label(value: object) -> bool:
 
 
 def normalize_people_for_storage(names: Iterable[object]) -> list[str]:
-    """名前付き人物を重複排除し、名前不明人数は1つの内部ラベルへ統合する。"""
+    """人物名を重複排除し、プロジェクト共通順へ正規化する。
+
+    並び順は sakamichi_members.member_group_generation_sort_key に統一する。
+    乃木坂46 → 櫻坂46 → 日向坂46 → ポカ → その他の人物、
+    各坂道グループ内は期順 → 同一期内で名前順。
+    名前不明人数の内部ラベルは常に最後に置く。
+    """
     result: list[str] = []
     unknown_count = 0
     for value in names:
@@ -43,6 +51,9 @@ def normalize_people_for_storage(names: Iterable[object]) -> list[str]:
             continue
         if text not in result:
             result.append(text)
+
+    result.sort(key=member_group_generation_sort_key)
+
     if unknown_count:
         result.append(make_unknown_other_label(unknown_count))
     return result
@@ -74,22 +85,25 @@ def people_items_for_users(names: Iterable[object]) -> list[str]:
     return result
 
 def format_people_for_users(value: object) -> str:
-    """DBの人物文字列を一般利用者向けの自然な表記へ変換する。"""
+    """DBの人物文字列を共通順で並べ、利用者向けの自然な表記へ変換する。"""
     text = str(value or "").strip()
     if not text:
         return ""
-    raw_items = text.replace("\n", "、").replace(",", "、").replace("，", "、").split("、")
+
+    raw_items = (
+        text.replace("\n", "、")
+        .replace(",", "、")
+        .replace("，", "、")
+        .split("、")
+    )
+
+    normalized = normalize_people_for_storage(raw_items)
     names: list[str] = []
-    unknown_count = 0
-    for raw in raw_items:
-        item = raw.strip()
-        if not item:
-            continue
+    for item in normalized:
         count = unknown_other_count(item)
         if count:
-            unknown_count += count
-        elif item not in names:
+            names.append(f"その他{count}名")
+        else:
             names.append(item)
-    if unknown_count:
-        names.append(f"その他{unknown_count}名")
+
     return "、".join(names)
