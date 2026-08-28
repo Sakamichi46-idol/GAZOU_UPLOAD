@@ -1127,7 +1127,14 @@ class BulkPhotoSelect(discord.ui.Select):
             status=str(item.get("review_status") or "pending")
             people = str(item.get("confirmed_people") or "").strip()
             if status == "completed":
-                description = people or "人物なし"
+                if people:
+                    try:
+                        from person_labels import format_people_for_users
+                        description = format_people_for_users(people) or "人物なし"
+                    except Exception:
+                        description = people
+                else:
+                    description = "人物なし"
             elif status == "skipped":
                 description = "スキップ済み"
             else:
