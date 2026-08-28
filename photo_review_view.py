@@ -1411,6 +1411,66 @@ class PersonSetApplyView(discord.ui.View):
         view = await PersonSetApplyView.create(self.review_view, self.page + 1)
         await interaction.edit_original_response(content=view.content(), view=view)
 
+
+class InlineQuickPeopleSelect(discord.ui.Select):
+    """人物確認カード内に常設する「よく使う人物」選択欄。
+
+    1ページ最大25人を表示し、ページを移動しても選択内容を保持する。
+    選択だけでは確定せず、同じカード内の「選択した人物で確定」で保存する。
+    """
+
+    def __init__(self, parent: "PersonReviewView"):
+        self.parent_view = parent
+        page_people = parent.quick_people_page_items()
+        options: list[discord.SelectOption] = []
+
+        for item in page_people:
+            name = normalize_text(item.get("person_name"))
+            if not name:
+                continue
+            is_author = bool(item.get("is_author"))
+            count = int(item.get("cooccurrence_count") or 0)
+            description = (
+                "ブログ投稿者（最優先）"
+                if is_author
+                else f"投稿者との共写 {count}回"
+            )
+            options.append(
+                discord.SelectOption(
+                    label=truncate_text(name, 100),
+                    value=name,
+                    description=truncate_text(description, 100),
+                    default=name in parent.quick_selected_names,
+                )
+            )
+
+        # DiscordのSelectは最低1 option必要。候補なしの場合はこのクラス自体を追加しない。
+        super().__init__(
+            placeholder="よく使う人物から選択（複数可）",
+            min_values=0,
+            max_values=max(1, len(options)),
+            options=options,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        parent = self.parent_view
+        # 現在ページに存在する人物だけ一旦外し、現在の選択値で置き換える。
+        page_names = {
+            normalize_text(item.get("person_name"))
+            for item in parent.quick_people_page_items()
+            if normalize_text(item.get("person_name"))
+        }
+        parent.quick_selected_names.difference_update(page_names)
+        parent.quick_selected_names.update(
+            normalize_text(value)
+            for value in self.values
+            if normalize_text(value)
+        )
+        parent.refresh_quick_people_components()
+        await interaction.response.edit_message(view=parent)
+
+
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=None)
@@ -1437,7 +1497,12 @@ class PersonReviewView(discord.ui.View):
             self.manual_input.label = "名前・不明人数を直接編集"
         else:
             self.manual_input.label = "名前・不明人数を入力"
-        self.quick_people_button.disabled = not bool(self.quick_people)
+        # 「よく使う人物」は以前と同じく、この人物確認カード内に直接表示する。
+        # 候補が25人を超える場合だけ同じカード内でページ送りし、
+        # ページをまたいだ選択内容も保持する。
+        self.quick_people_page = 0
+        self.quick_selected_names: set[str] = set()
+        self.refresh_quick_people_components()
 
         # スキップ済み一覧では再スキップすると同じ写真が再取得され続けるため、
         # スキップボタンを無効化して必ず確定・終了のどちらかを選べるようにする。
@@ -1462,6 +1527,37 @@ class PersonReviewView(discord.ui.View):
 
             stop_button.callback = stop_continuous
             self.add_item(stop_button)
+
+    def quick_people_total_pages(self) -> int:
+        return max(1, (len(self.quick_people) + 24) // 25)
+
+    def quick_people_page_items(self) -> list[dict[str, Any]]:
+        start = self.quick_people_page * 25
+        return [dict(item) for item in self.quick_people[start : start + 25]]
+
+    def refresh_quick_people_components(self) -> None:
+        # ページ移動時はSelectだけを作り直す。人物確認カード自体は同じメッセージのまま。
+        for item in list(self.children):
+            if isinstance(item, InlineQuickPeopleSelect):
+                self.remove_item(item)
+
+        if self.quick_people:
+            self.quick_people_page = max(
+                0,
+                min(self.quick_people_page, self.quick_people_total_pages() - 1),
+            )
+            self.add_item(InlineQuickPeopleSelect(self))
+
+        has_people = bool(self.quick_people)
+        self.quick_people_previous.disabled = (
+            not has_people or self.quick_people_page <= 0
+        )
+        self.quick_people_next.disabled = (
+            not has_people
+            or self.quick_people_page >= self.quick_people_total_pages() - 1
+        )
+        self.quick_people_clear.disabled = not bool(self.quick_selected_names)
+        self.quick_people_confirm.disabled = not bool(self.quick_selected_names)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.session and self.session.owner_id and interaction.user.id != self.session.owner_id:
@@ -1630,32 +1726,77 @@ class PersonReviewView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="よく使う人物から選択（複数可）",
-        emoji="⚡",
-        style=discord.ButtonStyle.primary,
-        row=2,
+        label="前の25人",
+        emoji="◀️",
+        style=discord.ButtonStyle.secondary,
+        row=4,
     )
-    async def quick_people_button(
+    async def quick_people_previous(
         self,
         interaction: discord.Interaction,
         _: discord.ui.Button,
     ) -> None:
-        if not self.quick_people:
+        self.quick_people_page = max(0, self.quick_people_page - 1)
+        self.refresh_quick_people_components()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="次の25人",
+        emoji="▶️",
+        style=discord.ButtonStyle.secondary,
+        row=4,
+    )
+    async def quick_people_next(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        self.quick_people_page = min(
+            self.quick_people_total_pages() - 1,
+            self.quick_people_page + 1,
+        )
+        self.refresh_quick_people_components()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="選択解除",
+        emoji="🧹",
+        style=discord.ButtonStyle.secondary,
+        row=4,
+    )
+    async def quick_people_clear(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        self.quick_selected_names.clear()
+        self.refresh_quick_people_components()
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(
+        label="選択した人物で確定",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        row=4,
+    )
+    async def quick_people_confirm(
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        if not self.quick_selected_names:
             await interaction.response.send_message(
-                "選択できる人物がありません。",
+                "人物を1人以上選択してください。",
                 ephemeral=True,
             )
             return
-        state = QuickPeopleState(
-            parent_view=self,
-            people=[dict(item) for item in self.quick_people],
-            owner_id=interaction.user.id,
-        )
-        view = QuickPeoplePagedView(state)
-        await interaction.response.send_message(
-            view.content(),
-            view=view,
-            ephemeral=True,
+
+        # 選択順ではなくプロジェクト共通の人物順で確定する。
+        names = normalize_people_for_storage(self.quick_selected_names)
+        await self.complete_review(
+            interaction,
+            names,
+            note="投稿者＋共写回数順のよく使う人物メニューから確定",
         )
 
     @discord.ui.button(label="理由を選んで保留", emoji="⏸️", style=discord.ButtonStyle.secondary, row=2)
