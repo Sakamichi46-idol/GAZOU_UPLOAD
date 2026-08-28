@@ -11,6 +11,7 @@ import aiohttp
 import discord
 
 from photo_database import get_connection, search_photo_images
+from person_labels import format_people_for_users
 from photo_search import (
     build_photo_attachment_files,
     close_discord_files,
@@ -35,7 +36,7 @@ def _blog_results(query: str, limit: int) -> list[dict[str, Any]]:
             'image_url': get_display_image_url(row),
             'title': row.get('title') or 'ブログ写真',
             'author': row.get('member_name') or '不明',
-            'people': row.get('confirmed_people') or row.get('candidate_people') or '',
+            'people': format_people_for_users(row.get('confirmed_people') or row.get('candidate_people') or ''),
             'date': row.get('published_at') or '',
             'source_url': row.get('blog_url') or '',
             'message_url': row.get('discord_message_url') or '',
@@ -176,7 +177,7 @@ def _blog_person_grouped_results(
             "image_url": data.get("image_url") or "",
             "local_path": data.get("local_path") or "",
             "bucket_key": data.get("bucket_key") or "",
-            "people": data.get("confirmed_people") or "",
+            "people": format_people_for_users(data.get("confirmed_people") or ""),
             "message_url": data.get("discord_message_url") or "",
         })
     return list(grouped.values())
@@ -569,7 +570,7 @@ class CombinedSearchView(discord.ui.View):
             url=row.get('source_url') or None,
             color=0x3498DB if row['source'] == 'blog' else 0xE1306C,
         )
-        embed.add_field(name='人物', value=shorten_text(row.get('people') or '未設定', 1024), inline=False)
+        embed.add_field(name='人物', value=shorten_text(format_people_for_users(row.get('people') or '') or '未設定', 1024), inline=False)
         embed.add_field(name='画像ID', value=f'{row["source"]}:{row.get("id")}', inline=True)
         embed.add_field(name='保存日時', value=shorten_text(row.get('date') or '不明', 1024), inline=True)
         if row.get('message_url'):
