@@ -2597,6 +2597,49 @@ def get_frequent_confirmed_people(
 
     return rows_to_dicts(rows)
 
+
+def get_author_cooccurrence_people(
+    author_name: str,
+) -> list[dict[str, Any]]:
+    """ブログ投稿者との共写回数を人物ごとに返す。
+
+    ``cooccurrence_count`` は、投稿者とその人物の両方が
+    ``photo_image_people`` で confirmed になっている写真の件数。
+    人物マスターの有効な人物をすべて返すため、共写0件の人物も
+    ページ送り候補として利用できる。並び替え自体はUI側で行う。
+    """
+    author = str(author_name or "").strip()
+    if not author:
+        return []
+
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                p.person_name,
+                p.group_name,
+                p.generation_name,
+                p.is_active,
+                COALESCE((
+                    SELECT COUNT(DISTINCT other.image_id)
+                    FROM photo_image_people AS other
+                    JOIN photo_image_people AS author
+                      ON author.image_id = other.image_id
+                     AND author.relation_status = 'confirmed'
+                     AND author.person_name = ?
+                    WHERE other.relation_status = 'confirmed'
+                      AND other.person_name = p.person_name
+                ), 0) AS cooccurrence_count
+            FROM photo_people AS p
+            WHERE p.is_active = 1
+              AND TRIM(p.person_name) != ''
+              AND p.person_name NOT IN ('人物不明', '名前不明', 'その他（名前不明）')
+            """,
+            (author,),
+        ).fetchall()
+
+    return rows_to_dicts(rows)
+
 def get_all_people(
     active_only: bool = True,
 ) -> list[dict[str, Any]]:
