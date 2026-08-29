@@ -4760,6 +4760,7 @@ def get_blog_images_for_review_admin(blog_id: int) -> list[dict[str, Any]]:
                 pi.id AS image_id,
                 pi.image_url,
                 pi.local_path,
+                pi.bucket_key,
                 pi.image_index,
                 pi.blog_id,
                 pb.blog_url,
