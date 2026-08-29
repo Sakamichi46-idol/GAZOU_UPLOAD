@@ -1471,6 +1471,112 @@ class InlineQuickPeopleSelect(discord.ui.Select):
         await interaction.response.edit_message(view=parent)
 
 
+class PersonReviewOtherActionsView(discord.ui.View):
+    """個別写真の低頻度・例外操作をまとめた補助メニュー。"""
+
+    def __init__(self, parent: "PersonReviewView"):
+        super().__init__(timeout=600)
+        self.parent_view = parent
+        if parent.session and parent.session.queue_status == "skipped":
+            self.skip_review.disabled = True
+            self.skip_review.label = "再スキップ不可"
+        if not (parent.session and parent.session.continuous):
+            self.stop_continuous.disabled = True
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        parent = self.parent_view
+        if parent.session and parent.session.owner_id and interaction.user.id != parent.session.owner_id:
+            await interaction.response.send_message(
+                "このレビュー操作はコマンドを実行した本人だけが使えます。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="名前・不明人数を入力", emoji="✏️", style=discord.ButtonStyle.secondary, row=0)
+    async def manual_input(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(PersonInputModal(self.parent_view))
+
+    @discord.ui.button(label="人物なし", emoji="🚫", style=discord.ButtonStyle.danger, row=0)
+    async def no_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.parent_view.complete_review(interaction, [], note="人物は写っていない")
+
+    @discord.ui.button(label="人物不明", emoji="❓", style=discord.ButtonStyle.secondary, row=0)
+    async def unknown_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.parent_view.complete_review(
+            interaction,
+            [make_unknown_other_label(1)],
+            note="その他の人物が1人写っているが名前不明",
+        )
+
+    @discord.ui.button(label="スキップ", emoji="⏭️", style=discord.ButtonStyle.secondary, row=1)
+    async def skip_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        parent = self.parent_view
+        await interaction.response.defer()
+        await asyncio.to_thread(
+            mark_person_review_skipped,
+            parent.image_id,
+            get_reviewer_name(interaction.user),
+            "Discordレビュー画面でスキップ",
+        )
+        await _finish_review_message(
+            interaction,
+            parent.message or interaction.message,
+            f"⏭️ 写真ID **{parent.image_id}** をスキップ一覧へ移しました。",
+        )
+        if parent.session:
+            await parent.session.mark_done(parent.image_id, interaction)
+
+    @discord.ui.button(label="理由を選んで保留", emoji="⏸️", style=discord.ButtonStyle.secondary, row=1)
+    async def hold_with_reason(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_message(
+            "保留理由を選んでください。",
+            view=HoldReasonView(self.parent_view),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="候補を仮確定", emoji="🧪", style=discord.ButtonStyle.secondary, row=1)
+    async def provisional_candidates(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        parent = self.parent_view
+        await interaction.response.defer(ephemeral=True)
+        if not parent.candidates:
+            await interaction.followup.send("仮確定できる候補がありません。", ephemeral=True)
+            return
+        await asyncio.to_thread(
+            save_provisional_people,
+            parent.image_id,
+            parent.candidates,
+            "review_candidates",
+            0.0,
+        )
+        await interaction.followup.send(
+            f"🧪 写真ID **{parent.image_id}** を仮確定しました。\n"
+            f"人物: {'、'.join(parent.candidates)}\n本確定はAI育成センターから行えます。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="人物セット", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
+    async def use_person_set(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = await PersonSetApplyView.create(self.parent_view, 0)
+        if view.total <= 0:
+            await interaction.followup.send("人物セットがまだ登録されていません。", ephemeral=True)
+            return
+        await interaction.followup.send(view.content(), view=view, ephemeral=True)
+
+    @discord.ui.button(label="連続確認を停止", emoji="⏹️", style=discord.ButtonStyle.secondary, row=2)
+    async def stop_continuous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        parent = self.parent_view
+        if not parent.session or not parent.session.continuous:
+            await interaction.response.send_message("現在は連続確認中ではありません。", ephemeral=True)
+            return
+        parent.session.continuous = False
+        await interaction.response.send_message(
+            "⏹️ 連続レビューを停止しました。現在表示中のセット終了後に続行確認を表示します。",
+            ephemeral=True,
+        )
+
+
 class PersonReviewView(discord.ui.View):
     def __init__(self, review: dict[str, Any], session: ReviewSession | None = None):
         super().__init__(timeout=None)
@@ -1510,23 +1616,37 @@ class PersonReviewView(discord.ui.View):
             self.skip_review.disabled = True
             self.skip_review.label = "再スキップ不可"
 
-        if self.session and self.session.continuous:
-            stop_button = discord.ui.Button(
-                label="連続停止",
-                emoji="⏹️",
-                style=discord.ButtonStyle.secondary,
-                row=1,
+
+        # 個別写真画面は日常操作だけを残す。低頻度・例外操作は「その他の操作」へ収納する。
+        for item in (
+            self.manual_input,
+            self.skip_review,
+            self.confirm_blog_author,
+            self.no_person,
+            self.unknown_person,
+            self.hold_with_reason,
+            self.provisional_candidates,
+            self.use_person_set,
+        ):
+            if item in self.children:
+                self.remove_item(item)
+
+        other_button = discord.ui.Button(
+            label="その他の操作",
+            emoji="⚙️",
+            style=discord.ButtonStyle.secondary,
+            row=1,
+        )
+
+        async def open_other_actions(interaction: discord.Interaction) -> None:
+            await interaction.response.send_message(
+                "⚙️ **その他の操作**\n通常は上の確定操作だけで十分です。必要な場合だけ選んでください。",
+                view=PersonReviewOtherActionsView(self),
+                ephemeral=True,
             )
 
-            async def stop_continuous(interaction: discord.Interaction) -> None:
-                self.session.continuous = False
-                await interaction.response.send_message(
-                    "⏹️ 連続レビューを停止しました。現在表示中のセット終了後に続行確認を表示します。",
-                    ephemeral=True,
-                )
-
-            stop_button.callback = stop_continuous
-            self.add_item(stop_button)
+        other_button.callback = open_other_actions
+        self.add_item(other_button)
 
     def quick_people_total_pages(self) -> int:
         return max(1, (len(self.quick_people) + 24) // 25)
@@ -1548,16 +1668,30 @@ class PersonReviewView(discord.ui.View):
             )
             self.add_item(InlineQuickPeopleSelect(self))
 
+        # 補助ボタンは必要なときだけ見せ、画面を圧迫しない。
+        for button in (
+            self.quick_people_previous,
+            self.quick_people_next,
+            self.quick_people_clear,
+            self.quick_people_confirm,
+        ):
+            if button in self.children:
+                self.remove_item(button)
+
         has_people = bool(self.quick_people)
-        self.quick_people_previous.disabled = (
-            not has_people or self.quick_people_page <= 0
-        )
-        self.quick_people_next.disabled = (
-            not has_people
-            or self.quick_people_page >= self.quick_people_total_pages() - 1
-        )
-        self.quick_people_clear.disabled = not bool(self.quick_selected_names)
-        self.quick_people_confirm.disabled = not bool(self.quick_selected_names)
+        if has_people and self.quick_people_total_pages() > 1:
+            self.quick_people_previous.disabled = self.quick_people_page <= 0
+            self.quick_people_next.disabled = (
+                self.quick_people_page >= self.quick_people_total_pages() - 1
+            )
+            self.add_item(self.quick_people_previous)
+            self.add_item(self.quick_people_next)
+
+        if self.quick_selected_names:
+            self.quick_people_clear.disabled = False
+            self.quick_people_confirm.disabled = False
+            self.add_item(self.quick_people_clear)
+            self.add_item(self.quick_people_confirm)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.session and self.session.owner_id and interaction.user.id != self.session.owner_id:
