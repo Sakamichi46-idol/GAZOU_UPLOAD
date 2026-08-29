@@ -2,8 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import os
 from typing import Any
+
+import aiohttp
+from PIL import Image, ImageDraw, ImageOps
 
 import discord
 from discord.ext import commands
@@ -1120,11 +1125,12 @@ class BlogPhotoSelect(discord.ui.Select):
 
 class BulkPhotoSelect(discord.ui.Select):
     def __init__(self, parent: "BulkPhotoSelectionView", rows: list[dict[str, Any]]):
-        self.parent_view=parent
-        opts=[]
-        for item in rows:
-            iid=int(item["image_id"]); num=int(item.get("image_index") or 0)
-            status=str(item.get("review_status") or "pending")
+        self.parent_view = parent
+        options: list[discord.SelectOption] = []
+        for slot, item in enumerate(rows, start=1):
+            iid = int(item["image_id"])
+            num = int(item.get("image_index") or 0)
+            status = str(item.get("review_status") or "pending")
             people = str(item.get("confirmed_people") or "").strip()
             if status == "completed":
                 if people:
@@ -1135,88 +1141,270 @@ class BulkPhotoSelect(discord.ui.Select):
                         description = people
                 else:
                     description = "人物なし"
+                icon = "✅"
             elif status == "skipped":
                 description = "スキップ済み"
+                icon = "⏭️"
             else:
                 description = "未確認"
-            opts.append(discord.SelectOption(label=f"{num}枚目",value=str(iid),description=description[:100],default=iid in parent.selected_ids))
-        super().__init__(placeholder="一括確定する写真を複数選択",min_values=0,max_values=len(opts),options=opts,row=0)
-    async def callback(self,interaction:discord.Interaction)->None:
-        page_ids={int(x["image_id"]) for x in self.parent_view.page_rows()}
-        self.parent_view.selected_ids.difference_update(page_ids); self.parent_view.selected_ids.update(int(x) for x in self.values)
-        v=BulkPhotoSelectionView(self.parent_view.blog_id,self.parent_view.all_rows,self.parent_view.page,self.parent_view.selected_ids)
-        await interaction.response.edit_message(content=v.text(),view=v)
+                icon = "⏳"
+            options.append(
+                discord.SelectOption(
+                    label=f"{slot}. {num}枚目 {icon}",
+                    value=str(iid),
+                    description=description[:100],
+                    default=iid in parent.selected_ids,
+                )
+            )
+        super().__init__(
+            placeholder="この9枚から一括確定する写真を選択（複数可）",
+            min_values=0,
+            max_values=max(1, len(options)),
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        page_ids = {int(x["image_id"]) for x in self.parent_view.page_rows()}
+        self.parent_view.selected_ids.difference_update(page_ids)
+        self.parent_view.selected_ids.update(int(x) for x in self.values)
+        view = BulkPhotoSelectionView(
+            self.parent_view.blog_id,
+            self.parent_view.all_rows,
+            self.parent_view.page,
+            self.parent_view.selected_ids,
+        )
+        file = await view.collage_file()
+        await interaction.response.edit_message(
+            content=view.text(),
+            attachments=[file] if file else [],
+            view=view,
+        )
+
 
 class BulkPeopleModal(discord.ui.Modal):
-    def __init__(self,parent:"BulkPhotoSelectionView"):
-        super().__init__(title="選択写真を一括確定",timeout=300); self.parent_view=parent
-        self.people=discord.ui.TextInput(label="人物名（複数は読点・カンマ区切り）",placeholder="例：金村美玖、小坂菜緒",max_length=500)
+    def __init__(self, parent: "BulkPhotoSelectionView"):
+        super().__init__(title="選択写真を一括確定", timeout=300)
+        self.parent_view = parent
+        self.people = discord.ui.TextInput(
+            label="人物名（複数は読点・カンマ区切り）",
+            placeholder="例：金村美玖、小坂菜緒",
+            max_length=500,
+        )
         self.add_item(self.people)
-    async def on_submit(self,interaction:discord.Interaction)->None:
-        names=[x.strip() for x in str(self.people.value).replace(',', '、').replace('，','、').split('、') if x.strip()]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        from person_labels import normalize_people_for_storage, format_people_for_users
+        names = normalize_people_for_storage(
+            x.strip()
+            for x in str(self.people.value).replace(",", "、").replace("，", "、").split("、")
+            if x.strip()
+        )
         if not names or not self.parent_view.selected_ids:
-            await interaction.response.send_message("写真と人物を選択してください。",ephemeral=True); return
-        selected=sorted(self.parent_view.selected_ids)
-        overwrite=sum(1 for r in self.parent_view.all_rows if int(r['image_id']) in self.parent_view.selected_ids and str(r.get('review_status'))=='completed')
+            await interaction.response.send_message("写真と人物を選択してください。", ephemeral=True)
+            return
+        selected = sorted(self.parent_view.selected_ids)
+        overwrite = sum(
+            1
+            for row in self.parent_view.all_rows
+            if int(row["image_id"]) in self.parent_view.selected_ids
+            and str(row.get("review_status")) == "completed"
+        )
         await interaction.response.send_message(
             f"⚠️ **一括確定の最終確認**\n"
             f"対象 **{len(selected)}枚** / 既存登録の上書き **{overwrite}枚**\n"
             f"写真ID: {', '.join(map(str, selected))}\n"
-            f"人物: {'、'.join(names)}",
-            view=BulkFinalConfirmView(self.parent_view,names),ephemeral=True)
-
-class BulkFinalConfirmView(discord.ui.View):
-    def __init__(self,parent:"BulkPhotoSelectionView",names:list[str]): super().__init__(timeout=300); self.parent=parent; self.names=names
-    @discord.ui.button(label="この内容で一括確定",emoji="✅",style=discord.ButtonStyle.danger)
-    async def confirm(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
-        await interaction.response.defer(ephemeral=True); ok=0; failed=0
-        for iid in sorted(self.parent.selected_ids):
-            try:
-                await asyncio.to_thread(create_people_snapshot,iid,interaction.user.id,"bulk_people_confirm")
-                await asyncio.to_thread(set_confirmed_image_people,iid,self.names,confirmed_by=f"{interaction.user} ({interaction.user.id})",note="ブログ内写真を選択して一括確定")
-                ok+=1
-            except Exception:
-                LOGGER.exception("選択式一括確定に失敗 image_id=%s",iid); failed+=1
-        await interaction.followup.send(
-            f"✅ 一括確定完了\n成功 **{ok}枚** / 失敗 **{failed}枚**\n人物: {'、'.join(self.names)}",
+            f"人物: {format_people_for_users('、'.join(names))}",
+            view=BulkFinalConfirmView(self.parent_view, names),
             ephemeral=True,
         )
-    @discord.ui.button(label="キャンセル",style=discord.ButtonStyle.secondary)
-    async def cancel(self,interaction:discord.Interaction,_:discord.ui.Button)->None:
-        await interaction.response.edit_message(content="一括確定をキャンセルしました。",view=None)
+
+
+class BulkFinalConfirmView(discord.ui.View):
+    def __init__(self, parent: "BulkPhotoSelectionView", names: list[str]):
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.names = names
+
+    @discord.ui.button(label="この内容で一括確定", emoji="✅", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        from person_labels import format_people_for_users
+        await interaction.response.defer(ephemeral=True)
+        ok = 0
+        failed = 0
+        for iid in sorted(self.parent.selected_ids):
+            try:
+                await asyncio.to_thread(create_people_snapshot, iid, interaction.user.id, "bulk_people_confirm")
+                await asyncio.to_thread(
+                    set_confirmed_image_people,
+                    iid,
+                    self.names,
+                    confirmed_by=f"{interaction.user} ({interaction.user.id})",
+                    note="9枚グリッドから選択して一括確定",
+                )
+                ok += 1
+            except Exception:
+                LOGGER.exception("選択式一括確定に失敗 image_id=%s", iid)
+                failed += 1
+        await interaction.followup.send(
+            f"✅ 一括確定完了\n成功 **{ok}枚** / 失敗 **{failed}枚**\n"
+            f"人物: {format_people_for_users('、'.join(self.names))}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="キャンセル", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(content="一括確定をキャンセルしました。", view=None)
+
+
+async def _load_bulk_thumbnail(item: dict[str, Any]) -> Image.Image:
+    local_path = str(item.get("local_path") or "").strip()
+    if local_path and os.path.isfile(local_path):
+        try:
+            with Image.open(local_path) as source:
+                return source.convert("RGB")
+        except Exception:
+            LOGGER.exception("一括確認サムネイル読込失敗 local=%s", local_path)
+
+    try:
+        from photo_search import get_display_image_url
+        url = get_display_image_url(item)
+    except Exception:
+        url = str(item.get("image_url") or "").strip()
+    if url:
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as response:
+                    response.raise_for_status()
+                    data = await response.read()
+            with Image.open(io.BytesIO(data)) as source:
+                return source.convert("RGB")
+        except Exception:
+            LOGGER.exception("一括確認サムネイル取得失敗 url=%s", url)
+
+    return Image.new("RGB", (360, 360), "white")
+
+
+async def _build_bulk_collage(rows: list[dict[str, Any]], selected_ids: set[int]) -> bytes:
+    cell = 360
+    gap = 10
+    cols = 3
+    rows_count = 3
+    canvas = Image.new(
+        "RGB",
+        (cols * cell + (cols - 1) * gap, rows_count * cell + (rows_count - 1) * gap),
+        "white",
+    )
+    draw = ImageDraw.Draw(canvas)
+    thumbs = await asyncio.gather(*(_load_bulk_thumbnail(item) for item in rows))
+
+    for idx, (item, thumb) in enumerate(zip(rows, thumbs), start=1):
+        x = ((idx - 1) % cols) * (cell + gap)
+        y = ((idx - 1) // cols) * (cell + gap)
+        fitted = ImageOps.fit(thumb, (cell, cell), method=Image.Resampling.LANCZOS)
+        canvas.paste(fitted, (x, y))
+
+        iid = int(item.get("image_id") or 0)
+        status = str(item.get("review_status") or "pending")
+        if status == "completed":
+            status_text = "OK"
+        elif status == "skipped":
+            status_text = "SKIP"
+        else:
+            status_text = "WAIT"
+        selected = iid in selected_ids
+        label = f"{idx}  {status_text}" + ("  SELECTED" if selected else "")
+        # 黒背景＋白文字で画像内容に左右されず番号を判読できるようにする。
+        box_w = min(cell - 12, 18 + len(label) * 8)
+        draw.rectangle((x + 6, y + 6, x + 6 + box_w, y + 34), fill="black")
+        draw.text((x + 12, y + 12), label, fill="white")
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=88, optimize=True)
+    return output.getvalue()
+
 
 class BulkPhotoSelectionView(AdminWorkflowView):
-    PAGE_SIZE=25
-    def __init__(self,blog_id:int,rows:list[dict[str,Any]],page:int=0,selected_ids:set[int]|None=None):
-        super().__init__(); self.blog_id=int(blog_id); self.all_rows=rows; self.selected_ids=set(selected_ids or set())
-        self.page_count=max(1,(len(rows)+self.PAGE_SIZE-1)//self.PAGE_SIZE); self.page=max(0,min(page,self.page_count-1))
-        if self.page_rows(): self.add_item(BulkPhotoSelect(self,self.page_rows()))
-        self.previous.disabled=self.page<=0; self.next.disabled=self.page>=self.page_count-1
-    def page_rows(self):
-        st=self.page*self.PAGE_SIZE; return self.all_rows[st:st+self.PAGE_SIZE]
-    def text(self):
-        nums=[str(int(r.get('image_index') or 0)) for r in self.all_rows if int(r['image_id']) in self.selected_ids]
+    PAGE_SIZE = 9
+
+    def __init__(
+        self,
+        blog_id: int,
+        rows: list[dict[str, Any]],
+        page: int = 0,
+        selected_ids: set[int] | None = None,
+    ):
+        super().__init__()
+        self.blog_id = int(blog_id)
+        self.all_rows = rows
+        self.selected_ids = set(selected_ids or set())
+        self.page_count = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(page, self.page_count - 1))
+        if self.page_rows():
+            self.add_item(BulkPhotoSelect(self, self.page_rows()))
+        self.previous.disabled = self.page <= 0
+        self.next.disabled = self.page >= self.page_count - 1
+        self.clear.disabled = not bool(self.selected_ids)
+        self.people.disabled = not bool(self.selected_ids)
+
+    def page_rows(self) -> list[dict[str, Any]]:
+        start = self.page * self.PAGE_SIZE
+        return self.all_rows[start : start + self.PAGE_SIZE]
+
+    def text(self) -> str:
+        start = self.page * self.PAGE_SIZE + 1 if self.all_rows else 0
+        end = min((self.page + 1) * self.PAGE_SIZE, len(self.all_rows))
+        nums = [
+            str(int(row.get("image_index") or 0))
+            for row in self.all_rows
+            if int(row["image_id"]) in self.selected_ids
+        ]
         return (
-            f"☑️ **写真を選んで一括確定**\n"
-            f"選択中 **{len(nums)}枚**: {', '.join(nums[:40]) or 'なし'}\n"
-            f"ページ {self.page+1}/{self.page_count}。ページを移動しても選択は保持されます。"
+            "🖼️ **9枚ずつ見て一括確定**\n"
+            f"表示 **{start}〜{end}枚目 / 全{len(self.all_rows)}枚** "
+            f"（{self.page + 1}/{self.page_count}ページ）\n"
+            f"選択中 **{len(nums)}枚**: {', '.join(nums[:40]) or 'なし'}\n\n"
+            "上の画像で人物を見比べて、下の選択欄から同じ人物構成の写真をまとめて選んでください。\n"
+            "`WAIT`=未確認 / `OK`=確定済み / `SKIP`=スキップ済み / `SELECTED`=選択中"
         )
-    @discord.ui.button(label="前の25枚",emoji="◀️",style=discord.ButtonStyle.secondary,row=1)
-    async def previous(self,interaction:discord.Interaction,_:discord.ui.Button):
-        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page-1,self.selected_ids); await interaction.response.edit_message(content=v.text(),view=v)
-    @discord.ui.button(label="次の25枚",emoji="▶️",style=discord.ButtonStyle.secondary,row=1)
-    async def next(self,interaction:discord.Interaction,_:discord.ui.Button):
-        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page+1,self.selected_ids); await interaction.response.edit_message(content=v.text(),view=v)
-    @discord.ui.button(label="未確認を全選択",emoji="⏳",style=discord.ButtonStyle.primary,row=1)
-    async def pending(self,interaction:discord.Interaction,_:discord.ui.Button):
-        ids={int(r['image_id']) for r in self.all_rows if str(r.get('review_status') or 'pending')!='completed'}
-        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page,ids); await interaction.response.edit_message(content=v.text(),view=v)
-    @discord.ui.button(label="選択解除",emoji="🧹",style=discord.ButtonStyle.secondary,row=2)
-    async def clear(self,interaction:discord.Interaction,_:discord.ui.Button):
-        v=BulkPhotoSelectionView(self.blog_id,self.all_rows,self.page,set()); await interaction.response.edit_message(content=v.text(),view=v)
-    @discord.ui.button(label="人物を設定して確定",emoji="👥",style=discord.ButtonStyle.success,row=2)
-    async def people(self,interaction:discord.Interaction,_:discord.ui.Button):
-        if not self.selected_ids: await interaction.response.send_message("先に写真を選択してください。",ephemeral=True); return
+
+    async def collage_file(self) -> discord.File | None:
+        page_rows = self.page_rows()
+        if not page_rows:
+            return None
+        data = await _build_bulk_collage(page_rows, self.selected_ids)
+        return discord.File(io.BytesIO(data), filename=f"bulk_review_{self.blog_id}_{self.page + 1}.jpg")
+
+    @discord.ui.button(label="前の9枚", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
+    async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BulkPhotoSelectionView(self.blog_id, self.all_rows, self.page - 1, self.selected_ids)
+        file = await view.collage_file()
+        await interaction.response.edit_message(
+            content=view.text(), attachments=[file] if file else [], view=view
+        )
+
+    @discord.ui.button(label="次の9枚", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
+    async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BulkPhotoSelectionView(self.blog_id, self.all_rows, self.page + 1, self.selected_ids)
+        file = await view.collage_file()
+        await interaction.response.edit_message(
+            content=view.text(), attachments=[file] if file else [], view=view
+        )
+
+    @discord.ui.button(label="選択解除", emoji="🧹", style=discord.ButtonStyle.secondary, row=2)
+    async def clear(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        view = BulkPhotoSelectionView(self.blog_id, self.all_rows, self.page, set())
+        file = await view.collage_file()
+        await interaction.response.edit_message(
+            content=view.text(), attachments=[file] if file else [], view=view
+        )
+
+    @discord.ui.button(label="選択した写真を一括確定", emoji="👥", style=discord.ButtonStyle.success, row=2)
+    async def people(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not self.selected_ids:
+            await interaction.response.send_message("先に写真を選択してください。", ephemeral=True)
+            return
         await interaction.response.send_modal(BulkPeopleModal(self))
 
 
@@ -1268,10 +1456,16 @@ class BlogPhotoBrowserView(AdminWorkflowView):
         if count:
             await interaction.followup.send("未確認写真を1枚ずつ表示します。保存またはスキップすると自動で次へ進みます。", ephemeral=True)
 
-    @discord.ui.button(label="写真を選んで一括確定", emoji="☑️", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="9枚ずつ見て一括確定", emoji="🖼️", style=discord.ButtonStyle.primary, row=2)
     async def bulk_select(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         view = BulkPhotoSelectionView(self.blog_id, self.all_rows)
-        await interaction.response.send_message(content=view.text(), view=view, ephemeral=True)
+        file = await view.collage_file()
+        await interaction.response.send_message(
+            content=view.text(),
+            file=file,
+            view=view,
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="一覧を更新", emoji="🔄", style=discord.ButtonStyle.primary, row=1)
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
