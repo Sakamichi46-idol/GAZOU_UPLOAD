@@ -287,6 +287,16 @@ class ReviewAdminView(AdminWorkflowView):
 
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
+    @discord.ui.button(label="顔を連続確認", emoji="▶️", style=discord.ButtonStyle.success)
+    async def face_continuous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        """未確認の顔を1件ずつ、確定後に自動で次へ送る連続確認を開始する。"""
+        from control_panel import invoke_existing_command
+
+        # face_review は1件だけカードを開き、確定・顔なし・保留後に
+        # 同じメッセージを次の未確認顔へ差し替える設計。
+        # 通常の顔確認入口は残し、連続処理を明示した専用入口を追加する。
+        await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
+
     @discord.ui.button(label="ブログ別に人物を確認", emoji="📖", style=discord.ButtonStyle.primary)
     async def blog_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
