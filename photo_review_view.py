@@ -381,6 +381,8 @@ class ReviewSession:
         continuous: bool = False,
         require_final_confirmation: bool = False,
         fixed_blog_id: int | None = None,
+        blog_sequence: list[int] | None = None,
+        sequence_label: str = "",
     ):
         self.destination = destination
         self.owner_id = owner_id
@@ -391,6 +393,13 @@ class ReviewSession:
         self.require_final_confirmation = bool(require_final_confirmation)
         self.current_blog_id: int | None = int(fixed_blog_id) if fixed_blog_id is not None else None
         self.fixed_blog_id: int | None = int(fixed_blog_id) if fixed_blog_id is not None else None
+        self.blog_sequence: list[int] = [int(x) for x in (blog_sequence or []) if int(x) > 0]
+        self.sequence_label = normalize_text(sequence_label) or "ブログ連続確認"
+        self.sequence_index = -1
+        # 連続ブログモードでは、対象ブログは sequence から順番に選ぶ。
+        if self.blog_sequence:
+            self.current_blog_id = None
+            self.fixed_blog_id = None
         self.active_image_ids: set[int] = set()
         self.completed_image_ids: set[int] = set()
         self.message_by_image_id: dict[int, discord.Message] = {}
@@ -436,6 +445,29 @@ class ReviewSession:
             await self.send_message("✅ このブログには人物確認待ちの写真がありません。")
             self.stopped = True
             return 0
+
+        # ブログ連続確認: 現在の記事が終わったら sequence の次の記事へ。
+        # 途中で別経路から確定済みになった記事や写真0枚の記事は自動で飛ばす。
+        if not reviews and self.blog_sequence:
+            self.current_blog_id = None
+            while self.sequence_index + 1 < len(self.blog_sequence):
+                self.sequence_index += 1
+                candidate_blog_id = int(self.blog_sequence[self.sequence_index])
+                candidate_reviews = await asyncio.to_thread(
+                    self.get_reviews,
+                    self.batch_size,
+                    candidate_blog_id,
+                )
+                if candidate_reviews:
+                    self.current_blog_id = candidate_blog_id
+                    reviews = candidate_reviews
+                    break
+            if not reviews:
+                await self.send_message(
+                    f"🎉 {self.sequence_label}が完了しました。対象ブログはすべて確認済みです。"
+                )
+                self.stopped = True
+                return 0
 
         if not reviews:
             first = await asyncio.to_thread(self.get_reviews, 1, None)
@@ -2052,6 +2084,40 @@ async def send_skipped_person_review_batch(
         queue_status="skipped",
         group_name=group_name,
     )
+
+async def send_blog_sequence_person_review_batch(
+    destination: commands.Context | discord.Interaction | discord.abc.Messageable,
+    blog_ids: list[int],
+    *,
+    sequence_label: str = "ブログ連続確認",
+    require_final_confirmation: bool = True,
+) -> int:
+    """指定したブログ列を、各ブログ完了後に自動で次へ進めながら確認する。"""
+    owner = getattr(destination, "author", None) or getattr(destination, "user", None)
+    owner_id = int(getattr(owner, "id", 0) or 0)
+    sequence = [int(x) for x in blog_ids if int(x) > 0]
+    if not sequence:
+        message = "✅ 連続確認の対象ブログはありません。"
+        if isinstance(destination, discord.Interaction):
+            if destination.response.is_done():
+                await destination.followup.send(message, ephemeral=True)
+            else:
+                await destination.response.send_message(message, ephemeral=True)
+        else:
+            await destination.send(message)
+        return 0
+    session = ReviewSession(
+        destination,
+        owner_id=owner_id,
+        batch_size=1,
+        queue_status="pending",
+        continuous=True,
+        require_final_confirmation=require_final_confirmation,
+        blog_sequence=sequence,
+        sequence_label=sequence_label,
+    )
+    return await session.start_batch()
+
 
 async def send_blog_person_review_batch(
     destination: commands.Context | discord.Interaction | discord.abc.Messageable,
