@@ -6047,6 +6047,48 @@ def get_latest_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     return _normalize_blog_admin_rows(rows)
 
 
+def get_pending_blog_ids_for_admin(
+    *,
+    group_name: str = "",
+    member_name: str = "",
+    limit: int = 5000,
+) -> list[int]:
+    """人物確認が未完了のブログIDを新しい順で返す。
+
+    ブログ単位の連続確認で使うため、通常の25件ページングとは独立して
+    十分な件数を取得できるようにしている。投稿者を指定した場合は、
+    その人物の記事だけに絞り込む。写真0枚の記事と非表示記事は対象外。
+    """
+    filters = ["COALESCE(pb.is_hidden, 0) = 0"]
+    params: list[Any] = []
+    clean_group = str(group_name or "").strip()
+    clean_member = str(member_name or "").strip()
+    if clean_group:
+        filters.append("pb.group_name = ?")
+        params.append(clean_group)
+    if clean_member:
+        filters.append("pb.member_name = ?")
+        params.append(clean_member)
+
+    safe_limit = max(1, min(int(limit), 10000))
+    sql = _blog_admin_progress_select() + " WHERE " + " AND ".join(filters) + """
+        GROUP BY pb.id
+        HAVING COUNT(DISTINCT pi.id) > 0
+           AND COUNT(DISTINCT CASE
+                WHEN prq.review_type = 'person_identity'
+                 AND prq.status = 'completed' THEN prq.image_id
+           END) < COUNT(DISTINCT pi.id)
+        ORDER BY
+            CASE WHEN pb.published_at = '' THEN 1 ELSE 0 END,
+            pb.published_at DESC,
+            pb.id DESC
+        LIMIT ?
+    """
+    with closing(get_connection()) as connection:
+        rows = connection.execute(sql, tuple(params + [safe_limit])).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
 def get_unprocessed_blogs_for_admin(limit: int = 25) -> list[dict[str, Any]]:
     """人物確認が未完了の記事を返す。"""
     safe_limit = max(1, min(int(limit), 25))
