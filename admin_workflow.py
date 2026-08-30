@@ -31,11 +31,17 @@ from photo_database import (
     get_error_blogs_for_admin,
     get_latest_blogs_for_admin,
     get_unprocessed_blogs_for_admin,
+    get_pending_blog_ids_for_admin,
     get_blog_workflow_stats_for_admin,
     reset_blog_processing_errors_for_admin,
     set_confirmed_image_people,
 )
-from photo_review_view import send_blog_person_review_batch, send_person_review_batch, send_person_review
+from photo_review_view import (
+    send_blog_person_review_batch,
+    send_blog_sequence_person_review_batch,
+    send_person_review_batch,
+    send_person_review,
+)
 from sakamichi_members import SAKAMICHI_MEMBERS, member_surname_kana_sort_key
 
 GROUPS = ("乃木坂46", "櫻坂46", "日向坂46")
@@ -287,16 +293,6 @@ class ReviewAdminView(AdminWorkflowView):
 
         await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
 
-    @discord.ui.button(label="顔を連続確認", emoji="▶️", style=discord.ButtonStyle.success)
-    async def face_continuous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        """未確認の顔を1件ずつ、確定後に自動で次へ送る連続確認を開始する。"""
-        from control_panel import invoke_existing_command
-
-        # face_review は1件だけカードを開き、確定・顔なし・保留後に
-        # 同じメッセージを次の未確認顔へ差し替える設計。
-        # 通常の顔確認入口は残し、連続処理を明示した専用入口を追加する。
-        await invoke_existing_command(interaction, "face_review", "1", admin_required=True)
-
     @discord.ui.button(label="ブログ別に人物を確認", emoji="📖", style=discord.ButtonStyle.primary)
     async def blog_review(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.edit_message(
@@ -393,7 +389,7 @@ class BlogDashboardView(AdminWorkflowView):
     async def latest(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_latest_blogs_for_admin, 500)
-        await _show_blog_list(interaction, "📅 最新記事", blogs)
+        await _show_blog_list(interaction, "📅 最新記事", blogs, sequence_mode="latest")
 
     @discord.ui.button(label="投稿者から選ぶ", emoji="👤", style=discord.ButtonStyle.primary)
     async def author(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -407,7 +403,7 @@ class BlogDashboardView(AdminWorkflowView):
     async def unprocessed(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
         blogs = await asyncio.to_thread(get_unprocessed_blogs_for_admin, 500)
-        await _show_blog_list(interaction, "🆕 人物確認が未完了の記事", blogs)
+        await _show_blog_list(interaction, "🆕 人物確認が未完了の記事", blogs, sequence_mode="unprocessed")
 
     @discord.ui.button(label="エラー記事", emoji="⚠️", style=discord.ButtonStyle.danger)
     async def errors(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -481,11 +477,17 @@ class BlogDashboardView(AdminWorkflowView):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-async def _show_blog_list(interaction: discord.Interaction, heading: str, blogs: list[dict[str, Any]]) -> None:
+async def _show_blog_list(
+    interaction: discord.Interaction,
+    heading: str,
+    blogs: list[dict[str, Any]],
+    *,
+    sequence_mode: str = "",
+) -> None:
     if not blogs:
         kwargs = dict(content=f"{heading}\n対象記事はありません。", embed=None, view=BlogDashboardView())
     else:
-        view = ProgressBlogSelectView(blogs, heading)
+        view = ProgressBlogSelectView(blogs, heading, sequence_mode=sequence_mode)
         kwargs = dict(content=view.text(), embed=None, view=view)
 
     if interaction.response.is_done():
@@ -543,15 +545,28 @@ class ProgressBlogSelect(discord.ui.Select):
 class ProgressBlogSelectView(AdminWorkflowView):
     PAGE_SIZE = 25
 
-    def __init__(self, blogs: list[dict[str, Any]], heading: str, page: int = 0):
+    def __init__(
+        self,
+        blogs: list[dict[str, Any]],
+        heading: str,
+        page: int = 0,
+        *,
+        sequence_mode: str = "",
+    ):
         super().__init__()
         self.blogs = list(blogs)
         self.heading = heading
+        self.sequence_mode = str(sequence_mode or "")
         self.page_count = max(1, (len(self.blogs) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
         self.page = max(0, min(int(page), self.page_count - 1))
         self.add_item(ProgressBlogSelect(self))
         self.previous.disabled = self.page <= 0
         self.next.disabled = self.page >= self.page_count - 1
+        self.continuous.disabled = self.sequence_mode not in {"latest", "unprocessed"}
+        if self.sequence_mode == "latest":
+            self.continuous.label = "新着を連続確認"
+        elif self.sequence_mode == "unprocessed":
+            self.continuous.label = "未解析を連続確認"
 
     def text(self) -> str:
         start = self.page * self.PAGE_SIZE + 1 if self.blogs else 0
@@ -563,13 +578,35 @@ class ProgressBlogSelectView(AdminWorkflowView):
 
     @discord.ui.button(label="前の25件", emoji="◀️", style=discord.ButtonStyle.secondary, row=1)
     async def previous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = ProgressBlogSelectView(self.blogs, self.heading, self.page - 1)
+        view = ProgressBlogSelectView(self.blogs, self.heading, self.page - 1, sequence_mode=self.sequence_mode)
         await interaction.response.edit_message(content=view.text(), embed=None, view=view)
 
     @discord.ui.button(label="次の25件", emoji="▶️", style=discord.ButtonStyle.secondary, row=1)
     async def next(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        view = ProgressBlogSelectView(self.blogs, self.heading, self.page + 1)
+        view = ProgressBlogSelectView(self.blogs, self.heading, self.page + 1, sequence_mode=self.sequence_mode)
         await interaction.response.edit_message(content=view.text(), embed=None, view=view)
+
+    @discord.ui.button(label="ブログを連続確認", emoji="🔁", style=discord.ButtonStyle.success, row=1)
+    async def continuous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.sequence_mode not in {"latest", "unprocessed"}:
+            await interaction.response.send_message(
+                "この一覧ではブログ連続確認は利用できません。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        blog_ids = await asyncio.to_thread(get_pending_blog_ids_for_admin, limit=5000)
+        label = "新着ブログの連続確認" if self.sequence_mode == "latest" else "未解析ブログの連続確認"
+        count = await send_blog_sequence_person_review_batch(
+            interaction,
+            blog_ids,
+            sequence_label=label,
+            require_final_confirmation=True,
+        )
+        if count:
+            await interaction.followup.send(
+                f"🔁 **{label}** を開始しました。現在のブログが完了すると、自動で次のブログへ進みます。",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="戻る", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -988,6 +1025,27 @@ class AuthorBlogBrowserView(AdminWorkflowView):
             interaction, page=0, selected_year=0, selected_month=0,
             title_query="", only_unprocessed=False,
         )
+
+    @discord.ui.button(label="この人を連続確認", emoji="🔁", style=discord.ButtonStyle.success, row=4)
+    async def continuous_person(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        blog_ids = await asyncio.to_thread(
+            get_pending_blog_ids_for_admin,
+            group_name=self.group,
+            member_name=self.author,
+            limit=5000,
+        )
+        count = await send_blog_sequence_person_review_batch(
+            interaction,
+            blog_ids,
+            sequence_label=f"{self.author}のブログ連続確認",
+            require_final_confirmation=True,
+        )
+        if count:
+            await interaction.followup.send(
+                f"🔁 **{self.author}** のブログ連続確認を開始しました。1つのブログが完了すると、自動で次の未完了ブログへ進みます。",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="投稿者選択へ", emoji="↩️", style=discord.ButtonStyle.secondary, row=4)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
