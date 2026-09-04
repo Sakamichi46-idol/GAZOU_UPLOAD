@@ -301,6 +301,8 @@ async def _finish_selection_message(
     source_message: discord.Message | None,
     selection_message: discord.Message | None,
     text: str,
+    *,
+    extra_messages: list[discord.Message] | tuple[discord.Message, ...] | None = None,
 ) -> None:
     """階層式人物選択の確定後、関係するエフェメラルをすべて終了する。
 
@@ -322,6 +324,7 @@ async def _finish_selection_message(
         source_message,
         selection_message,
         interaction.message,
+        *(extra_messages or ()),
         interaction=interaction,
     )
 
@@ -336,6 +339,8 @@ async def _finish_review_message(
     interaction: discord.Interaction,
     source_message: discord.Message | None,
     text: str,
+    *,
+    extra_messages: list[discord.Message] | tuple[discord.Message, ...] | None = None,
 ) -> None:
     """人物確認の成功後、元カードと現在操作中のUIを確実に消す。
 
@@ -355,6 +360,7 @@ async def _finish_review_message(
     await _delete_unique_messages(
         source_message,
         interaction.message,
+        *(extra_messages or ()),
         interaction=interaction,
     )
 
@@ -719,6 +725,7 @@ class SelectionState:
     remove_page: int = 0
     unknown_other_people: int = 0
     base_person_set_name: str = ""
+    auxiliary_messages: list[discord.Message] = field(default_factory=list, repr=False)
     commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     committed: bool = False
 
@@ -989,6 +996,7 @@ async def _commit_selection_state(
             state.source_message,
             state.selection_message,
             build_people_confirmation_text(image_id, normalized),
+            extra_messages=state.auxiliary_messages,
         )
         if state.session:
             await state.session.mark_done(image_id, interaction)
@@ -1330,6 +1338,7 @@ class FinalPersonConfirmView(discord.ui.View):
                 await interaction.edit_original_response(content=None, embed=None, view=None)
             except (discord.HTTPException, discord.NotFound, discord.Forbidden):
                 pass
+        await self.parent._cleanup_auxiliary_messages(interaction)
         self.stop()
 
 
@@ -1344,9 +1353,13 @@ class HoldReasonView(discord.ui.View):
             async def callback(interaction: discord.Interaction, c=code, l=label):
                 await interaction.response.defer(ephemeral=True)
                 await asyncio.to_thread(save_hold_reason, self.review_view.image_id, c, "", interaction.user.id)
-                await _delete_message_safely(self.review_view.message or interaction.message)
-                await interaction.edit_original_response(content=f"⏸️ 写真ID **{self.review_view.image_id}** を「{l}」で保留しました。", view=None)
-                asyncio.create_task(_delete_original_response_later(interaction))
+                await _finish_review_message(
+                    interaction,
+                    self.review_view.message or interaction.message,
+                    f"⏸️ 写真ID **{self.review_view.image_id}** を「{l}」で保留しました。",
+                    extra_messages=list(self.review_view._auxiliary_messages),
+                )
+                self.review_view._auxiliary_messages.clear()
                 if self.review_view.session:
                     await self.review_view.session.mark_done(self.review_view.image_id, interaction)
             button.callback = callback
@@ -1372,6 +1385,7 @@ class PersonSetApplySelect(discord.ui.Select):
             session=self.review_view.session,
             selected_names=normalize_people_for_storage(list(item["people"])),
             base_person_set_name=normalize_text(item["name"]),
+            auxiliary_messages=list(self.review_view._auxiliary_messages),
         )
 
         await interaction.response.edit_message(
@@ -1566,6 +1580,7 @@ class PersonReviewOtherActionsView(discord.ui.View):
             view=HoldReasonView(self.parent_view),
             ephemeral=True,
         )
+        await self.parent_view._track_interaction_response(interaction)
 
     @discord.ui.button(label="候補を仮確定", emoji="🧪", style=discord.ButtonStyle.secondary, row=1)
     async def provisional_candidates(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1581,11 +1596,17 @@ class PersonReviewOtherActionsView(discord.ui.View):
             "review_candidates",
             0.0,
         )
-        await interaction.followup.send(
-            f"🧪 写真ID **{parent.image_id}** を仮確定しました。\n"
-            f"人物: {'、'.join(parent.candidates)}\n本確定はAI育成センターから行えます。",
-            ephemeral=True,
-        )
+        await parent._cleanup_auxiliary_messages(interaction)
+        try:
+            notice = await interaction.followup.send(
+                f"🧪 写真ID **{parent.image_id}** を仮確定しました。\n"
+                f"人物: {'、'.join(parent.candidates)}\n本確定はAI育成センターから行えます。",
+                ephemeral=True,
+                wait=True,
+            )
+            asyncio.create_task(_delete_message_later(notice))
+        except discord.HTTPException:
+            pass
 
     @discord.ui.button(label="人物セット", emoji="📚", style=discord.ButtonStyle.secondary, row=2)
     async def use_person_set(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1594,7 +1615,8 @@ class PersonReviewOtherActionsView(discord.ui.View):
         if view.total <= 0:
             await interaction.followup.send("人物セットがまだ登録されていません。", ephemeral=True)
             return
-        await interaction.followup.send(view.content(), view=view, ephemeral=True)
+        message = await interaction.followup.send(view.content(), view=view, ephemeral=True, wait=True)
+        self.parent_view._track_auxiliary_message(message)
 
     @discord.ui.button(label="連続確認を停止", emoji="⏹️", style=discord.ButtonStyle.secondary, row=2)
     async def stop_continuous(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1603,10 +1625,17 @@ class PersonReviewOtherActionsView(discord.ui.View):
             await interaction.response.send_message("現在は連続確認中ではありません。", ephemeral=True)
             return
         parent.session.continuous = False
-        await interaction.response.send_message(
-            "⏹️ 連続レビューを停止しました。現在表示中のセット終了後に続行確認を表示します。",
-            ephemeral=True,
-        )
+        await interaction.response.defer(ephemeral=True)
+        await parent._cleanup_auxiliary_messages(interaction)
+        try:
+            notice = await interaction.followup.send(
+                "⏹️ 連続レビューを停止しました。現在表示中のセット終了後に続行確認を表示します。",
+                ephemeral=True,
+                wait=True,
+            )
+            asyncio.create_task(_delete_message_later(notice))
+        except discord.HTTPException:
+            pass
 
 
 class PersonReviewView(discord.ui.View):
@@ -1618,6 +1647,9 @@ class PersonReviewView(discord.ui.View):
         self.message: discord.Message | None = None
         self._commit_lock = asyncio.Lock()
         self._committed = False
+        # 「その他の操作」など、人物確認から派生した補助エフェメラルを保持する。
+        # Modalや最終確認など別Interactionを経由して確定しても、元の補助画面を確実に消すために使う。
+        self._auxiliary_messages: list[discord.Message] = []
         self.source_message_id = 0
         self.candidates = build_candidate_names(review)
         # 投稿者＋共写回数ランキングは画面生成時に毎回DBから取得する。
@@ -1676,9 +1708,30 @@ class PersonReviewView(discord.ui.View):
                 view=PersonReviewOtherActionsView(self),
                 ephemeral=True,
             )
+            await self._track_interaction_response(interaction)
 
         other_button.callback = open_other_actions
         self.add_item(other_button)
+
+    def _track_auxiliary_message(self, message: discord.Message | None) -> None:
+        if message is None:
+            return
+        message_id = int(getattr(message, "id", 0) or 0)
+        if message_id and any(int(getattr(x, "id", 0) or 0) == message_id for x in self._auxiliary_messages):
+            return
+        self._auxiliary_messages.append(message)
+
+    async def _track_interaction_response(self, interaction: discord.Interaction) -> None:
+        try:
+            message = await interaction.original_response()
+        except (discord.HTTPException, discord.NotFound, discord.Forbidden):
+            return
+        self._track_auxiliary_message(message)
+
+    async def _cleanup_auxiliary_messages(self, interaction: discord.Interaction) -> None:
+        messages = list(self._auxiliary_messages)
+        self._auxiliary_messages.clear()
+        await _delete_unique_messages(*messages, interaction=interaction)
 
     def quick_people_total_pages(self) -> int:
         return max(1, (len(self.quick_people) + 24) // 25)
@@ -1749,6 +1802,7 @@ class PersonReviewView(discord.ui.View):
                 view=FinalPersonConfirmView(self, names, note),
                 ephemeral=True,
             )
+            await self._track_interaction_response(interaction)
             return
         await self.commit_review(interaction, names, note=note)
 
@@ -1795,7 +1849,9 @@ class PersonReviewView(discord.ui.View):
                 interaction,
                 self.message or interaction.message,
                 confirmation_text,
+                extra_messages=list(self._auxiliary_messages),
             )
+            self._auxiliary_messages.clear()
             if self.session:
                 await self.session.mark_done(self.image_id, interaction)
 
